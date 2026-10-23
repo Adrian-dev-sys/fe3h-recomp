@@ -472,7 +472,7 @@ import json as _json
 import os as _os
 _rv = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'rando', 'patch_variants.json')
 RANDO_CODE = {}
-if _os.path.exists(_rv):
+if False:  # LA randomizer patches: off for FE3H
     for _a, _ws in _json.load(open(_rv))['code'].items():
         RANDO_CODE[int(_a, 16)] = [int(_w, 16) for _w in _ws]
 
