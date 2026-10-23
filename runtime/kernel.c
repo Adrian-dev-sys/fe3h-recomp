@@ -313,6 +313,10 @@ static uint32_t block_current(int64_t timeout_ns) {
             break;
         }
         if (!kwait(timeout_ns, &ts)) {
+            // A waker can get in just as the time runs out (it holds g_klock until our timed wait reacquires it): then
+            // its result stands. Overwriting it with a timeout lost the wake - and a mutex it had handed us, which the
+            // caller then tried to take again (FE3H: TimedWaitEvent racing SignalEvent, a deadlock).
+            if (t->wait_kind == WAIT_NONE) break;
             t->wait_kind = WAIT_NONE;
             t->wait_result = R_TIMEOUT;
             break;
