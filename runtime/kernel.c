@@ -517,7 +517,9 @@ static int prof_svc = -1;
 static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc);
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
     rt_unwind_point();
+    if (t_cur) { t_cur->svc_imm = imm; t_cur->svc_since = plat_now_ns(); }
     svc_entry(c, imm, pc);
+    if (t_cur) t_cur->svc_since = 0;
     rt_unwind_point();
 }
 
@@ -838,7 +840,49 @@ void kernel_reset(void) {
     pthread_mutex_unlock(&g_klock);
 }
 
+// ------------------------------------------------------------------ hang watch
+// LARECOMP_HANG_WATCH=<seconds>: every that many seconds, list every guest thread - the system call it is inside and
+// for how long, what it waits on, and its guest call chain (frame pointers, sdk names where known). For deadlocks.
+static void *hang_watch(void *arg) {
+    static const char *const kinds[] = {"-", "mutex", "condvar", "arbiter"};
+    int secs = (int)(intptr_t)arg;
+    for (;;) {
+        sleep(secs);
+        uint64_t now = plat_now_ns();
+        pthread_mutex_lock(&g_klock);
+        LOG("[hang] ---- guest threads ----\n");
+        for (KThread *t = g_threads; t; t = t->anext) {
+            if (t->finished) continue;
+            LOG("[hang] t%llu prio %d entry %llx: ", (unsigned long long)t->id, t->prio, (unsigned long long)t->entry);
+            if (t->svc_since)
+                LOG("in svc%02x for %llus", t->svc_imm, (unsigned long long)((now - t->svc_since) / 1000000000ull));
+            else
+                LOG("not in a system call");
+            LOG(", wait %s %llx%s\n", kinds[t->wait_kind & 3], (unsigned long long)t->wait_addr,
+                t->in_sync_wait ? " (WaitSynchronization)" : "");
+            uint64_t pc = t->cpu.x[30], fp = t->cpu.x[29];
+            for (int i = 0; i < 12 && pc; i++) {
+                uint64_t off = 0;
+                const char *s = loader_symbol_at(pc, &off);
+                if (s) LOG("[hang]     #%-2d %llx %s+%llx\n", i, (unsigned long long)pc, s, (unsigned long long)off);
+                else LOG("[hang]     #%-2d %llx\n", i, (unsigned long long)pc);
+                if (fp < GUEST_LO || fp >= GUEST_HI || (fp & 7)) break;
+                pc = ((uint64_t *)(uintptr_t)fp)[1];
+                fp = ((uint64_t *)(uintptr_t)fp)[0];
+            }
+        }
+        pthread_mutex_unlock(&g_klock);
+    }
+    return NULL;
+}
+
 void kernel_init(void) {
+    static bool watching;
+    const char *hw = getenv("LARECOMP_HANG_WATCH");
+    if (hw && !watching && atoi(hw) > 0) {
+        pthread_t th;
+        watching = pthread_create(&th, NULL, hang_watch, (void *)(intptr_t)atoi(hw)) == 0;
+    }
     // Reserve the heap, alias, stack, and TLS regions.
     region_add(TLS_BASE, TLS_SIZE, 0xC, 3);
     for (int i = 0; i < g_nmodules; i++) {

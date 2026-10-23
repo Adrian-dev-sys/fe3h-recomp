@@ -36,6 +36,9 @@ struct KThread {
     // in-place reboot (kernel_stop_threads): thread_main's setjmp point, where the thread unwinds to and ends
     jmp_buf unwind;
     bool started, finished;
+    // hang watch (LARECOMP_HANG_WATCH): the system call the thread is inside, since when (0: none)
+    uint32_t svc_imm;
+    uint64_t svc_since;
     KThread *anext;        // every thread of this boot (g_klock)
 };
 
