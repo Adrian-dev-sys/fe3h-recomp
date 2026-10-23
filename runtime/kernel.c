@@ -355,8 +355,11 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
     t->wait_tag = tag;
     __atomic_store_n(u32p(key), 1, __ATOMIC_SEQ_CST);
     uint32_t r = block_current(timeout);
-    if (r != R_OK) {
-        // timed out / cancelled: still must reacquire the mutex
+    // Timed out: return without the mutex, as Horizon does. The caller re-takes it itself
+    // (nn::os InternalConditionVariableImplByHorizon::TimedWait calls Enter() on a timeout); taking it here as well made
+    // that Enter wait on a mutex its own thread held - a deadlock (FE3H: TimedWaitEvent / WaitTimerEvent).
+    if (r != R_OK && r != R_TIMEOUT) {
+        // cancelled: still must reacquire the mutex
         if (!mutex_acquire_or_mark(mutex, tag)) {
             t->wait_kind = WAIT_MUTEX;
             t->wait_addr = mutex;
