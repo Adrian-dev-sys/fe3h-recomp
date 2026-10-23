@@ -415,6 +415,25 @@ static bool emit_half(Ctx *c, uint64_t w) {
         hstore(c, d, t, merge, sat);
         return true;
     }
+    // ---- HSETP2 immediate (7e0x): B is two immediate halves (as HADD2's), the compare and HAnd move to 49 / 53
+    if ((op & 0xfe80) == 0x7e00) {
+        sprintf(ib, "0x%08xu", himm(w));
+        const char *x = HS(R(a), (int)bits(w, 47, 2), bits(w, 43, 1), bits(w, 44, 1));
+        const char *y = HS(ib, 0, false, false);
+        int cop = (int)bits(w, 49, 4), bop = (int)bits(w, 45, 2);
+        const char *pp = P((int)bits(w, 39, 3), bits(w, 42, 1));
+        char lx[512], ly[512];
+        sp(&c->body, "    { float2 hx_ = %s, hy_ = %s; bool pp = %s;\n", x, y, pp);
+        fcmp_expr(lx, cop, "hx_.x", "hy_.x");
+        fcmp_expr(ly, cop, "hx_.y", "hy_.y");
+        sp(&c->body, "      bool l = %s, h = %s;\n", lx, ly);
+        int pa = (int)bits(w, 3, 3), pb = (int)bits(w, 0, 3);
+        if (bits(w, 53, 1)) sp(&c->body, "      l = l && h; h = !l;\n");
+        if (pa != PT) { c->pred_used[pa] = 1; sp(&c->body, "      p%d = l %s pp;\n", pa, bool_op(bop)); }
+        if (pb != PT) { c->pred_used[pb] = 1; sp(&c->body, "      p%d = h %s pp;\n", pb, bool_op(bop)); }
+        sp(&c->body, "    }\n");
+        return true;
+    }
     // ---- HSETP2 / HSET2 (reg forms)
     if ((op & 0xfff8) == 0x5d20 || (op & 0xfff8) == 0x5d18) {
         bool setp = (op & 0xfff8) == 0x5d20;
@@ -1553,6 +1572,17 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             }
         }
         sp(&c->body, "    }\n");
+    } else if (OPM(0x50d8000000000000ull, 0xfff8000000000000ull)) {  // VOTE
+        // mode (48): ALL / ANY / EQ of the source predicate across the warp, into a predicate (45); the ballot of it
+        // into Rd. A subgroup is the warp here (it may be 64 wide: the ballot keeps the low 32 lanes).
+        if (!c->glsl) { fail(c, "VOTE outside GLSL at %#x", pc); return; }
+        int mode = (int)bits(w, 48, 2), vp = (int)bits(w, 45, 3);
+        const char *src = P((int)bits(w, 39, 3), bits(w, 42, 1));
+        static const char *const fn[] = {"subgroupAll", "subgroupAny", "subgroupAllEqual", "subgroupAll"};
+        sp(&c->body, "    { bool vs_ = %s;\n", src);
+        if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = subgroupBallot(vs_).x;\n", d); }
+        if (vp != PT) { c->pred_used[vp] = 1; sp(&c->body, "      p%d = %s(vs_);\n", vp, fn[mode]); }
+        sp(&c->body, "    }\n");
     } else if (OPM(0xef10000000000000ull, 0xfff8000000000000ull)) {  // SHFL
         int mode = (int)bits(w, 30, 2);
         char bb[32];
@@ -1740,6 +1770,8 @@ static const char glsl_prelude[] =
     "#extension GL_KHR_shader_subgroup_basic : require\n"
     "#extension GL_KHR_shader_subgroup_shuffle : require\n"
     "#extension GL_KHR_shader_subgroup_shuffle_relative : require\n"
+    "#extension GL_KHR_shader_subgroup_vote : require\n"
+    "#extension GL_KHR_shader_subgroup_ballot : require\n"
     "#extension GL_EXT_texture_shadow_lod : require\n"
     "#define cbr(cb, off) cb[min((off) >> 4, uint(cb.length() - 1))][((off) >> 2) & 3u]\n"
     "uint as_u(float x) { return floatBitsToUint(x); }\n"
