@@ -397,7 +397,31 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     vk_collect_dead();
 }
 
-void renderer_submit(void) { vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE); }
+// One guest thread at a time in the backend. Every NVN queue submits on the guest thread that owns it, and Three Houses
+// uses more than one, but the backend keeps a single set of execution state (subs[] and their open command buffers,
+// the bound state `st`, the render pass): two threads in it at once recorded into a command buffer the other had just
+// ended (vkCmdCopyBufferToImage outside the recording state; vkEndCommandBuffer -13). Recursive: execution submits,
+// presenting draws. Only GPU waits happen inside, never a wait on another guest thread.
+static pthread_mutex_t backend_mu;
+static pthread_once_t backend_mu_once = PTHREAD_ONCE_INIT;
+static void backend_mu_init(void) {
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&backend_mu, &a);
+    pthread_mutexattr_destroy(&a);
+}
+void vk_backend_lock(void) {
+    pthread_once(&backend_mu_once, backend_mu_init);
+    pthread_mutex_lock(&backend_mu);
+}
+void vk_backend_unlock(void) { pthread_mutex_unlock(&backend_mu); }
+
+void renderer_submit(void) {
+    vk_backend_lock();
+    vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
+    vk_backend_unlock();
+}
 
 void renderer_flush(void) {
     renderer_submit();
@@ -3778,6 +3802,7 @@ static void exec_list(uint64_t handle, int depth) {
 }
 
 void backend_execute(uint64_t handle) {
+    vk_backend_lock();
     PROF_T0();
     exec_list(handle, 0);
     PROF_ADD(prof_exec);
@@ -3786,4 +3811,5 @@ void backend_execute(uint64_t handle) {
     if (sync_submit < 0) sync_submit = getenv("LARECOMP_SYNC_SUBMIT") ? 1 : 0;
     if (sync_submit) renderer_flush();
     else renderer_submit();
+    vk_backend_unlock();
 }

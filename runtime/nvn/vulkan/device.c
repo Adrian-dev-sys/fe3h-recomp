@@ -476,7 +476,15 @@ void backend_represent(void) {
     else SDL_Delay(16);
 }
 
-void backend_present(NvnTexture *t) {
+static void backend_present_locked(NvnTexture *t);
+void vk_backend_lock(void);
+void vk_backend_unlock(void);
+void backend_present(NvnTexture *t) {  // (one thread at a time in the backend: exec.c vk_backend_lock)
+    vk_backend_lock();
+    backend_present_locked(t);
+    vk_backend_unlock();
+}
+static void backend_present_locked(NvnTexture *t) {
     g_last_presented = t;
     TexBackend *b = vk_tex(t, true);
     b->presented = true;
