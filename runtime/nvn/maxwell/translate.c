@@ -30,6 +30,7 @@ const uint8_t *maxwell_dbg_vs;
 
 #define RZ 255
 #define LMEM_WORDS 256  // local memory per invocation (1 KB)
+#define SMEM_WORDS 8192  // compute shared memory (32 KB: every desktop GPU has it; Maxwell allows 48 KB)
 #define PT 7
 
 typedef struct {
@@ -63,7 +64,7 @@ typedef struct {
     uint8_t pred_used[8];
     uint32_t in_attr_mask, out_attr_mask;
     uint32_t vs_in_comp[32];
-    bool uses_branches, uses_cc, uses_local, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane;
+    bool uses_branches, uses_cc, uses_local, uses_shared, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane;
     bool uses_rscale;  // resolution-scale table (fragment/compute only)
     uint32_t flat_mask;           // fragment inputs using constant (flat) interpolation
     uint32_t noperspective_mask;  // fragment inputs using pass (linear) interpolation
@@ -1509,12 +1510,24 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         icmp_expr(cmp, (int)bits(w, 49, 3), cv, "0u", bits(w, 48, 1));
         sprintf(t, "(%s ? %s : %s)", cmp, R(a), bv);
         set_reg(c, d, t);
-    } else if (OPM(0xef40000000000000ull, 0xfff8000000000000ull) || OPM(0xef50000000000000ull, 0xfff8000000000000ull)) {  // LDL / STL
-        // thread-private local memory, modelled as a word array (byte/short accesses within a word)
+    } else if (OPM(0xef40000000000000ull, 0xfff8000000000000ull) || OPM(0xef50000000000000ull, 0xfff8000000000000ull) ||
+               OPM(0xef48000000000000ull, 0xfff8000000000000ull) || OPM(0xef58000000000000ull, 0xfff8000000000000ull)) {
+        // LDL / STL: thread-private local memory, modelled as a word array (byte/short accesses within a word).
+        // LDS / STS (same layout, bit 51): compute shared memory, the same way in a `shared` array (GLSL only).
         bool store = bits(w, 52, 1);
+        bool shared_mem = bits(w, 51, 1);
         int size = (int)bits(w, 48, 3);
         int32_t off = (int32_t)sbits(w, 20, 24);
-        c->uses_local = true;
+        const char *mem = "lmem";
+        unsigned words = LMEM_WORDS;
+        if (shared_mem) {
+            if (!c->glsl || c->stage != STAGE_COMPUTE) { fail(c, "LDS/STS outside a GLSL compute shader at %#x", pc); return; }
+            c->uses_shared = true;
+            mem = "smem";
+            words = SMEM_WORDS;
+        } else {
+            c->uses_local = true;
+        }
         char addr[128];
         if (a == RZ) sprintf(addr, "%du", off);
         else sprintf(addr, "(%s + %du)", R(a), (uint32_t)off);
@@ -1524,19 +1537,19 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             if (size < 4) {
                 static const char *const ext[] = {"(v >> sh) & 0xFFu", "uint(int(char((v >> sh) & 0xFFu)))", "(v >> sh) & 0xFFFFu",
                                                   "uint(int(short((v >> sh) & 0xFFFFu)))"};
-                if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      uint v = lmem[(la >> 2) & %du]; uint sh = (la & 3u) * 8u; r%d = %s;\n", LMEM_WORDS - 1, d, ext[size]); }
+                if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      uint v = %s[(la >> 2) & %du]; uint sh = (la & 3u) * 8u; r%d = %s;\n", mem, words - 1, d, ext[size]); }
             } else {
                 for (int k = 0; k < nw; k++)
-                    if (d != RZ && d + k < RZ) { c->reg_used[d + k] = 1; sp(&c->body, "      r%d = lmem[((la >> 2) + %du) & %du];\n", d + k, k, LMEM_WORDS - 1); }
+                    if (d != RZ && d + k < RZ) { c->reg_used[d + k] = 1; sp(&c->body, "      r%d = %s[((la >> 2) + %du) & %du];\n", d + k, mem, k, words - 1); }
             }
         } else {
             if (size < 4) {
                 uint32_t m = size < 2 ? 0xFFu : 0xFFFFu;
-                sp(&c->body, "      uint sh = (la & 3u) * 8u; uint i = (la >> 2) & %du; lmem[i] = (lmem[i] & ~(0x%xu << sh)) | ((%s & 0x%xu) << sh);\n",
-                   LMEM_WORDS - 1, m, R(d), m);
+                sp(&c->body, "      uint sh = (la & 3u) * 8u; uint i = (la >> 2) & %du; %s[i] = (%s[i] & ~(0x%xu << sh)) | ((%s & 0x%xu) << sh);\n",
+                   words - 1, mem, mem, m, R(d), m);
             } else {
                 for (int k = 0; k < nw; k++)
-                    sp(&c->body, "      lmem[((la >> 2) + %du) & %du] = %s;\n", k, LMEM_WORDS - 1, R(d == RZ ? RZ : d + k));
+                    sp(&c->body, "      %s[((la >> 2) + %du) & %du] = %s;\n", mem, k, words - 1, R(d == RZ ? RZ : d + k));
             }
         }
         sp(&c->body, "    }\n");
@@ -1857,6 +1870,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (c->omap_depth) info->writes_depth = true;
     } else {
         sp(&s, "layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;\n");
+        if (c->uses_shared) sp(&s, "shared uint smem[%d];\n", SMEM_WORDS);
     }
     sp(&s, "void main() {\n");
     if (stage == STAGE_VERTEX) {
