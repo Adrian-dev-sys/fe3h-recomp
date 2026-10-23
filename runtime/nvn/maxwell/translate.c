@@ -415,11 +415,17 @@ static bool emit_half(Ctx *c, uint64_t w) {
         hstore(c, d, t, merge, sat);
         return true;
     }
-    // ---- HSETP2 immediate (7e0x): B is two immediate halves (as HADD2's), the compare and HAnd move to 49 / 53
-    if ((op & 0xfe80) == 0x7e00) {
-        sprintf(ib, "0x%08xu", himm(w));
+    // ---- HSETP2 immediate (7e0x) / constant buffer (7e8x): B is two immediate halves (as HADD2's), or a cbuf value
+    // read as one f32 (as HADD2's cbuf form, with its neg 56 / abs 54); the compare and HAnd move to 49 / 53
+    if ((op & 0xfe80) == 0x7e00 || (op & 0xfe80) == 0x7e80) {
         const char *x = HS(R(a), (int)bits(w, 47, 2), bits(w, 43, 1), bits(w, 44, 1));
-        const char *y = HS(ib, 0, false, false);
+        const char *y;
+        if ((op & 0xfe80) == 0x7e00) {
+            sprintf(ib, "0x%08xu", himm(w));
+            y = HS(ib, 0, false, false);
+        } else {
+            y = HS(cbuf_ref(c, (int)bits(w, 34, 5), bits(w, 20, 14) * 4, NULL, cb), 1, bits(w, 56, 1), bits(w, 54, 1));
+        }
         int cop = (int)bits(w, 49, 4), bop = (int)bits(w, 45, 2);
         const char *pp = P((int)bits(w, 39, 3), bits(w, 42, 1));
         char lx[512], ly[512];
@@ -1571,6 +1577,25 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                     sp(&c->body, "      %s[((la >> 2) + %du) & %du] = %s;\n", mem, k, words - 1, R(d == RZ ? RZ : d + k));
             }
         }
+        sp(&c->body, "    }\n");
+    } else if (OPM(0xec00000000000000ull, 0xff00000000000000ull)) {  // ATOMS
+        // atomic on compute shared memory: Rd = old value at [Ra + imm22 * 4], combined with Rb. 32-bit only.
+        if (!c->glsl || c->stage != STAGE_COMPUTE) { fail(c, "ATOMS outside a GLSL compute shader at %#x", pc); return; }
+        int size = (int)bits(w, 28, 2), aop = (int)bits(w, 52, 4);
+        uint32_t off = (uint32_t)bits(w, 30, 22) * 4u;
+        if (size > 1) { fail(c, "ATOMS size %d at %#x", size, pc); return; }
+        static const char *const fn[] = {"atomicAdd", "atomicMin", "atomicMax", NULL, NULL, "atomicAnd", "atomicOr", "atomicXor", "atomicExchange"};
+        if (aop > 8 || !fn[aop]) { fail(c, "ATOMS op %d at %#x", aop, pc); return; }
+        c->uses_shared = true;
+        char addr[128];
+        if (a == RZ) sprintf(addr, "%uu", off);
+        else sprintf(addr, "(%s + %uu)", R(a), off);
+        const char *bv = R((int)bits(w, 20, 8));
+        // (S32 min / max would compare signed: the shared array is uint, so those stay unsupported for now)
+        if (size == 1 && (aop == 1 || aop == 2)) { fail(c, "ATOMS signed min/max at %#x", pc); return; }
+        sp(&c->body, "    { uint ai_ = (%s >> 2) & %du;\n", addr, SMEM_WORDS - 1);
+        sp(&c->body, "      uint ov_ = %s(smem[ai_], %s);\n", fn[aop], bv);
+        if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = ov_;\n", d); }
         sp(&c->body, "    }\n");
     } else if (OPM(0x50d8000000000000ull, 0xfff8000000000000ull)) {  // VOTE
         // mode (48): ALL / ANY / EQ of the source predicate across the warp, into a predicate (45); the ballot of it
