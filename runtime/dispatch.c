@@ -223,6 +223,33 @@ void rt_fatal_trace(void) {
         for (int i = 0; i < 31; i += 4)
             fprintf(stderr, "  x%-2d %016llx  x%-2d %016llx  x%-2d %016llx  x%-2d %016llx\n", i, c->x[i], i + 1,
                     c->x[i + 1], i + 2, c->x[i + 2], i + 3, c->x[i + 3]);
+        // host-implemented (HLE) functions the registers point at: a crash in host code is usually inside one
+        uint64_t seen[32];
+        int nseen = 0;
+        for (int i = 0; i < 32; i++) {
+            uint64_t v = i < 31 ? c->x[i] : c->pc;
+            if (v < HLE_BASE || v >= HLE_BASE + 16ull * hle_count || (v & 15)) continue;
+            bool dup = false;
+            for (int k = 0; k < nseen; k++) dup |= seen[k] == v;
+            if (dup) continue;
+            seen[nseen++] = v;
+            char reg[8];
+            if (i < 31) snprintf(reg, sizeof reg, "x%d", i);
+            else snprintf(reg, sizeof reg, "pc");
+            fprintf(stderr, "  %s = %llx -> HLE %s\n", reg, v, hle_slots[(v - HLE_BASE) / 16].name);
+        }
+        // the guest call chain (frame pointers), with sdk names where known
+        fprintf(stderr, "guest call chain:\n");
+        uint64_t pc = c->x[30], fp = c->x[29];
+        for (int i = 0; i < 16 && pc; i++) {
+            uint64_t off = 0;
+            const char *s = loader_symbol_at(pc, &off);
+            if (s) fprintf(stderr, "  #%-2d %llx %s+%llx\n", i, pc, s, off);
+            else fprintf(stderr, "  #%-2d %llx\n", i, pc);
+            if (fp < GUEST_LO || fp >= GUEST_HI || (fp & 7)) break;
+            pc = ((uint64_t *)(uintptr_t)fp)[1];
+            fp = ((uint64_t *)(uintptr_t)fp)[0];
+        }
     }
     plat_fatal_notice();
     // our crash handler also catches SIGABRT: without this abort() re-entered it forever (a 5 GB log)
