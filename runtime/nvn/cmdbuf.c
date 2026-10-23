@@ -115,11 +115,10 @@ static CmdRec *record_copy(Cpu *c, uint32_t op, int arg, uint32_t len) {
 // ---- state binding
 NVN(nvnCommandBufferBindProgram) {
     Snap s = snap(c);
-    // (cmd, program, stages). A NULL program unbinds those stages (FE3H unbinds tessellation, stages 0x8, before its
-    // draws). Nothing is recorded: the renderer keeps one program for every stage, and a draw always binds its own.
-    if (!s.x[1]) return;
+    // (cmd, program, stages): binds the program to those stages only (exec.c bind_program). A NULL program unbinds
+    // them (FE3H unbinds tessellation, stages 0x8, before its draws).
     CmdRec *r = record(c, CMD_BIND_PROGRAM, 0, &s);
-    r->x[0] = (uint64_t)(uintptr_t)HOST(NvnProgram, s.x[1]);  // host program
+    r->x[0] = s.x[1] ? (uint64_t)(uintptr_t)HOST(NvnProgram, s.x[1]) : 0;  // host program
 }
 NVN(nvnCommandBufferBindBlendState) { record_copy(c, CMD_BIND_BLEND, 1, 8); }
 NVN(nvnCommandBufferBindChannelMaskState) { record_copy(c, CMD_BIND_CHANNEL_MASK, 1, 4); }

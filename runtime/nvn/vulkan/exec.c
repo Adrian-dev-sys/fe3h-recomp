@@ -23,7 +23,7 @@ static const char *const skip_names[SK_N] = {"compute shader", "LARECOMP_SKIP_CS
 static uint64_t stat_skip_why[SK_N];
 static int skip_logged[SK_N];
 #define SKIP(why, ...) do { stat_skipped++; stat_skip_why[why]++; \
-        if (skip_logged[why] < 5) { skip_logged[why]++; LOG("[skip] %s: " __VA_ARGS__); } return; } while (0)
+        if (skip_logged[why] < 5) { skip_logged[why]++; LOG("[skip] %s: ", skip_names[why]); LOG(__VA_ARGS__); } return; } while (0)
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static uint64_t stat_upload_bytes;
 // LARECOMP_VK_PROF=1: render-thread time per category in the fps log (exec = whole command lists, draw = draw(),
@@ -694,7 +694,8 @@ typedef struct { uint64_t addr, size; } Range;
 static struct {
     RtState rt;
     bool rt_dirty;
-    NvnProgram *program;
+    NvnProgram *program;           // what draws / dispatches use: stage_prog combined (bind_program)
+    NvnProgram *stage_prog[6];     // bound per stage: vertex, fragment, geometry, tess control, tess eval, compute
     uint8_t blend[8][8];
     uint32_t channel_mask;
     uint8_t color_state[4], ds[8], ms[0x18], poly[4];
@@ -810,6 +811,56 @@ const char *renderer_stats(void) {
     }
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_flushes = stat_wait_ns = 0;
     return stats_text;
+}
+
+// nvnCommandBufferBindProgram(cmd, program, stages) binds a program to the given stages only (NVNshaderStageBits:
+// vertex 1, fragment 2, geometry 4, tess control 8, tess eval 16, compute 32 - the stages[] index order). Link's
+// Awakening binds one program for everything; Three Houses binds vertex and fragment programs separately, so the last
+// one bound (a fragment-only program) was used for every stage and its draws were skipped. When the bound stages come
+// from more than one program, draws use a combined program, made once per set of shader code addresses.
+#define MERGED_TAB 4096
+static struct { uint64_t code[6]; NvnProgram *prog; } merged_tab[MERGED_TAB];
+static NvnProgram *combined_program(void) {
+    NvnProgram *one = NULL;
+    bool same = true;
+    for (int i = 0; i < 6; i++) {
+        NvnProgram *p = st.stage_prog[i];
+        if (!p) continue;
+        if (!one) one = p;
+        else if (p != one) same = false;
+    }
+    if (same) return one;  // (the usual case: the program as bound, its backend caches intact)
+    uint64_t code[6], h = 1469598103934665603ull;
+    for (int i = 0; i < 6; i++) {
+        code[i] = st.stage_prog[i] ? st.stage_prog[i]->stages[i].code_addr : 0;
+        h = (h ^ code[i]) * 1099511628211ull;
+    }
+    uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (MERGED_TAB - 1);
+    for (int n = 0; n < MERGED_TAB; n++, slot = (slot + 1) & (MERGED_TAB - 1)) {
+        if (merged_tab[slot].prog && !memcmp(merged_tab[slot].code, code, sizeof code)) return merged_tab[slot].prog;
+        if (!merged_tab[slot].prog) {
+            NvnProgram *m = calloc(1, sizeof *m);
+            if (!m) return one;
+            for (int i = 0; i < 6; i++) {
+                if (!st.stage_prog[i]) continue;
+                m->stages[i] = st.stage_prog[i]->stages[i];
+                m->stages[i].backend = NULL;
+                m->stage_mask |= 1u << i;
+            }
+            memcpy(merged_tab[slot].code, code, sizeof code);
+            merged_tab[slot].prog = m;
+            return m;
+        }
+    }
+    static bool warned;
+    if (!warned) { warned = true; LOG("[vk] combined program table full\n"); }
+    return one;
+}
+static void bind_program(NvnProgram *p, uint32_t stages) {
+    if (!stages) stages = p ? p->stage_mask : 0;  // (no stage bits given: the program's own stages)
+    for (int i = 0; i < 6; i++)
+        if (stages & (1u << i)) st.stage_prog[i] = p && (p->stage_mask & (1u << i)) ? p : NULL;
+    st.program = combined_program();
 }
 
 static void st_defaults(void) {
@@ -2509,7 +2560,9 @@ static CsProg *compute_program(NvnProgram *np) {
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
-    CsProg *cp = compute_program(st.program);
+    // (the compute program as bound: not a combination with whatever graphics programs are bound, which would build
+    // the same compute shader again for every graphics combination)
+    CsProg *cp = compute_program(st.stage_prog[5] ? st.stage_prog[5] : st.program);
     if (!cp || atomic_load(&cp->p.state) != 1)
         SKIP(SK_CS_PROG, "compute code %llx state %d\n", (unsigned long long)st.program->stages[5].code_addr, cp ? atomic_load(&cp->p.state) : -1);
     {   // LARECOMP_SKIP_CS=<code address hex> (debug): skip that compute shader's dispatches, to see what it does
@@ -3609,7 +3662,7 @@ static void exec_list(uint64_t handle, int depth) {
             for (uint64_t i = 0; i < r->x[0] && depth < 8; i++) exec_list(h[i], depth + 1);
             break;
         }
-        case CMD_BIND_PROGRAM: st.program = (NvnProgram *)(uintptr_t)r->x[0]; break;
+        case CMD_BIND_PROGRAM: bind_program((NvnProgram *)(uintptr_t)r->x[0], (uint32_t)r->x[1]); break;
         case CMD_BIND_BLEND: { uint8_t *b = x; memcpy(st.blend[b[0] & 7], b, 8); break; }
         case CMD_BIND_CHANNEL_MASK: memcpy(&st.channel_mask, x, 4); break;
         case CMD_BIND_COLOR: memcpy(st.color_state, x, 4); break;
