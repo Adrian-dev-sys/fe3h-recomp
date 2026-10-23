@@ -275,6 +275,27 @@ static void attr_load(Ctx *c, int dst, uint32_t addr, const char *idx) {
     set_reg(c, dst, e);
 }
 
+// IPA with a register index (address = Ra + imm, Ra usually from AL2P): the attribute is only known at run time, so
+// every input the vertex shader provides is a candidate, picked by its number; the component index stays dynamic.
+// GLSL fragment shaders only (vs_out_mask names the candidates there).
+static void ipa_indexed(Ctx *c, int d, const char *base, uint32_t addr, int mode, int mul) {
+    uint32_t mask = c->key ? c->key->vs_out_mask : 0;
+    sp(&c->body, "    { uint ad_ = %s + %uu; uint ix_ = (ad_ - 128u) >> 4; uint cx_ = (ad_ >> 2) & 3u; uint iv_ = 0u;\n", base,
+       addr);
+    char mb[16];
+    for (int a = 0; a < 32; a++) {
+        if (!(mask & (1u << a))) continue;
+        c->in_attr_mask |= 1u << a;
+        if (mode == 0) sp(&c->body, "      if (ix_ == %du) iv_ = as_type<uint>(in.v%d[cx_] * in.pos.w);\n", a, a);
+        else if (mode == 1 && mul != RZ)
+            sp(&c->body, "      if (ix_ == %du) iv_ = as_type<uint>(in.v%d[cx_] * in.pos.w * as_type<float>(%s));\n", a, a,
+               reg(c, mul, mb));
+        else sp(&c->body, "      if (ix_ == %du) iv_ = as_type<uint>(in.v%d[cx_]);\n", a, a);
+    }
+    if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = iv_;\n", d); }
+    sp(&c->body, "    }\n");
+}
+
 static void attr_store(Ctx *c, int src, uint32_t addr) {
     char b[16];
     const char *v = reg(c, src, b);
@@ -901,15 +922,19 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         bool idx = bits(w, 38, 1);
         uint32_t addr = (uint32_t)bits(w, 28, 10);
         int mode = (int)bits(w, 54, 2);  // 0 pass, 1 multiply, 2 constant, 3 sc
-        if (idx) { fail(c, "ipa idx"); }
-        if (addr >= 0x80 && addr < 0x280) {
-            int at = (addr - 0x80) >> 4;
-            if (mode == 2) c->flat_mask |= 1u << at;
+        if (idx) {
+            if (!c->glsl || c->stage != STAGE_FRAGMENT || mode == 2) fail(c, "ipa idx");
+            else ipa_indexed(c, d, R(a), addr, mode, (int)bits(w, 20, 8));
+        } else {
+            if (addr >= 0x80 && addr < 0x280) {
+                int at = (addr - 0x80) >> 4;
+                if (mode == 2) c->flat_mask |= 1u << at;
+            }
+            c->ipa_mode = mode;
+            c->ipa_mul = (int)bits(w, 20, 8);
+            attr_load(c, d, addr, NULL);
+            c->ipa_mode = -1;
         }
-        c->ipa_mode = mode;
-        c->ipa_mul = (int)bits(w, 20, 8);
-        attr_load(c, d, addr, NULL);
-        c->ipa_mode = -1;
         if (bits(w, 51, 1) && d != RZ) sp(&c->body, "    r%d = as_type<uint>(saturate(as_type<float>(r%d)));\n", d, d);
     } else if (OPM(0xefd8000000000000ull, 0xfff8000000000000ull)) {  // LD attribute
         int n = 1 + (int)bits(w, 47, 2);
@@ -921,6 +946,14 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int n = 1 + (int)bits(w, 47, 2);
         uint32_t addr = (uint32_t)bits(w, 20, 10);
         for (int i = 0; i < n; i++) attr_store(c, d + i, addr + 4 * i);
+    } else if (OPM(0xefa0000000000000ull, 0xfff8000000000000ull)) {  // AL2P
+        // attribute number to attribute address: Rd = Ra + imm11, read by an indexed IPA / LD a[] after it. The
+        // destination predicate (an out-of-range flag) is never set.
+        char t2[96];
+        sprintf(t2, "(%s + %uu)", R(a), (uint32_t)bits(w, 20, 11));
+        set_reg(c, d, t2);
+        int dp = (int)bits(w, 44, 3);
+        if (dp != PT) { c->pred_used[dp] = 1; sp(&c->body, "    p%d = false;\n", dp); }
     } else if (OPM(0xef90000000000000ull, 0xfff8000000000000ull)) {  // LD c[idx][reg + imm]
         int idx = (int)bits(w, 36, 5);
         int64_t off = (int64_t)bits(w, 20, 16);  // unsigned (Ryujinx InstLdc.CbufOffset)
