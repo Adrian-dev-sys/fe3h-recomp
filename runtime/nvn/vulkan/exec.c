@@ -2789,7 +2789,20 @@ static void draw_(CmdRec *r, bool indexed) {
     // ---- depth / stencil (dynamic)
     static int nodt = -1;
     if (nodt < 0) nodt = getenv("LARECOMP_NO_DEPTH_TEST") != NULL;
-    bool dt = st.ds[0] && !nodt && pass_depth;
+    // (test) LARECOMP_NO_DEPTH_TEST_FS=<fragment shader hash>[,...]: those draws only, without depth test: their whole
+    // shape on top of everything (is stray geometry misplaced, or just not hidden?)
+    static uint64_t nodt_fs[8];
+    static int nnodt_fs = -1;
+    if (nnodt_fs < 0) {
+        nnodt_fs = 0;
+        for (const char *p = getenv("LARECOMP_NO_DEPTH_TEST_FS"); p && *p && nnodt_fs < 8;) {
+            nodt_fs[nnodt_fs++] = strtoull(p, (char **)&p, 16);
+            while (*p == ',') p++;
+        }
+    }
+    bool nodt_here = false;
+    for (int i = 0; i < nnodt_fs; i++) nodt_here |= g_cur_fs_hash == nodt_fs[i];
+    bool dt = st.ds[0] && !nodt && !nodt_here && pass_depth;
     if (ss_need(SS_DT, ss.dt == (VkBool32)dt)) { ss.dt = dt; vkCmdSetDepthTestEnable(cb, dt); }
     VkBool32 dw = dt && st.ds[1];
     if (ss_need(SS_DW, ss.dw == dw)) { ss.dw = dw; vkCmdSetDepthWriteEnable(cb, dw); }
