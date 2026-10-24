@@ -1988,7 +1988,10 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     uint64_t size = si->cbuf_size[k] ? si->cbuf_size[k] : 256;
     if (!r.addr) return ubo_span(vk_transient_copy(zeros, size, 256), size);
     if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
-    if (size > r.size && r.size) size = r.size;
+    static int full = -1;  // (test) LARECOMP_CBUF_FULL=1: dynamically indexed cbufs bound as a full 64 KB of guest memory
+    if (full < 0) full = getenv("LARECOMP_CBUF_FULL") != NULL;
+    if (full && (si->cbuf_dynamic & (1u << k))) size = 0x10000;
+    else if (size > r.size && r.size) size = r.size;
     if (size < 16) size = 16;
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
     // within a command list nothing writes guest memory (no inline UpdateUniformBuffer: that writes through below
@@ -3152,6 +3155,12 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     LOG("[draw]   ds %02x %02x %02x %02x %02x %02x %02x %02x | stencil ref %u/%u mask %#x/%#x vmask %#x/%#x | depth range %g %g\n",
         st.ds[0], st.ds[1], st.ds[2], st.ds[3], st.ds[4], st.ds[5], st.ds[6], st.ds[7], st.stencil_ref[0], st.stencil_ref[1],
         st.stencil_mask[0], st.stencil_mask[1], st.stencil_vmask[0], st.stencil_vmask[1], st.depth_range[0][0], st.depth_range[0][1]);
+    for (int sg = 0; sg < 2; sg++) {  // the bound uniform buffers (cbuf index - 3) and their sizes
+        LOG("[draw]   %s ubufs:", sg ? "fs" : "vs");
+        for (int i = 0; i < 18; i++)
+            if (st.ubuf[sg][i].addr) LOG(" c%d=%llx+%#llx", i + 3, (unsigned long long)st.ubuf[sg][i].addr, (unsigned long long)st.ubuf[sg][i].size);
+        LOG(" | dynamic %#x\n", sg ? pr->fi->cbuf_dynamic : pr->vi->cbuf_dynamic);
+    }
     if (pr->vi->attr_mask) {  // the vertex inputs: NVN format, stream, offset; the streams' strides
         LOG("[draw]   attribs:");
         for (int i = 0; i < 32; i++) {
