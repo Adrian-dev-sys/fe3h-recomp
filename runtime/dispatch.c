@@ -316,6 +316,14 @@ bool rt_fault_watch(uint64_t fa, uint64_t pc) {
                     fp = ((const uint64_t *)(uintptr_t)fp)[0];
                 }
                 fprintf(stderr, "\n");
+                if (c->x[1] >= 0x7000000000ull && c->x[1] < 0x7800000000ull && !(c->x[1] & 3)) {  // (a copy: its source)
+                    const uint32_t *w = (const uint32_t *)(uintptr_t)c->x[1];
+                    uint32_t nz = 0;
+                    for (int i = 0; i < 256; i++) nz += w[i] != 0;
+                    fprintf(stderr, "[watch]   at x1: %u of 256 words non-zero:", nz);
+                    for (int i = 0; i < 16; i++) fprintf(stderr, " %08x", w[i]);
+                    fprintf(stderr, "\n");
+                }
             }
         }
     }

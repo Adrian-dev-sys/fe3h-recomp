@@ -2529,12 +2529,20 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 if (bt->addr >= HEAP_BASE && bt->addr + bytes <= HEAP_BASE + gmem_size && gmem_buf) off = (uint32_t)(bt->addr - HEAP_BASE);
                 {   // LARECOMP_WATCH_BUFTEX=1 (debug): watch the first compute-bound buffer texture's page - who touches it
                     static bool armed;
-                    if (!armed && stage == 5 && getenv("LARECOMP_WATCH_BUFTEX") && renderer_present_count() >= 60) {
+                    // LARECOMP_WATCH_ADDR=<hex addr>,<hex size> instead: that range (armed at the same moment)
+                    if (!armed && stage == 5 && (getenv("LARECOMP_WATCH_BUFTEX") || getenv("LARECOMP_WATCH_ADDR")) &&
+                        renderer_present_count() >= 60) {
                         extern uint64_t g_watch_lo, g_watch_hi;
                         extern void watch_arm(void);
                         armed = true;
                         g_watch_lo = bt->addr;
                         g_watch_hi = bt->addr + bytes;
+                        const char *wa = getenv("LARECOMP_WATCH_ADDR");
+                        if (wa) {
+                            char *e;
+                            g_watch_lo = strtoull(wa, &e, 16);
+                            g_watch_hi = g_watch_lo + (*e == ',' ? strtoull(e + 1, NULL, 16) : 0x10);
+                        }
                         LOG("[buftex] watching %llx..%llx\n", (unsigned long long)g_watch_lo, (unsigned long long)g_watch_hi);
                         watch_arm();
                     }
