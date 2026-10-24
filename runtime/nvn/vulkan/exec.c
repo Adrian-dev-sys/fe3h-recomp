@@ -3140,7 +3140,77 @@ static void draw_(CmdRec *r, bool indexed) {
     }
 }
 
+// (frame capture) LARECOMP_DUMP_FS=<fragment shader hash>[,...]: the data of those draws into build/dump/: the vertex
+// streams, index buffer, vertex-stage uniform buffers and compiler constants as raw files, and what they are in
+// d<NNN>_info.txt - to run a translated shader on the CPU with the game's own inputs.
+static void dump_file(const char *path, uint64_t addr, uint64_t size) {
+    if (!addr || !size) return;
+    if (size > (64ull << 20)) size = 64ull << 20;
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite((const void *)(uintptr_t)addr, 1, size, f);
+    fclose(f);
+}
+static void dump_draw(Prog *pr, CmdRec *r, bool indexed) {
+    static uint64_t want[16];
+    static int nwant = -1, ndump;
+    if (nwant < 0) {
+        nwant = 0;
+        for (const char *p = getenv("LARECOMP_DUMP_FS"); p && *p && nwant < 16;) {
+            want[nwant++] = strtoull(p, (char **)&p, 16);
+            while (*p == ',') p++;
+        }
+    }
+    bool hit = false;
+    for (int i = 0; i < nwant; i++) hit |= want[i] == g_cur_fs_hash;
+    if (!hit) return;
+    mkdir("build/dump", 0755);
+    int n = ndump++;
+    char path[256];
+    snprintf(path, sizeof path, "build/dump/d%03d_info.txt", n);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    NvnShaderStage *vs = &st.program->stages[0];
+    fprintf(f, "fs_hash %016llx\nvs %llx\nfs %llx\nindexed %d\nmode %llu\ncount %llu\n", (unsigned long long)g_cur_fs_hash,
+            (unsigned long long)vs->code_addr, (unsigned long long)st.program->stages[1].code_addr, indexed,
+            (unsigned long long)r->x[0], (unsigned long long)r->x[2]);
+    if (indexed) {
+        uint32_t itype = (uint32_t)r->x[1], isz = itype == 0 ? 1 : itype == 1 ? 2 : 4;
+        fprintf(f, "index_type %u\nbase_vertex %d\n", itype, (int32_t)r->x[4]);
+        snprintf(path, sizeof path, "build/dump/d%03d_index.bin", n);
+        dump_file(path, r->x[3], (uint64_t)r->x[2] * isz);
+    } else {
+        fprintf(f, "first %llu\n", (unsigned long long)r->x[1]);
+    }
+    uint32_t streams = 0;
+    for (int i = 0; i < 32; i++) {
+        if (!(pr->vi->attr_mask & (1u << i))) continue;
+        uint32_t a = i < st.nattrib ? st.attrib[i] : 0;
+        fprintf(f, "attr %d fmt 0x%x stream %u offset %u\n", i, a & 0xFF, (a >> 8) & 0x1F, a >> 13);
+        if ((a & 0xFF) && ((a >> 8) & 0x1F) < 16) streams |= 1u << ((a >> 8) & 0x1F);
+    }
+    for (int s = 0; s < 16; s++) {
+        if (!(streams & (1u << s))) continue;
+        fprintf(f, "stream %d stride %u divisor %u size %llu\n", s, s < st.nstream ? st.stream[s][0] : 0, s < st.nstream ? st.stream[s][1] : 0,
+                (unsigned long long)st.vbuf[s].size);
+        snprintf(path, sizeof path, "build/dump/d%03d_stream%d.bin", n, s);
+        dump_file(path, st.vbuf[s].addr, st.vbuf[s].size);
+    }
+    for (int i = 0; i < 18; i++) {
+        if (!st.ubuf[0][i].addr) continue;
+        fprintf(f, "cbuf %d size %llu\n", i + 3, (unsigned long long)st.ubuf[0][i].size);
+        snprintf(path, sizeof path, "build/dump/d%03d_cb%d.bin", n, i + 3);
+        dump_file(path, st.ubuf[0][i].addr, st.ubuf[0][i].size);
+    }
+    fprintf(f, "cb1 size %u\n", vs->const_size);
+    snprintf(path, sizeof path, "build/dump/d%03d_cb1.bin", n);
+    dump_file(path, vs->code_addr + vs->const_offset, vs->const_size);
+    fclose(f);
+    LOG("[dump] d%03d: fs %016llx vs %llx\n", n, (unsigned long long)g_cur_fs_hash, (unsigned long long)vs->code_addr);
+}
+
 static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
+    dump_draw(pr, r, indexed);
     LOG("[draw] %s inst %llu mode %llu count %llu prog vs=%llx fs=%llx | vs cb %#x fs cb %#x | rt %d", indexed ? "e" : "a",
         (unsigned long long)(indexed ? r->x[6] : r->x[4]), (unsigned long long)r->x[0], (unsigned long long)r->x[2],
         (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)st.program->stages[1].code_addr,
