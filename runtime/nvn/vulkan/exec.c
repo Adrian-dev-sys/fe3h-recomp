@@ -2547,7 +2547,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                         watch_arm();
                     }
                 }
-                {   // (log) each buffer texture when bound, and again 3 frames later (its GPU writes done by then)
+                if (getenv("LARECOMP_LOG_BUFTEX")) {  // (debug) each buffer texture when bound, and 3 frames later
                     static struct { uint64_t addr, bytes, frame; int stage, slot; bool rescanned; } bl[64];
                     static int nbl;
                     uint64_t now = renderer_present_count();

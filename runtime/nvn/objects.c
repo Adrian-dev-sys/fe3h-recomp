@@ -187,7 +187,8 @@ NVN(nvnMemoryPoolInitialize) {
     p->storage = G(uint64_t, A(1), 0x10);
     p->size = G(uint64_t, A(1), 0x18);
     p->flags = G(uint32_t, A(1), 8);
-    LOG("[nvn] memory pool storage %llx size %llx flags %#x\n", (unsigned long long)p->storage, (unsigned long long)p->size, p->flags);
+    if (getenv("LARECOMP_LOG_POOLS"))  // (FE3H makes a transient pool thousands of times a session)
+        LOG("[nvn] memory pool storage %llx size %llx flags %#x\n", (unsigned long long)p->storage, (unsigned long long)p->size, p->flags);
     SET_HOST(A(0), p);
     RET(1);
 }
