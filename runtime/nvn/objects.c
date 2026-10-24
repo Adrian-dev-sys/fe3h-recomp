@@ -187,6 +187,7 @@ NVN(nvnMemoryPoolInitialize) {
     p->storage = G(uint64_t, A(1), 0x10);
     p->size = G(uint64_t, A(1), 0x18);
     p->flags = G(uint32_t, A(1), 8);
+    LOG("[nvn] memory pool storage %llx size %llx flags %#x\n", (unsigned long long)p->storage, (unsigned long long)p->size, p->flags);
     SET_HOST(A(0), p);
     RET(1);
 }
@@ -201,7 +202,24 @@ NVN(nvnMemoryPoolFlushMappedRange) {
     backend_pool_written(p->storage + A(1), A(2));
 }
 NVN(nvnMemoryPoolInvalidateMappedRange) { (void)c; }
-NVN(nvnMemoryPoolMapVirtual) { RET(1); }
+// MapVirtual(pool, numRequests, const NVNmappingRequest *): {physicalPool*, physicalOffset, virtualOffset, size,
+// storageClass} (0x28 bytes). Not implemented: logged.
+NVN(nvnMemoryPoolMapVirtual) {
+    static int nlog;
+    NvnPool *vp = HOST(NvnPool, A(0));
+    int n = (int)A(1);
+    for (int i = 0; i < n && nlog < 40; i++, nlog++) {
+        const uint8_t *rq = (const uint8_t *)AP(2) + i * 0x28;
+        uint64_t pp = *(const uint64_t *)rq;
+        NvnPool *phys = pp ? HOST(NvnPool, pp) : NULL;
+        LOG("[nvn] MapVirtual pool storage %llx size %llx flags %#x: phys %llx+%llx -> virt +%llx size %llx class %#x\n",
+            (unsigned long long)vp->storage, (unsigned long long)vp->size, vp->flags,
+            (unsigned long long)(phys ? phys->storage : 0), (unsigned long long)*(const uint64_t *)(rq + 8),
+            (unsigned long long)*(const uint64_t *)(rq + 16), (unsigned long long)*(const uint64_t *)(rq + 24),
+            *(const uint32_t *)(rq + 32));
+    }
+    RET(1);
+}
 
 // ================================================================== buffers
 // Builder: device@0 pool@8 offset@0x10 size@0x18. Buffer: address@0 pool@8 offset@0x10 size@0x18 id@0x20
