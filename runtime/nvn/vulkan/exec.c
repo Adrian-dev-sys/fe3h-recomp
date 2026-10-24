@@ -2527,6 +2527,20 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 uint32_t off = 0xFFFFFFFFu, cnt = (bt->width < 0xFFFFFFu ? bt->width : 0xFFFFFFu) | (bt->format & 0xFFu) << 24;
                 gmem_info();  // (imports the heap on first use)
                 if (bt->addr >= HEAP_BASE && bt->addr + bytes <= HEAP_BASE + gmem_size && gmem_buf) off = (uint32_t)(bt->addr - HEAP_BASE);
+                {   // (log each buffer texture once, with its first words)
+                    static uint64_t seen[64];
+                    static int nseen;
+                    bool known = false;
+                    for (int k = 0; k < nseen; k++) if (seen[k] == bt->addr) known = true;
+                    if (!known && nseen < 64) {
+                        seen[nseen++] = bt->addr;
+                        const uint32_t *wd = (const uint32_t *)(uintptr_t)bt->addr;
+                        LOG("[buftex] stage %d slot %d addr %llx (heap %llx..%llx) %u texels fmt %#x -> off %#x | %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                            stage, t, (unsigned long long)bt->addr, (unsigned long long)HEAP_BASE,
+                            (unsigned long long)(HEAP_BASE + gmem_size), bt->width, bt->format, off,
+                            wd[0], wd[1], wd[2], wd[3], wd[4], wd[5], wd[6], wd[7]);
+                    }
+                }
                 memcpy(&rs[1 + t][2], &off, 4);
                 memcpy(&rs[1 + t][3], &cnt, 4);
             }
