@@ -298,9 +298,13 @@ bool rt_fault_watch(uint64_t fa, uint64_t pc) {
         snprintf(key, sizeof key, "%.36s+%llx", nm, (unsigned long long)(fa - g_watch_lo));
         bool found = false;
         for (int i = 0; i < nseen; i++) found |= !strcmp(seen[i], key);
+        static int all = -1, nall;
+        if (all < 0) all = getenv("LARECOMP_WATCH_ALL") != NULL;
+        if (all && found && nall++ < 300) found = false, nseen--;  // (LARECOMP_WATCH_ALL: every access, up to 300)
         if (!found && nseen < 64) {
+            extern uint64_t renderer_present_count(void);
             snprintf(seen[nseen++], 48, "%s", key);
-            fprintf(stderr, "[watch] +%#llx by %s\n", fa - g_watch_lo, nm);
+            fprintf(stderr, "[watch] f%llu +%#llx by %s\n", (unsigned long long)renderer_present_count(), fa - g_watch_lo, nm);
             Cpu *c = kernel_current_cpu();
             if (c) {  // the guest side: arguments and call chain (frame pointers)
                 fprintf(stderr, "[watch]   x0 %llx x1 %llx x2 %llx x3 %llx | chain:", (unsigned long long)c->x[0],
