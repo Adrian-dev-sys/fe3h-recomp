@@ -87,6 +87,10 @@ typedef struct {
 #define GMAP_MAX 16  // ranges in the table (GMap { uvec4 gmap[GMAP_MAX + 1]; }: [i] = addr lo, addr hi, size, word offset;
                      // [GMAP_MAX].x = count)
 extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
+// GLSL: keep 32-bit denormals (SPIR-V DenormPreserve). Maxwell shaders pass integers through float registers and
+// varyings (a flat input read back with floatBitsToUint); small ones are denormal bit patterns, which a GPU that
+// flushes denormals (AMD) turns into 0. Set by the backend when the device supports it.
+extern bool maxwell_glsl_denorm_preserve;
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;

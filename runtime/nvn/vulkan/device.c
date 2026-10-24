@@ -215,6 +215,15 @@ static void create_device(void) {
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
+    {   // keep 32-bit denormals in translated shaders where the GPU can (maxwell/shader.h maxwell_glsl_denorm_preserve)
+        extern bool maxwell_glsl_denorm_preserve;
+        VkPhysicalDeviceVulkan12Properties p12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &p12};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+        maxwell_glsl_denorm_preserve = p12.shaderDenormPreserveFloat32 && !getenv("LARECOMP_NO_DENORM_PRESERVE");
+        LOG("[vk] fp32 denormals: %s%s\n", p12.shaderDenormPreserveFloat32 ? "can preserve" : "flushed (no DenormPreserve)",
+            maxwell_glsl_denorm_preserve ? ", preserving" : "");
+    }
     if (g_vk.bias_unorm) {
         g_vk.set_bias2 = (PFN_vkCmdSetDepthBias2EXT)vkGetDeviceProcAddr(g_vk.dev, "vkCmdSetDepthBias2EXT");
         if (!g_vk.set_bias2) g_vk.bias_unorm = false;

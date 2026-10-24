@@ -23,6 +23,7 @@
 #include "shader.h"
 
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
+bool maxwell_glsl_denorm_preserve;
 const uint8_t *maxwell_dbg_code;
 uint32_t maxwell_dbg_pc;
 int maxwell_dbg_reg;
@@ -1831,6 +1832,7 @@ static const char glsl_prelude[] =
     "#extension GL_KHR_shader_subgroup_vote : require\n"
     "#extension GL_KHR_shader_subgroup_ballot : require\n"
     "#extension GL_EXT_texture_shadow_lod : require\n"
+    "#extension GL_EXT_spirv_intrinsics : require\n"
     "#define cbr(cb, off) cb[min((off) >> 4, uint(cb.length() - 1))][((off) >> 2) & 3u]\n"
     "uint as_u(float x) { return floatBitsToUint(x); }\n"
     "uint as_u(uint x) { return x; }\n"
@@ -1894,6 +1896,9 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     int set = stage == STAGE_FRAGMENT ? 1 : 0;
     Str s = {0};
     sp(&s, "%s", glsl_prelude);
+    if (maxwell_glsl_denorm_preserve)  // (the declaration only brings in the DenormPreserve capability)
+        sp(&s, "spirv_execution_mode(4459, 32);\n"
+               "spirv_instruction(extensions = [\"SPV_KHR_float_controls\"], capabilities = [4464], id = 0) void denorm_cap_();\n");
     for (int i = 0; i < 18; i++) {
         if (!(info->cbuf_mask & (1u << i))) continue;
         uint32_t n = info->cbuf_size[i] / 16;
