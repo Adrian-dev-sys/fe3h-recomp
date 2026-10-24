@@ -78,6 +78,25 @@ HLE_FUNC("_ZN5movie9MediaDataD1Ev", md_dtor) {
     *(uint64_t *)(uintptr_t)c->x[0] = 0;
 }
 HLE_FUNC("_ZN5movie9MediaData5ClearEv", md_clear_hle) { md_clear(md(c->x[0])); }
+HLE_FUNC("_ZN5movie9MediaData8SetInt32EPKci", md_set_int32) {
+    md_set_int(md(c->x[0]), (const char *)(uintptr_t)c->x[1], (int32_t)c->x[2]);
+    if (getenv("LARECOMP_MOVIE_LOG")) LOG("[movie] MediaData SetInt32(\"%s\", %d)\n", (const char *)(uintptr_t)c->x[1], (int32_t)c->x[2]);
+}
+HLE_FUNC("_ZN5movie9MediaData8SetInt64EPKcl", md_set_int64) {
+    md_set_int(md(c->x[0]), (const char *)(uintptr_t)c->x[1], (int64_t)c->x[2]);
+}
+HLE_FUNC("_ZN5movie9MediaData9SetStringEPKcS2_", md_set_string) {
+    const char *v = (const char *)(uintptr_t)c->x[2];
+    md_set_str(md(c->x[0]), (const char *)(uintptr_t)c->x[1], v ? v : "");
+}
+HLE_FUNC("_ZNK5movie9MediaData9FindInt64EPKcPl", md_find_int64) {
+    MediaData *m = md(c->x[0]);
+    const char *k = (const char *)(uintptr_t)c->x[1];
+    for (int i = 0; i < m->n; i++)
+        if (!m->e[i].is_str && !strcmp(m->e[i].key, k)) { *(int64_t *)(uintptr_t)c->x[2] = m->e[i].ival; c->x[0] = 1; return; }
+    md_miss("FindInt64", k, c);
+    c->x[0] = 0;
+}
 HLE_FUNC("_ZNK5movie9MediaData9FindInt32EPKcPi", md_find_int32) {
     MediaData *m = md(c->x[0]);
     const char *k = (const char *)(uintptr_t)c->x[1];
@@ -472,6 +491,84 @@ static void unk_1_30(Cpu *c) { movie_unknown(c, 1, 30); }
 static void unk_1_31(Cpu *c) { movie_unknown(c, 1, 31); }
 static const HostFn g_unk_1[32] = {unk_1_0, unk_1_1, unk_1_2, unk_1_3, unk_1_4, unk_1_5, unk_1_6, unk_1_7, unk_1_8, unk_1_9, unk_1_10, unk_1_11, unk_1_12, unk_1_13, unk_1_14, unk_1_15, unk_1_16, unk_1_17, unk_1_18, unk_1_19, unk_1_20, unk_1_21, unk_1_22, unk_1_23, unk_1_24, unk_1_25, unk_1_26, unk_1_27, unk_1_28, unk_1_29, unk_1_30, unk_1_31};
 
+// LARECOMP_MOVIE_LOG: every Extractor / Decoder virtual call with its arguments and result
+static HostFn g_vt_real[2][32];
+static void vt_trace(Cpu *c, int k, int i) {
+    static int on = -1, n;
+    if (on < 0) on = getenv("LARECOMP_MOVIE_LOG") ? 1 : 0;
+    uint64_t a1 = c->x[1], a2 = c->x[2], a3 = c->x[3], lr = c->x[30];
+    g_vt_real[k][i](c);
+    if (on && n++ < 400)
+        LOG("[movie] %s.%d(%llx, %llx, %llx) -> %llx (lr=%llx)\n", k ? "Decoder" : "Extractor", i, (unsigned long long)a1,
+            (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)c->x[0], (unsigned long long)lr);
+}
+static void tr_0_0(Cpu *c) { vt_trace(c, 0, 0); }
+static void tr_0_1(Cpu *c) { vt_trace(c, 0, 1); }
+static void tr_0_2(Cpu *c) { vt_trace(c, 0, 2); }
+static void tr_0_3(Cpu *c) { vt_trace(c, 0, 3); }
+static void tr_0_4(Cpu *c) { vt_trace(c, 0, 4); }
+static void tr_0_5(Cpu *c) { vt_trace(c, 0, 5); }
+static void tr_0_6(Cpu *c) { vt_trace(c, 0, 6); }
+static void tr_0_7(Cpu *c) { vt_trace(c, 0, 7); }
+static void tr_0_8(Cpu *c) { vt_trace(c, 0, 8); }
+static void tr_0_9(Cpu *c) { vt_trace(c, 0, 9); }
+static void tr_0_10(Cpu *c) { vt_trace(c, 0, 10); }
+static void tr_0_11(Cpu *c) { vt_trace(c, 0, 11); }
+static void tr_0_12(Cpu *c) { vt_trace(c, 0, 12); }
+static void tr_0_13(Cpu *c) { vt_trace(c, 0, 13); }
+static void tr_0_14(Cpu *c) { vt_trace(c, 0, 14); }
+static void tr_0_15(Cpu *c) { vt_trace(c, 0, 15); }
+static void tr_0_16(Cpu *c) { vt_trace(c, 0, 16); }
+static void tr_0_17(Cpu *c) { vt_trace(c, 0, 17); }
+static void tr_0_18(Cpu *c) { vt_trace(c, 0, 18); }
+static void tr_0_19(Cpu *c) { vt_trace(c, 0, 19); }
+static void tr_0_20(Cpu *c) { vt_trace(c, 0, 20); }
+static void tr_0_21(Cpu *c) { vt_trace(c, 0, 21); }
+static void tr_0_22(Cpu *c) { vt_trace(c, 0, 22); }
+static void tr_0_23(Cpu *c) { vt_trace(c, 0, 23); }
+static void tr_0_24(Cpu *c) { vt_trace(c, 0, 24); }
+static void tr_0_25(Cpu *c) { vt_trace(c, 0, 25); }
+static void tr_0_26(Cpu *c) { vt_trace(c, 0, 26); }
+static void tr_0_27(Cpu *c) { vt_trace(c, 0, 27); }
+static void tr_0_28(Cpu *c) { vt_trace(c, 0, 28); }
+static void tr_0_29(Cpu *c) { vt_trace(c, 0, 29); }
+static void tr_0_30(Cpu *c) { vt_trace(c, 0, 30); }
+static void tr_0_31(Cpu *c) { vt_trace(c, 0, 31); }
+static const HostFn g_tr_0[32] = {tr_0_0, tr_0_1, tr_0_2, tr_0_3, tr_0_4, tr_0_5, tr_0_6, tr_0_7, tr_0_8, tr_0_9, tr_0_10, tr_0_11, tr_0_12, tr_0_13, tr_0_14, tr_0_15, tr_0_16, tr_0_17, tr_0_18, tr_0_19, tr_0_20, tr_0_21, tr_0_22, tr_0_23, tr_0_24, tr_0_25, tr_0_26, tr_0_27, tr_0_28, tr_0_29, tr_0_30, tr_0_31};
+static void tr_1_0(Cpu *c) { vt_trace(c, 1, 0); }
+static void tr_1_1(Cpu *c) { vt_trace(c, 1, 1); }
+static void tr_1_2(Cpu *c) { vt_trace(c, 1, 2); }
+static void tr_1_3(Cpu *c) { vt_trace(c, 1, 3); }
+static void tr_1_4(Cpu *c) { vt_trace(c, 1, 4); }
+static void tr_1_5(Cpu *c) { vt_trace(c, 1, 5); }
+static void tr_1_6(Cpu *c) { vt_trace(c, 1, 6); }
+static void tr_1_7(Cpu *c) { vt_trace(c, 1, 7); }
+static void tr_1_8(Cpu *c) { vt_trace(c, 1, 8); }
+static void tr_1_9(Cpu *c) { vt_trace(c, 1, 9); }
+static void tr_1_10(Cpu *c) { vt_trace(c, 1, 10); }
+static void tr_1_11(Cpu *c) { vt_trace(c, 1, 11); }
+static void tr_1_12(Cpu *c) { vt_trace(c, 1, 12); }
+static void tr_1_13(Cpu *c) { vt_trace(c, 1, 13); }
+static void tr_1_14(Cpu *c) { vt_trace(c, 1, 14); }
+static void tr_1_15(Cpu *c) { vt_trace(c, 1, 15); }
+static void tr_1_16(Cpu *c) { vt_trace(c, 1, 16); }
+static void tr_1_17(Cpu *c) { vt_trace(c, 1, 17); }
+static void tr_1_18(Cpu *c) { vt_trace(c, 1, 18); }
+static void tr_1_19(Cpu *c) { vt_trace(c, 1, 19); }
+static void tr_1_20(Cpu *c) { vt_trace(c, 1, 20); }
+static void tr_1_21(Cpu *c) { vt_trace(c, 1, 21); }
+static void tr_1_22(Cpu *c) { vt_trace(c, 1, 22); }
+static void tr_1_23(Cpu *c) { vt_trace(c, 1, 23); }
+static void tr_1_24(Cpu *c) { vt_trace(c, 1, 24); }
+static void tr_1_25(Cpu *c) { vt_trace(c, 1, 25); }
+static void tr_1_26(Cpu *c) { vt_trace(c, 1, 26); }
+static void tr_1_27(Cpu *c) { vt_trace(c, 1, 27); }
+static void tr_1_28(Cpu *c) { vt_trace(c, 1, 28); }
+static void tr_1_29(Cpu *c) { vt_trace(c, 1, 29); }
+static void tr_1_30(Cpu *c) { vt_trace(c, 1, 30); }
+static void tr_1_31(Cpu *c) { vt_trace(c, 1, 31); }
+static const HostFn g_tr_1[32] = {tr_1_0, tr_1_1, tr_1_2, tr_1_3, tr_1_4, tr_1_5, tr_1_6, tr_1_7, tr_1_8, tr_1_9, tr_1_10, tr_1_11, tr_1_12, tr_1_13, tr_1_14, tr_1_15, tr_1_16, tr_1_17, tr_1_18, tr_1_19, tr_1_20, tr_1_21, tr_1_22, tr_1_23, tr_1_24, tr_1_25, tr_1_26, tr_1_27, tr_1_28, tr_1_29, tr_1_30, tr_1_31};
+
 #define EX_LOCKED(fn) \
     static void fn##_l(Cpu *c) { pthread_mutex_lock(&ex_lock); fn(c); pthread_mutex_unlock(&ex_lock); }
 EX_LOCKED(ex_dtor)
@@ -494,6 +591,7 @@ HLE_FUNC("_ZN5movie9ExtractorC1ENS_13ContainerTypeE", movie_extractor_ctor) {
                         ex_read_l, ex_advance_l, ex_get_sample_time_l, NULL, ex_cached_duration_l,
                         ex_set_data_source_l};
         for (int i = 0; i < 32; i++) if (!f[i]) f[i] = g_unk_0[i];
+        for (int i = 0; i < 32; i++) g_vt_real[0][i] = f[i], f[i] = g_tr_0[i];
         vt = g_ex_vt = make_vtable(f, 32, "Extractor");
     }
     uint64_t *self = (uint64_t *)(uintptr_t)c->x[0];
@@ -903,6 +1001,7 @@ HLE_FUNC("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11Dec
                         dec_acquire_output, dec_get_output_buffer, dec_get_counts, dec_release_output, ok,
                         NULL, dec_get_output_buffer_format};
         for (int i = 0; i < 32; i++) if (!f[i]) f[i] = g_unk_1[i];
+        for (int i = 0; i < 32; i++) g_vt_real[1][i] = f[i], f[i] = g_tr_1[i];
         vt = g_dec_vt = make_vtable(f, 32, "Decoder");
     }
     uint64_t *self = (uint64_t *)(uintptr_t)c->x[0];
