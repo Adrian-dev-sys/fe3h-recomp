@@ -3112,6 +3112,17 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n", st.viewport[0][0], st.viewport[0][1],
         st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],
         st.channel_mask);
+    if (pr->vi->attr_mask) {  // the vertex inputs: NVN format, stream, offset; the streams' strides
+        LOG("[draw]   attribs:");
+        for (int i = 0; i < 32; i++) {
+            if (!(pr->vi->attr_mask & (1u << i))) continue;
+            uint32_t a = i < st.nattrib ? st.attrib[i] : 0;
+            LOG(" a%d=f%#x/s%u+%u", i, a & 0xFF, (a >> 8) & 0x1F, a >> 13);
+        }
+        LOG(" | strides:");
+        for (int s = 0; s < st.nstream && s < 16; s++) if (st.stream[s][0]) LOG(" s%d=%u", s, st.stream[s][0]);
+        LOG("\n");
+    }
     if (getenv("LARECOMP_DEBUG_DATA")) {  // vertex streams 0-1 and fragment cbufs: the first floats
         for (int s = 0; s < 2; s++) {
             if (!st.vbuf[s].addr) continue;
