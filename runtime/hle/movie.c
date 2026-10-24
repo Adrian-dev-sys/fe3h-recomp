@@ -15,6 +15,9 @@
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 #include <pthread.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -132,6 +135,7 @@ HLE_FUNC("_ZN5movie6Buffer12SetInt32DataEi", buf_set_i32) { BUF(c->x[0])->i32 = 
 
 HLE_FUNC("_ZN5movie12SetAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_", movie_set_allocator) { (void)c; }
 HLE_FUNC("_ZN5movie17SetThreadPriorityEi", movie_set_thread_priority) { (void)c; }
+HLE_FUNC("_ZN5movie11SetCoreMaskEm", movie_set_core_mask) { c->x[0] = 0; }
 HLE_FUNC("_ZN5movie17GetThreadPriorityEv", movie_get_thread_priority) { c->x[0] = 16; }
 
 // ------------------------------------------------------------------ helpers
@@ -210,9 +214,11 @@ static void ex_fill(Extractor *e) {
     }
 }
 
-static void ex_set_data_source(Cpu *c) {
+static void ex_open_path(Cpu *c, const char *path);
+static void ex_set_data_source(Cpu *c) { ex_open_path(c, (const char *)(uintptr_t)c->x[2]); }
+
+static void ex_open_path(Cpu *c, const char *path) {
     Extractor *e = self_state(c);
-    const char *path = (const char *)(uintptr_t)c->x[2];
     // "rom:/region_common/movie/title.webm" -> extracted/romfs/region_common/movie/title.webm
     const char *rel = path && strstr(path, ":/") ? strstr(path, ":/") + 2 : path;
     char host[1024];
@@ -350,11 +356,113 @@ static void ex_dtor(Cpu *c) {
     c->x[0] = 0;
 }
 
-static void movie_log_slot(Cpu *c) {
+// Reads a NUL-terminated string at a guest address without faulting on a bad pointer (NULL if not text).
+static const char *peek_str(uint64_t a, char *buf, size_t cap) {
+    if (a < 0x7000000000ull || a >= 0x7800000000ull || (a >= HLE_BASE && a < TLS_BASE)) return NULL;
+#ifdef _WIN32
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), (const void *)(uintptr_t)a, buf, cap - 1, &got) || got == 0) {
+        // (the string may end close to the end of a mapping: try a short read)
+        if (!ReadProcessMemory(GetCurrentProcess(), (const void *)(uintptr_t)a, buf, 16, &got) || got == 0) return NULL;
+    }
+    buf[got] = 0;
+#else
+    return NULL;
+#endif
+    size_t n = strnlen(buf, cap - 1);
+    if (n < 4) return NULL;
+    for (size_t i = 0; i < n; i++) if ((unsigned char)buf[i] < 0x20 || (unsigned char)buf[i] > 0x7e) return NULL;
+    return buf;
+}
+
+// Unknown extractor / decoder slots: log the slot and arguments; an extractor call given a movie path opens it.
+static void movie_unknown(Cpu *c, int kind, int slot) {
     static int n;
-    if (n++ < 20) LOG("[movie] unimplemented virtual (lr=%llx)\n", c->x[30]);
+    char sb[4][256];
+    const char *str[4] = {0};
+    for (int i = 0; i < 4; i++) str[i] = peek_str(c->x[1 + i], sb[i], sizeof sb[i]);
+    if (n++ < 40)
+        LOG("[movie] %s slot %d (lr=%llx) x1=%llx%s%s%s x2=%llx%s%s%s x3=%llx x4=%llx\n", kind ? "Decoder" : "Extractor",
+            slot, (unsigned long long)c->x[30], (unsigned long long)c->x[1], str[0] ? " \"" : "", str[0] ? str[0] : "",
+            str[0] ? "\"" : "", (unsigned long long)c->x[2], str[1] ? " \"" : "", str[1] ? str[1] : "", str[1] ? "\"" : "",
+            (unsigned long long)c->x[3], (unsigned long long)c->x[4]);
+    if (kind == 0)
+        for (int i = 0; i < 2; i++)
+            if (str[i] && (strstr(str[i], ".webm") || strstr(str[i], ".mp4") || strstr(str[i], "movie/"))) {
+                LOG("[movie] treating Extractor slot %d as SetDataSource(path)\n", slot);
+                pthread_mutex_lock(&ex_lock);
+                ex_open_path(c, str[i]);
+                pthread_mutex_unlock(&ex_lock);
+                return;
+            }
     c->x[0] = 0;
 }
+static void unk_0_0(Cpu *c) { movie_unknown(c, 0, 0); }
+static void unk_0_1(Cpu *c) { movie_unknown(c, 0, 1); }
+static void unk_0_2(Cpu *c) { movie_unknown(c, 0, 2); }
+static void unk_0_3(Cpu *c) { movie_unknown(c, 0, 3); }
+static void unk_0_4(Cpu *c) { movie_unknown(c, 0, 4); }
+static void unk_0_5(Cpu *c) { movie_unknown(c, 0, 5); }
+static void unk_0_6(Cpu *c) { movie_unknown(c, 0, 6); }
+static void unk_0_7(Cpu *c) { movie_unknown(c, 0, 7); }
+static void unk_0_8(Cpu *c) { movie_unknown(c, 0, 8); }
+static void unk_0_9(Cpu *c) { movie_unknown(c, 0, 9); }
+static void unk_0_10(Cpu *c) { movie_unknown(c, 0, 10); }
+static void unk_0_11(Cpu *c) { movie_unknown(c, 0, 11); }
+static void unk_0_12(Cpu *c) { movie_unknown(c, 0, 12); }
+static void unk_0_13(Cpu *c) { movie_unknown(c, 0, 13); }
+static void unk_0_14(Cpu *c) { movie_unknown(c, 0, 14); }
+static void unk_0_15(Cpu *c) { movie_unknown(c, 0, 15); }
+static void unk_0_16(Cpu *c) { movie_unknown(c, 0, 16); }
+static void unk_0_17(Cpu *c) { movie_unknown(c, 0, 17); }
+static void unk_0_18(Cpu *c) { movie_unknown(c, 0, 18); }
+static void unk_0_19(Cpu *c) { movie_unknown(c, 0, 19); }
+static void unk_0_20(Cpu *c) { movie_unknown(c, 0, 20); }
+static void unk_0_21(Cpu *c) { movie_unknown(c, 0, 21); }
+static void unk_0_22(Cpu *c) { movie_unknown(c, 0, 22); }
+static void unk_0_23(Cpu *c) { movie_unknown(c, 0, 23); }
+static void unk_0_24(Cpu *c) { movie_unknown(c, 0, 24); }
+static void unk_0_25(Cpu *c) { movie_unknown(c, 0, 25); }
+static void unk_0_26(Cpu *c) { movie_unknown(c, 0, 26); }
+static void unk_0_27(Cpu *c) { movie_unknown(c, 0, 27); }
+static void unk_0_28(Cpu *c) { movie_unknown(c, 0, 28); }
+static void unk_0_29(Cpu *c) { movie_unknown(c, 0, 29); }
+static void unk_0_30(Cpu *c) { movie_unknown(c, 0, 30); }
+static void unk_0_31(Cpu *c) { movie_unknown(c, 0, 31); }
+static const HostFn g_unk_0[32] = {unk_0_0, unk_0_1, unk_0_2, unk_0_3, unk_0_4, unk_0_5, unk_0_6, unk_0_7, unk_0_8, unk_0_9, unk_0_10, unk_0_11, unk_0_12, unk_0_13, unk_0_14, unk_0_15, unk_0_16, unk_0_17, unk_0_18, unk_0_19, unk_0_20, unk_0_21, unk_0_22, unk_0_23, unk_0_24, unk_0_25, unk_0_26, unk_0_27, unk_0_28, unk_0_29, unk_0_30, unk_0_31};
+static void unk_1_0(Cpu *c) { movie_unknown(c, 1, 0); }
+static void unk_1_1(Cpu *c) { movie_unknown(c, 1, 1); }
+static void unk_1_2(Cpu *c) { movie_unknown(c, 1, 2); }
+static void unk_1_3(Cpu *c) { movie_unknown(c, 1, 3); }
+static void unk_1_4(Cpu *c) { movie_unknown(c, 1, 4); }
+static void unk_1_5(Cpu *c) { movie_unknown(c, 1, 5); }
+static void unk_1_6(Cpu *c) { movie_unknown(c, 1, 6); }
+static void unk_1_7(Cpu *c) { movie_unknown(c, 1, 7); }
+static void unk_1_8(Cpu *c) { movie_unknown(c, 1, 8); }
+static void unk_1_9(Cpu *c) { movie_unknown(c, 1, 9); }
+static void unk_1_10(Cpu *c) { movie_unknown(c, 1, 10); }
+static void unk_1_11(Cpu *c) { movie_unknown(c, 1, 11); }
+static void unk_1_12(Cpu *c) { movie_unknown(c, 1, 12); }
+static void unk_1_13(Cpu *c) { movie_unknown(c, 1, 13); }
+static void unk_1_14(Cpu *c) { movie_unknown(c, 1, 14); }
+static void unk_1_15(Cpu *c) { movie_unknown(c, 1, 15); }
+static void unk_1_16(Cpu *c) { movie_unknown(c, 1, 16); }
+static void unk_1_17(Cpu *c) { movie_unknown(c, 1, 17); }
+static void unk_1_18(Cpu *c) { movie_unknown(c, 1, 18); }
+static void unk_1_19(Cpu *c) { movie_unknown(c, 1, 19); }
+static void unk_1_20(Cpu *c) { movie_unknown(c, 1, 20); }
+static void unk_1_21(Cpu *c) { movie_unknown(c, 1, 21); }
+static void unk_1_22(Cpu *c) { movie_unknown(c, 1, 22); }
+static void unk_1_23(Cpu *c) { movie_unknown(c, 1, 23); }
+static void unk_1_24(Cpu *c) { movie_unknown(c, 1, 24); }
+static void unk_1_25(Cpu *c) { movie_unknown(c, 1, 25); }
+static void unk_1_26(Cpu *c) { movie_unknown(c, 1, 26); }
+static void unk_1_27(Cpu *c) { movie_unknown(c, 1, 27); }
+static void unk_1_28(Cpu *c) { movie_unknown(c, 1, 28); }
+static void unk_1_29(Cpu *c) { movie_unknown(c, 1, 29); }
+static void unk_1_30(Cpu *c) { movie_unknown(c, 1, 30); }
+static void unk_1_31(Cpu *c) { movie_unknown(c, 1, 31); }
+static const HostFn g_unk_1[32] = {unk_1_0, unk_1_1, unk_1_2, unk_1_3, unk_1_4, unk_1_5, unk_1_6, unk_1_7, unk_1_8, unk_1_9, unk_1_10, unk_1_11, unk_1_12, unk_1_13, unk_1_14, unk_1_15, unk_1_16, unk_1_17, unk_1_18, unk_1_19, unk_1_20, unk_1_21, unk_1_22, unk_1_23, unk_1_24, unk_1_25, unk_1_26, unk_1_27, unk_1_28, unk_1_29, unk_1_30, unk_1_31};
 
 #define EX_LOCKED(fn) \
     static void fn##_l(Cpu *c) { pthread_mutex_lock(&ex_lock); fn(c); pthread_mutex_unlock(&ex_lock); }
@@ -373,11 +481,12 @@ EX_LOCKED(ex_set_data_source)
 HLE_FUNC("_ZN5movie9ExtractorC1ENS_13ContainerTypeE", movie_extractor_ctor) {
     uint64_t vt = g_ex_vt;
     if (!vt) {
-        HostFn f[16] = {ex_dtor_l, ex_dtor_l, movie_log_slot, movie_log_slot, ex_get_track_count_l,
-                        ex_get_track_config_l, ex_select_track_l, movie_log_slot, ex_seek_l, ex_get_sample_track_l,
-                        ex_read_l, ex_advance_l, ex_get_sample_time_l, movie_log_slot, ex_cached_duration_l,
+        HostFn f[32] = {ex_dtor_l, ex_dtor_l, NULL, NULL, ex_get_track_count_l,
+                        ex_get_track_config_l, ex_select_track_l, NULL, ex_seek_l, ex_get_sample_track_l,
+                        ex_read_l, ex_advance_l, ex_get_sample_time_l, NULL, ex_cached_duration_l,
                         ex_set_data_source_l};
-        vt = g_ex_vt = make_vtable(f, 16, "Extractor");
+        for (int i = 0; i < 32; i++) if (!f[i]) f[i] = g_unk_0[i];
+        vt = g_ex_vt = make_vtable(f, 32, "Extractor");
     }
     uint64_t *self = (uint64_t *)(uintptr_t)c->x[0];
     self[0] = vt;
@@ -781,11 +890,12 @@ static void dec_get_counts(Cpu *c) {  // slot 14: (int*, int64*) queried after C
 HLE_FUNC("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeEi", movie_decoder_ctor) {
     uint64_t vt = g_dec_vt;
     if (!vt) {
-        HostFn f[19] = {dec_dtor, dec_dtor, dec_configure, dec_register_events, dec_get_output_format,
+        HostFn f[32] = {dec_dtor, dec_dtor, dec_configure, dec_register_events, dec_get_output_format,
                         dec_start, dec_stop, ok, ok, dec_acquire_input, dec_get_input_buffer, dec_send_input,
                         dec_acquire_output, dec_get_output_buffer, dec_get_counts, dec_release_output, ok,
-                        movie_log_slot, dec_get_output_buffer_format};
-        vt = g_dec_vt = make_vtable(f, 19, "Decoder");
+                        NULL, dec_get_output_buffer_format};
+        for (int i = 0; i < 32; i++) if (!f[i]) f[i] = g_unk_1[i];
+        vt = g_dec_vt = make_vtable(f, 32, "Decoder");
     }
     uint64_t *self = (uint64_t *)(uintptr_t)c->x[0];
     Decoder *d = calloc(1, sizeof *d);
