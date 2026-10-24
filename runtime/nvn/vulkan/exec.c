@@ -3291,6 +3291,7 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         if (done_frame != renderer_present_count()) done_frame = renderer_present_count(), ndone = 0;
         for (int k = 0; k < ndone; k++) if (done[k] == g_cur_fs_hash) want = false;
         if (want && ndone < 32) {
+            extern uint32_t g_save_layer;
             done[ndone++] = g_cur_fs_hash;
             void renderer_save_depth_tex(TexBackend *b, const char *prefix);
             for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
@@ -3301,11 +3302,20 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
                 snprintf(path, sizeof path, "build/tex_%016llx_%d", (unsigned long long)g_cur_fs_hash, i);
                 if (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) {
                     renderer_save_depth_tex(b, path);
+                } else if (b->layers > 1 && b->depth == 1) {  // every layer (up to 64): _L<k>.png
+                    for (uint32_t ly = 0; ly < b->layers && ly < 64; ly++) {
+                        char p2[128];
+                        snprintf(p2, sizeof p2, "%s_L%u.png", path, ly);
+                        g_save_layer = ly;
+                        renderer_save_texture_tex(b, p2);
+                    }
+                    g_save_layer = 0;
                 } else {
                     strcat(path, ".png");
                     renderer_save_texture_tex(b, path);
                 }
-                LOG("[dumptex] %s: %ux%u f%#x\n", path, t->width, t->height, t->format);
+                LOG("[dumptex] %s: %ux%u f%#x layers %u depth %u target %u\n", path, t->width, t->height, t->format, b->layers,
+                    b->depth, t->target);
             }
         }
     }
@@ -3553,8 +3563,11 @@ static VkImageView raw_view(TexBackend *b) {
     VkFormat f = b->format == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM
                : b->format == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM : b->format;
     static const VkComponentMapping id = {0};
-    return vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, f, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
+    extern uint32_t g_save_layer;
+    uint32_t ly = g_save_layer < b->layers ? g_save_layer : 0;
+    return vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, f, 0, 1, ly, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
 }
+uint32_t g_save_layer;  // (frame capture) the array layer renderer_save_texture_tex saves
 
 // ---- post passes (Video tab "Anti-aliasing" / "Upscaler"): SMAA 1x at the game image's size, then AMD FSR 1 (EASU
 // upscale to the image's size in the window, RCAS sharpen) when it is smaller than its place in the window, as
