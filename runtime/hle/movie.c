@@ -955,6 +955,20 @@ static void dec_get_output_buffer(Cpu *c) {
         c->x[0] = 0;
         return;
     }
+    if (b->base && b->capacity > 8) {
+        // the game's own memory (FE3H): copy the decoded frame into it and keep the game's pointer
+        uint32_t n = d->out_size[i];
+        if (n > b->capacity) {
+            static int warned;
+            if (!warned++) LOG("[movie] output %u bytes > the game's buffer %llu\n", n, (unsigned long long)b->capacity);
+            n = (uint32_t)b->capacity;
+        }
+        memcpy((void *)(uintptr_t)b->base, d->out_mem[i], n);
+        b->offset = 0;
+        b->size = (int32_t)n;
+        c->x[0] = 0;
+        return;
+    }
     b->offset = 0;  // (the user data fields i64 / u32 / i32 stay the game's)
     b->base = (uint64_t)(uintptr_t)d->out_mem[i];
     b->capacity = d->out_cap;
