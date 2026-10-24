@@ -1019,8 +1019,39 @@ SERVICE("audren:u", audren_u) {
         ipc_return_object(resp, service_new("IAudioRenderer", audio_renderer, r));
         break;
     }
-    case 1: OUT(uint64_t, 0) = 0x1000000; resp_size(resp, 8); break;  // GetWorkBufferSize: 16 MB
-    case 2: case 4: ipc_return_object(resp, service_new("IAudioDevice", audio_device, NULL)); break;
+    case 1: {  // GetWorkBufferSize(params)
+        // The renderer here mixes on the CPU with its own memory, so the buffer the game gives it goes unused - but the
+        // game allocates it from its own audio heap. A flat 16 MB fitted Link's Awakening; Three Houses asked, could not
+        // allocate that much, and went on without sound (it never opened a renderer). Now an estimate in the spirit of
+        // the real formula (mix buffers, voices, sub mixes, effects, splitters, performance frames), generously rounded.
+        // LARECOMP_AUDREN_WORK=<bytes>: test override.
+        const uint32_t *p = (const uint32_t *)req->data;
+        uint64_t rate = p[0], samples = p[1] ? p[1] : 240, mixbufs = p[2], submixes = p[3], voices = p[4], sinks = p[5];
+        uint64_t effects = p[6], perf = p[7], splitters = p[9];
+        (void)rate;
+        uint64_t size = (mixbufs + 6) * samples * 4 * 2          // mix buffers (+ depop / scratch)
+                      + voices * 0x400                          // voice state, channel resources, wave buffer state
+                      + (submixes + 1) * 0x400 + sinks * 0x800  // mixes, sinks
+                      + effects * 0x4000                        // effect state (reverb / delay work areas)
+                      + splitters * 0x200                       // splitter info and destinations
+                      + (perf + 1) * 0x1000                     // performance frames
+                      + (effects + voices * 4) * 0x40           // memory pools
+                      + 0x10000;
+        size = (size + 0xFFFF) & ~0xFFFFull;
+        const char *e = getenv("LARECOMP_AUDREN_WORK");
+        if (e) size = strtoull(e, NULL, 0);
+        LOG("[audren] GetWorkBufferSize: %llu samples, %llu mix buffers, %llu voices, %llu sub mixes, %llu effects, %llu "
+            "splitters, rev %08x -> %llu KB\n", (unsigned long long)samples, (unsigned long long)mixbufs,
+            (unsigned long long)voices, (unsigned long long)submixes, (unsigned long long)effects,
+            (unsigned long long)splitters, p[12], (unsigned long long)(size >> 10));
+        OUT(uint64_t, 0) = size;
+        resp_size(resp, 8);
+        break;
+    }
+    case 2: case 4:
+        LOG("[audren] GetAudioDeviceService (cmd %u)\n", req->cmd);
+        ipc_return_object(resp, service_new("IAudioDevice", audio_device, NULL));
+        break;
     default: LOG("[audren] cmd %u (ok)\n", req->cmd);
     }
 }
