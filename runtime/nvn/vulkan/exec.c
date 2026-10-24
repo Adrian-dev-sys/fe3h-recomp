@@ -2566,7 +2566,9 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                         }
                         LOG("\n");
                     }
-                    if (nbl < 64 && now >= 60) {
+                    static uint64_t dbg_frame = ~0ull;  // (F9: this frame's bindings; else the first after frame 60)
+                    if (g_debug_frame && dbg_frame != now) dbg_frame = now, nbl = 0;
+                    if (nbl < 64 && (g_debug_frame || (dbg_frame == ~0ull && now >= 60))) {
                         const uint32_t *wd = (const uint32_t *)(uintptr_t)bt->addr;
                         uint64_t nw = bytes / 4, nz = 0;
                         for (uint64_t q = 0; q < nw; q++) if (wd[q]) nz++;
