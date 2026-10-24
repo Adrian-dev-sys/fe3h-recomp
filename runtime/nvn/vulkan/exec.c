@@ -2527,24 +2527,35 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 uint32_t off = 0xFFFFFFFFu, cnt = (bt->width < 0xFFFFFFu ? bt->width : 0xFFFFFFu) | (bt->format & 0xFFu) << 24;
                 gmem_info();  // (imports the heap on first use)
                 if (bt->addr >= HEAP_BASE && bt->addr + bytes <= HEAP_BASE + gmem_size && gmem_buf) off = (uint32_t)(bt->addr - HEAP_BASE);
-                {   // (log each buffer texture the 1st and 4th time it is bound: non-zero words, first non-zero ones)
-                    static uint64_t seen[64];
-                    static int nseen, times[64];
-                    int k = 0;
-                    while (k < nseen && seen[k] != bt->addr) k++;
-                    if (k == nseen && nseen < 64) seen[nseen++] = bt->addr;
-                    if (k < 64 && (times[k]++ == 0 || times[k] == 4)) {
-                        const uint32_t *wd = (const uint32_t *)(uintptr_t)bt->addr;
-                        uint64_t nw = bytes / 4, nz = 0, first = ~0ull;
+                {   // (log) each buffer texture when bound, and again 3 frames later (its GPU writes done by then)
+                    static struct { uint64_t addr, bytes, frame; int stage, slot; bool rescanned; } bl[64];
+                    static int nbl;
+                    uint64_t now = renderer_present_count();
+                    for (int k = 0; k < nbl; k++) {
+                        if (bl[k].rescanned || now < bl[k].frame + 3) continue;
+                        bl[k].rescanned = true;
+                        const uint32_t *wd = (const uint32_t *)(uintptr_t)bl[k].addr;
+                        uint64_t nw = bl[k].bytes / 4, nz = 0, first = ~0ull;
                         for (uint64_t q = 0; q < nw; q++) if (wd[q]) { nz++; if (first == ~0ull) first = q; }
-                        LOG("[buftex] f%llu (seen %d) stage %d slot %d addr %llx %u texels fmt %#x off %#x: %llu of %llu words non-zero",
-                            (unsigned long long)renderer_present_count(), times[k], stage, t, (unsigned long long)bt->addr, bt->width,
-                            bt->format, off, (unsigned long long)nz, (unsigned long long)nw);
+                        LOG("[buftex] f%llu: f%llu's stage %d slot %d buffer %llx now %llu of %llu words non-zero",
+                            (unsigned long long)now, (unsigned long long)bl[k].frame, bl[k].stage, bl[k].slot,
+                            (unsigned long long)bl[k].addr, (unsigned long long)nz, (unsigned long long)nw);
                         if (first != ~0ull) {
                             LOG(", from word %llu:", (unsigned long long)first);
                             for (uint64_t q = first; q < first + 8 && q < nw; q++) LOG(" %08x", wd[q]);
                         }
                         LOG("\n");
+                    }
+                    if (nbl < 64 && now >= 60) {
+                        const uint32_t *wd = (const uint32_t *)(uintptr_t)bt->addr;
+                        uint64_t nw = bytes / 4, nz = 0;
+                        for (uint64_t q = 0; q < nw; q++) if (wd[q]) nz++;
+                        LOG("[buftex] f%llu stage %d slot %d buffer %llx %u texels fmt %#x off %#x: %llu of %llu words non-zero when bound\n",
+                            (unsigned long long)now, stage, t, (unsigned long long)bt->addr, bt->width, bt->format, off,
+                            (unsigned long long)nz, (unsigned long long)nw);
+                        bl[nbl].addr = bt->addr; bl[nbl].bytes = bytes; bl[nbl].frame = now;
+                        bl[nbl].stage = stage; bl[nbl].slot = t; bl[nbl].rescanned = false;
+                        nbl++;
                     }
                 }
                 memcpy(&rs[1 + t][2], &off, 4);
@@ -4171,6 +4182,16 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_DOWNSAMPLE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], 1); break; }
         case CMD_COPY_BUFFER_TO_TEXTURE: copy_buffer_to_texture(r->x[0], x); break;
         case CMD_COPY_TEXTURE_TO_BUFFER: copy_texture_to_buffer(x, r->x[3]); break;
+        case CMD_CLEAR_BUFFER: {  // (buffer address, size, 32-bit value): as the copies, on the CPU once the GPU is idle
+            static int nlog;
+            if (nlog++ < 8) LOG("[nvn] ClearBuffer %llx size %llu value %#x\n", (unsigned long long)r->x[0], (unsigned long long)r->x[1], (uint32_t)r->x[2]);
+            if (!r->x[0] || r->x[1] > (256ull << 20)) break;
+            wait_why = "clear buffer";
+            renderer_flush();
+            uint32_t *d = (uint32_t *)(uintptr_t)r->x[0], v = (uint32_t)r->x[2];
+            for (uint64_t i = 0; i < r->x[1] / 4; i++) d[i] = v;
+            break;
+        }
         case CMD_COPY_BUFFER_TO_BUFFER:
             wait_why = "buffer -> buffer copy";
             renderer_flush();
