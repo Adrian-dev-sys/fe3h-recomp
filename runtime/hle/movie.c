@@ -27,7 +27,7 @@
 #define MOVIE_EOS 4u
 
 // ------------------------------------------------------------------ MediaData (8-byte handle)
-typedef struct { char *key; char *sval; int64_t ival; bool is_str; } MdEntry;
+typedef struct { char *key; char *sval; int64_t ival; bool is_str, is_rect; int32_t rect[4]; } MdEntry;
 typedef struct { MdEntry e[32]; int n; void *codecpar; } MediaData;
 
 static MediaData *md(uint64_t guest) {
@@ -48,7 +48,11 @@ static MdEntry *md_slot(MediaData *m, const char *k) {
     e->key = strdup(k);
     return e;
 }
-static void md_set_int(MediaData *m, const char *k, int64_t v) { MdEntry *e = md_slot(m, k); if (e) { e->ival = v; e->is_str = false; } }
+static void md_set_int(MediaData *m, const char *k, int64_t v) { MdEntry *e = md_slot(m, k); if (e) { e->ival = v; e->is_str = e->is_rect = false; } }
+static void md_set_rect(MediaData *m, const char *k, int32_t l, int32_t t, int32_t r, int32_t b) {
+    MdEntry *e = md_slot(m, k);
+    if (e) { e->is_str = false; e->is_rect = true; e->rect[0] = l; e->rect[1] = t; e->rect[2] = r; e->rect[3] = b; }
+}
 static void md_set_str(MediaData *m, const char *k, const char *v) {
     MdEntry *e = md_slot(m, k);
     if (e) { free(e->sval); e->sval = strdup(v); e->is_str = true; }
@@ -67,6 +71,8 @@ HLE_FUNC("_ZN5movie9MediaDataC1ERKS0_", md_copy) {
         dst->e[i].sval = src->e[i].sval ? strdup(src->e[i].sval) : NULL;
         dst->e[i].ival = src->e[i].ival;
         dst->e[i].is_str = src->e[i].is_str;
+        dst->e[i].is_rect = src->e[i].is_rect;
+        memcpy(dst->e[i].rect, src->e[i].rect, sizeof dst->e[i].rect);
     }
     dst->n = src->n;
     dst->codecpar = src->codecpar;
@@ -78,6 +84,23 @@ HLE_FUNC("_ZN5movie9MediaDataD1Ev", md_dtor) {
     *(uint64_t *)(uintptr_t)c->x[0] = 0;
 }
 HLE_FUNC("_ZN5movie9MediaData5ClearEv", md_clear_hle) { md_clear(md(c->x[0])); }
+// FindRect(name, &left, &top, &right, &bottom), e.g. "crop" (inclusive right / bottom)
+HLE_FUNC("_ZNK5movie9MediaData8FindRectEPKcPiS3_S3_S3_", md_find_rect) {
+    MediaData *m = md(c->x[0]);
+    const char *k = (const char *)(uintptr_t)c->x[1];
+    for (int i = 0; i < m->n; i++)
+        if (m->e[i].is_rect && !strcmp(m->e[i].key, k)) {
+            for (int j = 0; j < 4; j++) if (c->x[2 + j]) *(int32_t *)(uintptr_t)c->x[2 + j] = m->e[i].rect[j];
+            c->x[0] = 1;
+            return;
+        }
+    md_miss("FindRect", k, c);
+    c->x[0] = 0;
+}
+HLE_FUNC("_ZN5movie9MediaData7SetRectEPKciiii", md_set_rect_hle) {
+    md_set_rect(md(c->x[0]), (const char *)(uintptr_t)c->x[1], (int32_t)c->x[2], (int32_t)c->x[3], (int32_t)c->x[4],
+                (int32_t)c->x[5]);
+}
 HLE_FUNC("_ZN5movie9MediaData8SetInt32EPKci", md_set_int32) {
     md_set_int(md(c->x[0]), (const char *)(uintptr_t)c->x[1], (int32_t)c->x[2]);
     if (getenv("LARECOMP_MOVIE_LOG")) LOG("[movie] MediaData SetInt32(\"%s\", %d)\n", (const char *)(uintptr_t)c->x[1], (int32_t)c->x[2]);
@@ -715,6 +738,8 @@ static void dec_configure(Cpu *c) {
 static void dec_register_events(Cpu *c) {
     Decoder *d = self_state(c);
     memcpy(d->events, (void *)(uintptr_t)c->x[1], sizeof d->events);
+    LOG("[movie] decoder events: input %llx output %llx format %llx error %llx\n", (unsigned long long)d->events[0],
+        (unsigned long long)d->events[1], (unsigned long long)d->events[2], (unsigned long long)d->events[3]);
     c->x[0] = 0;
 }
 
@@ -728,6 +753,9 @@ static void dec_output_format(Decoder *d, MediaData *m) {
         md_set_int(m, "nv12-y-offset", 0);
         md_set_int(m, "nv12-uv-offset", d->stride * ((d->height + 15) & ~15));
         md_set_int(m, "nv12-colorspace", 0);
+        md_set_int(m, "stride", d->stride);
+        md_set_int(m, "slice-height", (d->height + 15) & ~15);
+        md_set_rect(m, "crop", 0, 0, d->width - 1, d->height - 1);
     } else {
         md_set_str(m, "mime", "audio/raw");
         md_set_int(m, "sample-rate", d->sample_rate);
@@ -743,6 +771,9 @@ static void dec_start(Cpu *c) {
     pthread_mutex_lock(&d->lock);
     d->stopped = false;
     pthread_mutex_unlock(&d->lock);
+    // a hardware decoder reports its output format before the first frame: FE3H creates its video textures
+    // (sized from GetOutputFormat's "crop") only on this event
+    if (d->video) dec_signal(c, d, 2);
     dec_signal(c, d, 0);  // all input buffers are free
     c->x[0] = 0;
 }
