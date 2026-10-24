@@ -75,6 +75,8 @@ typedef struct {
     bool tex_weak[64];            // slot type only guessed (from a size query): the next sample decides
     bool fail;
     bool branchy;  // program uses the pc state machine
+    bool bar_split;  // (GLSL compute with the pc state machine) BAR leaves the loop: barrier() where lanes have reconverged
+    bool uses_bar_split;
     int ipa_mode;  // interpolation mode of the IPA being translated (-1 for plain loads)
     int ipa_mul;   // its multiplier register (mode 1: the result is the "pass" value attr/w times this register)
     // GLSL (fields kept last: the MSL path's layout, including its out-of-range reg_used writes, is unchanged)
@@ -1796,7 +1798,16 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         fail(c, "cset");
     } else if (OPM(0xf0a8000000000000ull, 0xfff8000000000000ull)) {  // BAR
         if (!c->glsl) sp(&c->body, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
-        else if (c->stage == STAGE_COMPUTE) sp(&c->body, "    barrier();\n");
+        else if (c->stage == STAGE_COMPUTE && c->bar_split) {
+            // Inside the switch lanes of one subgroup can be at different instructions (diverged earlier, not yet back
+            // at the same pc): a barrier() there runs once per group of lanes, so the workgroup's waves disagree on how
+            // many barriers there were (FE3H's light culling read its light count before the other waves had added
+            // theirs). Leave the loop instead - every lane comes here - and run the barrier after it, then resume.
+            uint32_t next = pc + 8;
+            if ((next / 8) % 4 == 0) next += 8;
+            c->uses_bar_split = true;
+            sp(&c->body, "    pc = %uu; bar_now = true; break;\n", next);
+        } else if (c->stage == STAGE_COMPUTE) sp(&c->body, "    barrier();\n");
         else sp(&c->body, "    /* bar */\n");  // GLSL barrier() is compute / tessellation only
     } else {
         fail(c, "unknown instruction %016llx at %#x", (unsigned long long)w, pc);
@@ -2065,9 +2076,12 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0u; uint pbk[16]; uint pbk_n = 0u; uint pcnt[16]; uint pcnt_n = 0u;\n");
         sp(&s, "  bool exit_now = false;\n");
+        if (c->uses_bar_split) sp(&s, "  bool bar_now = false;\n  for (uint bar_i = 0u; bar_i < 256u; bar_i++) {\n");
         sp(&s, "  for (uint guard = 0u; guard < 100000u; guard++) {\n  switch (pc) {\n");
         sp(&s, "%s", body.buf ? body.buf : "");
-        sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now) break;\n  }\n");
+        sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now%s) break;\n  }\n",
+           c->uses_bar_split ? " || bar_now" : "");
+        if (c->uses_bar_split) sp(&s, "  if (!bar_now) break;\n  bar_now = false;\n  barrier();\n  }\n");
     } else {
         sp(&s, "  do {\n%s  } while (false);\n", body.buf ? body.buf : "");
     }
@@ -2163,6 +2177,11 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             any_branch = true;
             memset(label, 1, end);
         }
+        if ((w & 0xfff8000000000000ull) == 0xf0a8000000000000ull && i + 1 < end) {  // BAR: the next instruction resumes
+            size_t j = i + 1;
+            if (j % 4 == 0) j++;
+            if (j < end) label[j] = 1;
+        }
         if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull || (w & 0xfff0000000000000ull) == 0xe340000000000000ull ||
             (w & 0xfff0000000000000ull) == 0xe350000000000000ull)
             any_branch = true;
@@ -2173,6 +2192,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     static int annotate = -1;
     if (annotate < 0) annotate = getenv("LARECOMP_SAVE_MSL") != NULL;
     c->branchy = any_branch;
+    c->bar_split = any_branch && c->glsl && stage == STAGE_COMPUTE && !getenv("LARECOMP_NO_BAR_SPLIT");
     for (size_t i = 0; i < end && !c->fail; i++) {
         if (i % 4 == 0) continue;
         uint32_t pc = (uint32_t)(i * 8);
