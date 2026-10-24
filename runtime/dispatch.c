@@ -301,6 +301,22 @@ bool rt_fault_watch(uint64_t fa, uint64_t pc) {
         if (!found && nseen < 64) {
             snprintf(seen[nseen++], 48, "%s", key);
             fprintf(stderr, "[watch] +%#llx by %s\n", fa - g_watch_lo, nm);
+            Cpu *c = kernel_current_cpu();
+            if (c) {  // the guest side: arguments and call chain (frame pointers)
+                fprintf(stderr, "[watch]   x0 %llx x1 %llx x2 %llx x3 %llx | chain:", (unsigned long long)c->x[0],
+                        (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3]);
+                uint64_t lr = c->x[30], fp = c->x[29];
+                for (int i = 0; i < 8 && lr; i++) {
+                    uint64_t off = 0;
+                    const char *s = loader_symbol_at(lr, &off);
+                    fprintf(stderr, " %llx", (unsigned long long)lr);
+                    if (s && off < 0x1000) fprintf(stderr, "(%s+%llx)", s, (unsigned long long)off);
+                    if (!fp || fp < 0x7000000000ull || fp >= 0x7800000000ull || (fp & 7)) break;
+                    lr = ((const uint64_t *)(uintptr_t)fp)[1];
+                    fp = ((const uint64_t *)(uintptr_t)fp)[0];
+                }
+                fprintf(stderr, "\n");
+            }
         }
     }
     plat_protect(watch_page, PLAT_PAGE, PLAT_PROT_RW);
