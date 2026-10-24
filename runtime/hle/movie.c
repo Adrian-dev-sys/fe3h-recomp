@@ -54,6 +54,11 @@ static void md_set_str(MediaData *m, const char *k, const char *v) {
     if (e) { free(e->sval); e->sval = strdup(v); e->is_str = true; }
 }
 
+static void md_miss(const char *what, const char *k, Cpu *c) {
+    static int n;
+    if (n++ < 40) LOG("[movie] MediaData %s(\"%s\") not found (lr=%llx)\n", what, k ? k : "", (unsigned long long)c->x[30]);
+}
+
 HLE_FUNC("_ZN5movie9MediaDataC1Ev", md_ctor) { *(uint64_t *)(uintptr_t)c->x[0] = (uint64_t)(uintptr_t)calloc(1, sizeof(MediaData)); }
 HLE_FUNC("_ZN5movie9MediaDataC1ERKS0_", md_copy) {
     MediaData *src = md(c->x[1]), *dst = calloc(1, sizeof(MediaData));
@@ -78,6 +83,7 @@ HLE_FUNC("_ZNK5movie9MediaData9FindInt32EPKcPi", md_find_int32) {
     const char *k = (const char *)(uintptr_t)c->x[1];
     for (int i = 0; i < m->n; i++)
         if (!m->e[i].is_str && !strcmp(m->e[i].key, k)) { *(int32_t *)(uintptr_t)c->x[2] = (int32_t)m->e[i].ival; c->x[0] = 1; return; }
+    md_miss("FindInt32", k, c);
     c->x[0] = 0;
 }
 HLE_FUNC("_ZNK5movie9MediaData10FindStringEPKcPS2_", md_find_string) {
@@ -85,6 +91,7 @@ HLE_FUNC("_ZNK5movie9MediaData10FindStringEPKcPS2_", md_find_string) {
     const char *k = (const char *)(uintptr_t)c->x[1];
     for (int i = 0; i < m->n; i++)
         if (m->e[i].is_str && !strcmp(m->e[i].key, k)) { *(uint64_t *)(uintptr_t)c->x[2] = (uint64_t)(uintptr_t)m->e[i].sval; c->x[0] = 1; return; }
+    md_miss("FindString", k, c);
     c->x[0] = 0;
 }
 
