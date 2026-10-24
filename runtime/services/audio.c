@@ -963,7 +963,7 @@ static void update_mix(Renderer *r, const uint8_t *p, int id) {
 }
 
 // Splitter section: header "SNDH" (count of splitter infos, count of destinations; 0x20 bytes), then records:
-// "SNDI" info {magic, id, sample rate, destination count, destination ids[]} and
+// "SNDI" info {magic, id, sample rate, destination count, destination ids[], 12 bytes} and
 // "SNDD" destination {magic, id, float volume[24], mix id, used, pad[3]} (0x70 bytes).
 static void update_splitters(Renderer *r, const uint8_t *p, const uint8_t *end) {
     if (!r->splitters || p + 0x20 > end || *(const uint32_t *)p != 0x48444E53) return;
@@ -984,7 +984,7 @@ static void update_splitters(Renderer *r, const uint8_t *p, const uint8_t *end) 
             uint32_t sr, cnt;
             memcpy(&sr, p + 8, 4);
             memcpy(&cnt, p + 12, 4);
-            if (cnt > 4096 || p + 16 + cnt * 4 > end) break;
+            if (cnt > 4096 || p + 0x1C + cnt * 4 > end) break;
             if (id < r->splitters) {
                 Splitter *s = &r->spl[id];
                 s->sample_rate = sr;
@@ -1000,7 +1000,7 @@ static void update_splitters(Renderer *r, const uint8_t *p, const uint8_t *end) 
                     LOG("\n");
                 }
             }
-            p += 16 + cnt * 4;
+            p += 0x1C + cnt * 4;  // ids follow the count; the record carries 12 more bytes
         } else if (magic == 0x44444E53) {  // SNDD
             if (p + 0x70 > end) break;
             if (id < r->split_dests) {
