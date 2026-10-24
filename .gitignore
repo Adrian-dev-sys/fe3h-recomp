@@ -17,3 +17,10 @@ tools/venv/
 venv/
 __pycache__/
 .DS_Store
+
+# local debugging output (fn*.txt holds game code: never commit)
+/run.log*
+/run.lo
+/*.patch
+/fn*.txt
+/*.txt
