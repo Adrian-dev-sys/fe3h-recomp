@@ -651,20 +651,19 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
     else strcpy(out, e);
 }
 
-// Buffer textures (key buf_slot / buf_fmt): the NVN format of `slot` if the bound texture is a buffer, else -1.
-static int buf_tex_fmt(Ctx *c, int slot) {
+// Buffer textures (key buf_mask): whether texture slot `slot` is bound to a buffer texture.
+static bool buf_tex(Ctx *c, int slot) {
     const ShaderKey *k = c->key;
-    if (!k || !c->glsl || c->stage == STAGE_VERTEX) return -1;
-    if (k->buf_slot0 && k->buf_slot0 - 1 == slot) return k->buf_fmt0;
-    if (k->buf_slot1 && k->buf_slot1 - 1 == slot) return k->buf_fmt1;
-    return -1;
+    if (!k || !c->glsl || c->stage == STAGE_VERTEX || slot < 0 || slot >= 32) return false;
+    return (key_buf_mask(k) >> slot) & 1;
 }
 
 // TLDS 1D on a buffer texture: Vulkan has no 1D image that long (FE3H's light index list: 1052640 texels), so the
-// texels are read from the guest heap (gmem, the imported heap) at the offset / count the renderer puts in
-// rscale[slot + 1].zw (exec.c stage_set). bfetch<slot> returns the raw bits as floats, like the other fetches.
+// texels are read from the guest heap (gmem, the imported heap). The renderer puts the heap byte offset in
+// rscale[slot + 1].z and texel count | NVN format << 24 in .w (exec.c stage_set); bfetch_at decodes the format and
+// returns the raw bits as floats, like the other fetches (integer formats: the integers' bits).
 static bool glsl_buffer_fetch(Ctx *c, int slot, const char *idx, char *call) {
-    if (buf_tex_fmt(c, slot) < 0 || slot >= 64) return false;
+    if (!buf_tex(c, slot)) return false;
     sprintf(call, "bfetch%d(int(%s))", slot, idx);
     c->buf_used |= 1ull << slot;
     c->uses_rscale = true;
@@ -672,36 +671,22 @@ static bool glsl_buffer_fetch(Ctx *c, int slot, const char *idx, char *call) {
     return true;
 }
 
-static void glsl_buffer_fetch_fn(Ctx *c, Str *s, int slot) {
-    int f = buf_tex_fmt(c, slot);
-    // words per texel and how they become the 4 results (raw bits; integer formats: the integers' bits)
-    int words = 0;
-    const char *body = NULL;
-    switch (f) {
-    case 0x0A: words = 1; body = "vec4(uintBitsToFloat(w0), 0.0f, 0.0f, 1.0f)"; break;                       // R32F
-    case 0x0B: case 0x0C: words = 1; body = "vec4(uintBitsToFloat(w0), 0.0f, 0.0f, uintBitsToFloat(1u))"; break;  // R32UI / I
-    case 0x16: words = 2; body = "vec4(uintBitsToFloat(w0), uintBitsToFloat(w1), 0.0f, 1.0f)"; break;           // RG32F
-    case 0x17: case 0x18: words = 2; body = "vec4(uintBitsToFloat(w0), uintBitsToFloat(w1), 0.0f, uintBitsToFloat(1u))"; break;
-    case 0x22: words = 3; body = "vec4(uintBitsToFloat(w0), uintBitsToFloat(w1), uintBitsToFloat(w2), 1.0f)"; break;
-    case 0x23: case 0x24: words = 3; body = "vec4(uintBitsToFloat(w0), uintBitsToFloat(w1), uintBitsToFloat(w2), uintBitsToFloat(1u))"; break;
-    case 0x2E: case 0x2F: case 0x30: words = 4;
-        body = "vec4(uintBitsToFloat(w0), uintBitsToFloat(w1), uintBitsToFloat(w2), uintBitsToFloat(w3))"; break;
-    case 0x25: words = 1; body = "unpackUnorm4x8(w0)"; break;                                                   // RGBA8
-    case 0x11: words = 1; body = "vec4(unpackHalf2x16(w0), 0.0f, 1.0f)"; break;                                // RG16F
-    case 0x29: words = 2; body = "vec4(unpackHalf2x16(w0), unpackHalf2x16(w1))"; break;                        // RGBA16F
-    default: break;
-    }
-    sp(s, "vec4 bfetch%d(int i) {\n", slot);
-    if (!words) {
-        sp(s, "  return vec4(0.0f); }  // (buffer texture format %#x not decoded)\n", f);
-        return;
-    }
-    sp(s, "  uint off = floatBitsToUint(rscale[%d].z), n = floatBitsToUint(rscale[%d].w);\n", slot + 1, slot + 1);
-    sp(s, "  if (off == 0xFFFFFFFFu || uint(i) >= n) return vec4(0.0f);\n");
-    sp(s, "  uint b = (off >> 2) + uint(i) * %du;\n", words);
-    for (int k = 0; k < 4; k++) sp(s, "  uint w%d = %s;\n", k, k < words ? (k == 0 ? "gmem_.w[b]" : k == 1 ? "gmem_.w[b + 1u]" : k == 2 ? "gmem_.w[b + 2u]" : "gmem_.w[b + 3u]") : "0u");
-    sp(s, "  return %s;\n}\n", body);
-}
+static const char glsl_bfetch_at[] =
+    "vec4 bfetch_at(vec4 r, int i) {\n"
+    "  uint off = floatBitsToUint(r.z), cw = floatBitsToUint(r.w), n = cw & 0xFFFFFFu, f = cw >> 24;\n"
+    "  if (off == 0xFFFFFFFFu || uint(i) >= n) return vec4(0.0f);\n"
+    "  uint words = (f >= 0x2Eu && f <= 0x30u) ? 4u : (f >= 0x22u && f <= 0x24u) ? 3u : ((f >= 0x16u && f <= 0x18u) || f == 0x29u) ? 2u : 1u;\n"
+    "  uint b = (off >> 2) + uint(i) * words;\n"
+    "  uint w0 = gmem_.w[b], w1 = words > 1u ? gmem_.w[b + 1u] : 0u, w2 = words > 2u ? gmem_.w[b + 2u] : 0u, w3 = words > 3u ? gmem_.w[b + 3u] : 0u;\n"
+    "  float one = ((f >= 0x0Bu && f <= 0x0Cu) || (f >= 0x17u && f <= 0x18u) || (f >= 0x23u && f <= 0x24u)) ? uintBitsToFloat(1u) : 1.0f;\n"
+    "  if (f == 0x25u) return unpackUnorm4x8(w0);\n"
+    "  if (f == 0x11u) return vec4(unpackHalf2x16(w0), 0.0f, 1.0f);\n"
+    "  if (f == 0x29u) return vec4(unpackHalf2x16(w0), unpackHalf2x16(w1));\n"
+    "  if (words == 1u) return vec4(uintBitsToFloat(w0), 0.0f, 0.0f, one);\n"
+    "  if (words == 2u) return vec4(uintBitsToFloat(w0), uintBitsToFloat(w1), 0.0f, one);\n"
+    "  if (words == 3u) return vec4(uintBitsToFloat(w0), uintBitsToFloat(w1), uintBitsToFloat(w2), one);\n"
+    "  return vec4(uintBitsToFloat(w0), uintBitsToFloat(w1), uintBitsToFloat(w2), uintBitsToFloat(w3));\n"
+    "}\n";
 
 // TEXS / TLDS in GLSL (same slot allocation order and result layout as the MSL switch in emit_texs)
 static bool glsl_texs(Ctx *c, uint64_t w, bool fetch, int *slot_out, char *call, const char *A, const char *A1,
@@ -2022,8 +2007,11 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         default: sp(&s, "ivec3 tsize%d(int l) { return ivec3(textureSize(t%d, l), 1); }\n", i, i);
         }
     }
-    for (int i = 0; i < info->ntex && i < 64; i++)
-        if (c->buf_used & (1ull << i)) glsl_buffer_fetch_fn(c, &s, i);
+    if (c->buf_used) {
+        sp(&s, "%s", glsl_bfetch_at);
+        for (int i = 0; i < info->ntex && i < 64; i++)
+            if (c->buf_used & (1ull << i)) sp(&s, "vec4 bfetch%d(int i) { return bfetch_at(rscale[%d], i); }\n", i, i + 1);
+    }
     if (stage == STAGE_VERTEX) {
         for (int i = 0; i < 32; i++) {
             if (!(c->in_attr_mask & (1u << i))) continue;

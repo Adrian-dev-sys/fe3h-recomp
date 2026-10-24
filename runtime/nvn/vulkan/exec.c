@@ -1333,6 +1333,18 @@ static void translate_program(void *arg) {
 #define PROG_TAB 4096
 static struct { uint64_t key; Prog *prog; } prog_tab[PROG_TAB];
 
+static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_);
+// Texture slots 0-31 of a stage's shader that are 1D in the shader and bound to buffer textures (NVN target 10).
+static uint32_t buffer_texture_mask(int stage, const ShaderInfo *si) {
+    uint32_t m = 0;
+    for (int i = 0; i < si->ntex && i < 32; i++) {
+        if (si->tex[i].type != TEXTYPE_1D || si->tex[i].is_image) continue;
+        NvnTexture *t = shader_texture_object(stage, (ShaderTexture *)&si->tex[i]);
+        if (t && t->target == 10) m |= 1u << i;
+    }
+    return m;
+}
+
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
     uint64_t h = 0xcbf29ce484222325ull;
@@ -1340,9 +1352,9 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     const uint8_t *vb = (const uint8_t *)vkey;
     for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
-    if (fkey->buf_slot0) {  // (buffer textures: only keys that have them hash differently)
-        const uint8_t e[4] = {fkey->buf_slot0, fkey->buf_fmt0, fkey->buf_slot1, fkey->buf_fmt1};
-        for (int i = 0; i < 4; i++) { h ^= e[i]; h *= 0x100000001B3ull; }
+    if (key_buf_mask(fkey)) {  // (buffer textures: only keys that have them hash differently)
+        uint32_t m = key_buf_mask(fkey);
+        for (int i = 0; i < 4; i++) { h ^= (m >> (i * 8)) & 0xFF; h *= 0x100000001B3ull; }
     }
     if (!h) h = 1;
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
@@ -2506,13 +2518,13 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             bi[n] = ubo_span(vk_transient_copy(gmap_tab, sizeof gmap_tab, 256), sizeof gmap_tab);
         } else if (b->binding == 18) {
             for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; }
-            for (int t = 0; t < si->ntex && t < 64; t++) {  // buffer textures (bfetch): heap byte offset, texel count
+            for (int t = 0; t < si->ntex && t < 32; t++) {  // buffer textures (bfetch): heap byte offset, count | format << 24
                 if (si->tex[t].type != TEXTYPE_1D) continue;
                 NvnTexture *bt = shader_texture_object(stage, &si->tex[t]);
                 if (!bt || bt->target != 10) continue;
                 const FormatInfo *fi = nvn_format_info(bt->format);
                 uint64_t bytes = (uint64_t)bt->width * (fi && fi->bpb ? fi->bpb : 4);
-                uint32_t off = 0xFFFFFFFFu, cnt = bt->width;
+                uint32_t off = 0xFFFFFFFFu, cnt = (bt->width < 0xFFFFFFu ? bt->width : 0xFFFFFFu) | (bt->format & 0xFFu) << 24;
                 gmem_info();  // (imports the heap on first use)
                 if (bt->addr >= HEAP_BASE && bt->addr + bytes <= HEAP_BASE + gmem_size && gmem_buf) off = (uint32_t)(bt->addr - HEAP_BASE);
                 memcpy(&rs[1 + t][2], &off, 4);
@@ -2555,20 +2567,22 @@ static void build_compute(void *arg) {
     if (r != VK_SUCCESS) LOG("[compute] pipeline failed: %d\n", r);
 }
 
-static struct CsEnt { uint64_t addr; CsProg *cp; } g_cs_tab[256];  // compute programs by code address
+static struct CsEnt { uint64_t addr; uint32_t bufmask; CsProg *cp; } g_cs_tab[256];  // compute programs by code address
 
-static CsProg *compute_program(NvnProgram *np) {
+// bufmask: texture slots bound to buffer textures (a variant reading them from the heap, see buffer_texture_mask)
+static CsProg *compute_program(NvnProgram *np, uint32_t bufmask) {
     NvnShaderStage *ss = &np->stages[5];
     if (!ss->code_addr) return NULL;
     struct CsEnt *tab = g_cs_tab;
     int n = g_cs_n;
-    for (int i = 0; i < n; i++) if (tab[i].addr == ss->code_addr) return tab[i].cp;
+    for (int i = 0; i < n; i++) if (tab[i].addr == ss->code_addr && tab[i].bufmask == bufmask) return tab[i].cp;
     CsProg *cp = calloc(1, sizeof *cp);
-    if (n < 256) { tab[n].addr = ss->code_addr; tab[n].cp = cp; g_cs_n = n + 1; }
+    if (n < 256) { tab[n].addr = ss->code_addr; tab[n].bufmask = bufmask; tab[n].cp = cp; g_cs_n = n + 1; }
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
     ShaderKey k = {0};
     k.glsl = 1;
+    key_set_buf_mask(&k, bufmask);
     pthread_mutex_lock(&translate_lock);
     cp->si = maxwell_translate((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, STAGE_COMPUTE, &k);
     pthread_mutex_unlock(&translate_lock);
@@ -2592,9 +2606,17 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     if (!st.program || !gx || !gy || !gz) return;
     // (the compute program as bound: not a combination with whatever graphics programs are bound, which would build
     // the same compute shader again for every graphics combination)
-    CsProg *cp = compute_program(st.stage_prog[5] ? st.stage_prog[5] : st.program);
+    NvnProgram *csp = st.stage_prog[5] ? st.stage_prog[5] : st.program;
+    CsProg *cp = compute_program(csp, 0);
     if (!cp || atomic_load(&cp->p.state) != 1)
         SKIP(SK_CS_PROG, "compute code %llx state %d\n", (unsigned long long)st.program->stages[5].code_addr, cp ? atomic_load(&cp->p.state) : -1);
+    {
+        uint32_t m = buffer_texture_mask(5, cp->si);
+        if (m) {
+            cp = compute_program(csp, m);
+            if (!cp || atomic_load(&cp->p.state) != 1) SKIP(SK_CS_PROG, "buffer-texture compute variant building\n");
+        }
+    }
     {   // LARECOMP_SKIP_CS=<code address hex> (debug): skip that compute shader's dispatches, to see what it does
         static uint64_t skip = ~0ull;
         if (skip == ~0ull) { const char *e = getenv("LARECOMP_SKIP_CS"); skip = e ? strtoull(e, NULL, 16) : 0; }
@@ -2692,16 +2714,9 @@ static void draw_(CmdRec *r, bool indexed) {
         SKIP(SK_PROG, "vs %llx fs %llx state %d\n", (unsigned long long)st.program->stages[0].code_addr,
              (unsigned long long)st.program->stages[1].code_addr, pr ? atomic_load(&pr->state) : -1);
     {   // buffer textures bound to the fragment shader's 1D slots: the variant that reads them from the guest heap
-        int nb = 0;
-        for (int i = 0; i < pr->fi->ntex && i < 64 && nb < 2; i++) {
-            if (pr->fi->tex[i].type != TEXTYPE_1D || pr->fi->tex[i].is_image) continue;
-            NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
-            if (!t || t->target != 10) continue;
-            if (!nb) fkey.buf_slot0 = (uint8_t)(i + 1), fkey.buf_fmt0 = (uint8_t)t->format;
-            else fkey.buf_slot1 = (uint8_t)(i + 1), fkey.buf_fmt1 = (uint8_t)t->format;
-            nb++;
-        }
-        if (nb) {
+        uint32_t m = buffer_texture_mask(1, pr->fi);
+        if (m) {
+            key_set_buf_mask(&fkey, m);
             pr = get_program(st.program, &vkey, &fkey);
             if (!pr || atomic_load(&pr->state) != 1) SKIP(SK_PROG, "buffer-texture variant building\n");
         }

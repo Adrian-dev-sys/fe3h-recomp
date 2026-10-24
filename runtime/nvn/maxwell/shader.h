@@ -43,14 +43,20 @@ typedef struct {
     bool flip_y;            // lower-left window origin
     bool flip_x;            // mirror the image left to right (mirror mode's scene composite). (In the padding
                             // after flip_y: keys without it hash as before - shader caches stay valid.)
-    // (GLSL fragment / compute) buffer textures (NVN target 10, fetched with TLDS 1D): slot + 1 (0: none) and the
-    // NVN format; read from the guest heap (gmem) - see glsl_buffer_fetch. In padding bytes, as flip_x.
-    uint8_t buf_slot0;
+    // (GLSL fragment / compute) texture slots 0-31 bound to buffer textures (NVN target 10, fetched with TLDS 1D):
+    // read from the guest heap (gmem) - see glsl_buffer_fetch. A bit mask over buf_mask0..3, in padding bytes as flip_x.
+    uint8_t buf_mask0;
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
-    uint8_t buf_fmt0, buf_slot1, buf_fmt1;
+    uint8_t buf_mask1, buf_mask2, buf_mask3;
 } ShaderKey;
 _Static_assert(sizeof(ShaderKey) == 52, "ShaderKey: new fields only in padding (cached program hashes)");
+static inline uint32_t key_buf_mask(const ShaderKey *k) {
+    return k->buf_mask0 | (uint32_t)k->buf_mask1 << 8 | (uint32_t)k->buf_mask2 << 16 | (uint32_t)k->buf_mask3 << 24;
+}
+static inline void key_set_buf_mask(ShaderKey *k, uint32_t m) {
+    k->buf_mask0 = (uint8_t)m; k->buf_mask1 = (uint8_t)(m >> 8); k->buf_mask2 = (uint8_t)(m >> 16); k->buf_mask3 = (uint8_t)(m >> 24);
+}
 
 typedef struct {
     uint32_t handle_offset;  // byte offset of the texture handle in the bound texture cbuf
