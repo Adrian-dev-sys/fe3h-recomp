@@ -962,6 +962,11 @@ static void vk_end_pass_at(int line) {
         if (multi) snprintf(path, sizeof path, "build/pass_%llu_%03d.png", (unsigned long long)debug_pass_frame, debug_pass_no++);
         else snprintf(path, sizeof path, "build/pass_%03d.png", debug_pass_no++);
         renderer_save_texture_tex(st.rt.color[0]->backend, path);
+        if (st.rt.depth && st.rt.depth->backend) {  // its depth / stencil too: build/pass_NNN_d.png, _s.png
+            void renderer_save_depth_tex(TexBackend *b, const char *prefix);
+            path[strlen(path) - 4] = 0;
+            renderer_save_depth_tex(st.rt.depth->backend, path);
+        }
     }
 }
 
@@ -3144,6 +3149,9 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         st.channel_mask);
     if (st.poly[3] & 4)
         LOG("[draw]   depth bias: slope %g units %g clamp %g\n", st.poly_offset[0], st.poly_offset[1], st.poly_offset[2]);
+    LOG("[draw]   ds %02x %02x %02x %02x %02x %02x %02x %02x | stencil ref %u/%u mask %#x/%#x vmask %#x/%#x | depth range %g %g\n",
+        st.ds[0], st.ds[1], st.ds[2], st.ds[3], st.ds[4], st.ds[5], st.ds[6], st.ds[7], st.stencil_ref[0], st.stencil_ref[1],
+        st.stencil_mask[0], st.stencil_mask[1], st.stencil_vmask[0], st.stencil_vmask[1], st.depth_range[0][0], st.depth_range[0][1]);
     if (pr->vi->attr_mask) {  // the vertex inputs: NVN format, stream, offset; the streams' strides
         LOG("[draw]   attribs:");
         for (int i = 0; i < 32; i++) {
@@ -3637,6 +3645,60 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
 }
 
 // Screenshot of a game texture (presented crop applied to build/frame_* shots), via the present shader into RGBA8.
+// (frame capture) A depth / stencil target as two PNGs: <prefix>_d.png, the depth stretched over the range it holds
+// (white = largest), and <prefix>_s.png, each stencil value its own grey (value * 37 mod 256; 0 black).
+void renderer_save_depth_tex(TexBackend *b, const char *prefix) {
+    if (!b || !b->image || !(b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) return;
+    uint32_t w = b->width, h = b->height;
+    bool f32 = b->format == VK_FORMAT_D32_SFLOAT || b->format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+    bool d16 = b->format == VK_FORMAT_D16_UNORM;
+    bool has_s = (b->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+    vk_end_pass();
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    uint64_t dbytes = (uint64_t)w * h * (d16 ? 2 : 4);
+    // (one readback buffer: depth at 0, stencil after it)
+    VkSpan dout = vk_readback(dbytes + (has_s ? (uint64_t)w * h : 0)), sout = dout;
+    sout.off = dout.off + dbytes;
+    sout.ptr = (uint8_t *)dout.ptr + dbytes;
+    VkBufferImageCopy c = {.bufferOffset = dout.off, .imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+    vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, dout.buf, 1, &c);
+    if (has_s) {
+        VkBufferImageCopy cs = {.bufferOffset = sout.off, .imageSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+        vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, sout.buf, 1, &cs);
+    }
+    renderer_flush();
+    uint8_t *px = malloc((size_t)w * h * 4);
+    if (!px) return;
+    double lo = 1e30, hi = -1e30;
+    for (uint64_t i = 0; i < (uint64_t)w * h; i++) {
+        double v = f32 ? ((const float *)dout.ptr)[i] : d16 ? ((const uint16_t *)dout.ptr)[i] / 65535.0
+                                                            : (((const uint32_t *)dout.ptr)[i] & 0xFFFFFF) / 16777215.0;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    for (uint64_t i = 0; i < (uint64_t)w * h; i++) {
+        double v = f32 ? ((const float *)dout.ptr)[i] : d16 ? ((const uint16_t *)dout.ptr)[i] / 65535.0
+                                                            : (((const uint32_t *)dout.ptr)[i] & 0xFFFFFF) / 16777215.0;
+        uint8_t g = hi > lo ? (uint8_t)((v - lo) / (hi - lo) * 255.0 + 0.5) : 0;
+        px[i * 4] = px[i * 4 + 1] = px[i * 4 + 2] = g;
+        px[i * 4 + 3] = 255;
+    }
+    char path[300];
+    snprintf(path, sizeof path, "%s_d.png", prefix);
+    vk_save_png(path, px, w, h);
+    LOG("[capture] %s: depth %.9g .. %.9g\n", path, lo, hi);
+    if (has_s) {
+        for (uint64_t i = 0; i < (uint64_t)w * h; i++) {
+            uint8_t g = (uint8_t)(((const uint8_t *)sout.ptr)[i] * 37u);
+            px[i * 4] = px[i * 4 + 1] = px[i * 4 + 2] = g;
+        }
+        snprintf(path, sizeof path, "%s_s.png", prefix);
+        vk_save_png(path, px, w, h);
+    }
+    free(px);
+}
+
 void renderer_save_texture_tex(TexBackend *b, const char *path) {
     if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return;
     extern const float *vk_shot_crop(void);
