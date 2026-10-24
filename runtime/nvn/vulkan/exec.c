@@ -2527,18 +2527,24 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 uint32_t off = 0xFFFFFFFFu, cnt = (bt->width < 0xFFFFFFu ? bt->width : 0xFFFFFFu) | (bt->format & 0xFFu) << 24;
                 gmem_info();  // (imports the heap on first use)
                 if (bt->addr >= HEAP_BASE && bt->addr + bytes <= HEAP_BASE + gmem_size && gmem_buf) off = (uint32_t)(bt->addr - HEAP_BASE);
-                {   // (log each buffer texture once, with its first words)
+                {   // (log each buffer texture the 1st and 4th time it is bound: non-zero words, first non-zero ones)
                     static uint64_t seen[64];
-                    static int nseen;
-                    bool known = false;
-                    for (int k = 0; k < nseen; k++) if (seen[k] == bt->addr) known = true;
-                    if (!known && nseen < 64) {
-                        seen[nseen++] = bt->addr;
+                    static int nseen, times[64];
+                    int k = 0;
+                    while (k < nseen && seen[k] != bt->addr) k++;
+                    if (k == nseen && nseen < 64) seen[nseen++] = bt->addr;
+                    if (k < 64 && (times[k]++ == 0 || times[k] == 4)) {
                         const uint32_t *wd = (const uint32_t *)(uintptr_t)bt->addr;
-                        LOG("[buftex] stage %d slot %d addr %llx (heap %llx..%llx) %u texels fmt %#x -> off %#x | %08x %08x %08x %08x %08x %08x %08x %08x\n",
-                            stage, t, (unsigned long long)bt->addr, (unsigned long long)HEAP_BASE,
-                            (unsigned long long)(HEAP_BASE + gmem_size), bt->width, bt->format, off,
-                            wd[0], wd[1], wd[2], wd[3], wd[4], wd[5], wd[6], wd[7]);
+                        uint64_t nw = bytes / 4, nz = 0, first = ~0ull;
+                        for (uint64_t q = 0; q < nw; q++) if (wd[q]) { nz++; if (first == ~0ull) first = q; }
+                        LOG("[buftex] f%llu (seen %d) stage %d slot %d addr %llx %u texels fmt %#x off %#x: %llu of %llu words non-zero",
+                            (unsigned long long)renderer_present_count(), times[k], stage, t, (unsigned long long)bt->addr, bt->width,
+                            bt->format, off, (unsigned long long)nz, (unsigned long long)nw);
+                        if (first != ~0ull) {
+                            LOG(", from word %llu:", (unsigned long long)first);
+                            for (uint64_t q = first; q < first + 8 && q < nw; q++) LOG(" %08x", wd[q]);
+                        }
+                        LOG("\n");
                     }
                 }
                 memcpy(&rs[1 + t][2], &off, 4);
