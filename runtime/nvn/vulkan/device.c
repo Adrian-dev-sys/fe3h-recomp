@@ -150,12 +150,25 @@ static void create_device(void) {
     if (g_vk.host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
+    bool dbc_ext = has_ext(ep, ne, VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME);
     g_fault_ext = fault;
     free(ep);
 
     // features the backend relies on (all present on current desktop drivers)
-    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    VkPhysicalDeviceDepthBiasControlFeaturesEXT dbc_have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT};
+    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = dbc_ext ? &dbc_have : NULL};
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+    // Depth bias in 24-bit units on float depth (DEPTH24 formats stand in as D32 on AMD): the constant term of a float
+    // depth format scales with the depth's exponent, far smaller than 2^-24 - Three Houses' outlines, pushed back by
+    // bias, came through thin geometry (cloaks) as black shards
+    g_vk.bias_unorm = dbc_ext && dbc_have.depthBiasControl && dbc_have.leastRepresentableValueForceUnormRepresentation;
+    g_vk.bias_exact = g_vk.bias_unorm && dbc_have.depthBiasExact;
+    if (g_vk.bias_unorm) ext[n_ext++] = VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME;
+    LOG("[vk] depth bias control: %s%s\n", g_vk.bias_unorm ? "yes" : "no", g_vk.bias_exact ? " (exact)" : "");
+    VkPhysicalDeviceDepthBiasControlFeaturesEXT dbc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT,
+                                                       .depthBiasControl = VK_TRUE,
+                                                       .leastRepresentableValueForceUnormRepresentation = VK_TRUE,
+                                                       .depthBiasExact = g_vk.bias_exact};
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT div = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
         .vertexAttributeInstanceRateDivisor = VK_TRUE, .vertexAttributeInstanceRateZeroDivisor = VK_FALSE};
@@ -176,6 +189,7 @@ static void create_device(void) {
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
                                            .pNext = &f11};
     VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&ff : (void *)&f11};
+    if (g_vk.bias_unorm) { dbc.pNext = f.pNext; f.pNext = &dbc; }
     VkPhysicalDeviceFeatures *b = &f.features, *h = &have.features;
     b->independentBlend = h->independentBlend;
     b->dualSrcBlend = h->dualSrcBlend;
@@ -201,6 +215,10 @@ static void create_device(void) {
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
+    if (g_vk.bias_unorm) {
+        g_vk.set_bias2 = (PFN_vkCmdSetDepthBias2EXT)vkGetDeviceProcAddr(g_vk.dev, "vkCmdSetDepthBias2EXT");
+        if (!g_vk.set_bias2) g_vk.bias_unorm = false;
+    }
 
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
                                  .vulkanApiVersion = VK_API_VERSION_1_3};

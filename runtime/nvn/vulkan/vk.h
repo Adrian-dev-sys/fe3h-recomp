@@ -35,6 +35,9 @@ typedef struct {
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import;
+    // VK_EXT_depth_bias_control: depth bias in 24-bit units on the float depth that stands in for DEPTH24 (exec.c)
+    bool bias_unorm, bias_exact;
+    PFN_vkCmdSetDepthBias2EXT set_bias2;
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;

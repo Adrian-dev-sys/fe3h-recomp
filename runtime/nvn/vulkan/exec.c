@@ -923,7 +923,7 @@ static struct {
     VkBool32 dt, dw, sten, pre, dbe;
     VkCompareOp dop;
     uint32_t sface[2][7];  // fail, pass, depth fail, compare, compare mask, write mask, reference
-    float bc[4], db[3];
+    float bc[4], db[4];  // db: slope, constant, clamp, 24-bit-as-float
     VkCullModeFlags cull;
     VkFrontFace ff;
     VkPrimitiveTopology topo;
@@ -2847,7 +2847,24 @@ static void draw_(CmdRec *r, bool indexed) {
         if (on) memcpy(f, st.poly_offset, sizeof f);
         if (equal_tol) { f[1] -= 8; on = true; }  // (see the EQUAL comment above: a few depth ulps nearer)
         if (ss_need(SS_DBE, ss.dbe == (VkBool32)on)) { ss.dbe = on; vkCmdSetDepthBiasEnable(cb, on); }
-        if (ss_need(SS_DB, !memcmp(ss.db, f, sizeof f))) { memcpy(ss.db, f, sizeof f); vkCmdSetDepthBias(cb, f[1], f[2], f[0]); }
+        // a DEPTH24 target standing in as float depth (0x33 always, 0x35 where the GPU has no D24S8): the bias's units are
+        // 2^-24 steps as on the Switch, not the float format's own (device.c: VK_EXT_depth_bias_control)
+        bool d24_as_float = st.rt.depth && (st.rt.depth->format == 0x33 ||
+                            (st.rt.depth->format == 0x35 && pass_depth == VK_FORMAT_D32_SFLOAT_S8_UINT));
+        float key[4] = {f[0], f[1], f[2], d24_as_float ? 1.0f : 0.0f};
+        if (ss_need(SS_DB, !memcmp(ss.db, key, sizeof key))) {
+            memcpy(ss.db, key, sizeof key);
+            if (d24_as_float && g_vk.bias_unorm) {
+                VkDepthBiasRepresentationInfoEXT rep = {.sType = VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT,
+                    .depthBiasRepresentation = VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT,
+                    .depthBiasExact = g_vk.bias_exact};
+                VkDepthBiasInfoEXT bi = {.sType = VK_STRUCTURE_TYPE_DEPTH_BIAS_INFO_EXT, .pNext = &rep, .depthBiasConstantFactor = f[1],
+                                         .depthBiasClamp = f[2], .depthBiasSlopeFactor = f[0]};
+                g_vk.set_bias2(cb, &bi);
+            } else {
+                vkCmdSetDepthBias(cb, f[1], f[2], f[0]);
+            }
+        }
     }
 
     // ---- textures first (their scales feed the widescreen decision and the rscale table), then the viewport
@@ -3112,6 +3129,8 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n", st.viewport[0][0], st.viewport[0][1],
         st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],
         st.channel_mask);
+    if (st.poly[3] & 4)
+        LOG("[draw]   depth bias: slope %g units %g clamp %g\n", st.poly_offset[0], st.poly_offset[1], st.poly_offset[2]);
     if (pr->vi->attr_mask) {  // the vertex inputs: NVN format, stream, offset; the streams' strides
         LOG("[draw]   attribs:");
         for (int i = 0; i < 32; i++) {
