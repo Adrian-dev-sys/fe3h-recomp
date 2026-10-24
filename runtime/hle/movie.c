@@ -276,6 +276,7 @@ static void ex_get_track_config(Cpu *c) {
         md_set_int(m, "channel-count", p->ch_layout.nb_channels);
     }
     if (e->fmt->duration > 0) md_set_int(m, "durationUs", e->fmt->duration);
+    md_set_int(m, "max-input-size", p->codec_type == AVMEDIA_TYPE_VIDEO ? 4 << 20 : 256 << 10);  // = the decoder's in_cap
     c->x[0] = 0;
 }
 
