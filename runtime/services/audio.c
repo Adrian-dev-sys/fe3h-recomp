@@ -169,13 +169,26 @@ static int decode_voice(Voice *v, int ch, ChanState *cs, int16_t *out, int need)
                 }
             } else if (v->fmt == 6 && coefs) {
                 for (; n < want; n++) out[y + n] = adpcm_next(data, wb->size, start + cs->offset + n, coefs, cs);
-            } else if (v->fmt == 3) {  // PCM float
-                const float *pcm = (const float *)data;
-                uint64_t nsamp = wb->size / 4 / v->chans;
+            } else if (v->fmt == 1 || v->fmt == 3 || v->fmt == 4 || v->fmt == 5) {
+                // SampleFormat: 1 PcmInt8, 3 PcmInt24 (packed), 4 PcmInt32, 5 PcmFloat; interleaved
+                uint32_t bps = v->fmt == 1 ? 1 : v->fmt == 3 ? 3 : 4;
+                uint64_t nsamp = wb->size / bps / v->chans;
                 for (; n < want; n++) {
                     uint64_t s = (uint64_t)start + cs->offset + n;
                     if (s >= nsamp) break;
-                    out[y + n] = (int16_t)clampf(pcm[s * v->chans + ch] * 32767.f, -32768.f, 32767.f);
+                    const uint8_t *q = data + (s * v->chans + ch) * bps;
+                    int32_t x;
+                    if (v->fmt == 1) x = (int8_t)q[0] * 256;
+                    else if (v->fmt == 3) x = (int32_t)((uint32_t)q[0] << 8 | (uint32_t)q[1] << 16 | (uint32_t)q[2] << 24) >> 16;
+                    else if (v->fmt == 4) { int32_t w; memcpy(&w, q, 4); x = w >> 16; }
+                    else { float f; memcpy(&f, q, 4); x = (int32_t)clampf(f * 32767.f, -32768.f, 32767.f); }
+                    out[y + n] = (int16_t)x;
+                }
+            } else {
+                static uint32_t warned;
+                if (v->fmt < 32 && !(warned & (1u << v->fmt))) {
+                    warned |= 1u << v->fmt;
+                    LOG("[audren] sample format %u not decoded\n", v->fmt);
                 }
             }
         }
@@ -501,6 +514,61 @@ static void apply_effects(Renderer *r, int32_t mix_id, Mix *m) {
 static int hf_log = -1;
 static double hf[1024];
 
+// LARECOMP_AUDIO_STATS: once a second, every playing voice (level before volume, volume, route) and every mix level
+static int stats_on = -1;
+static double st_in[1024], st_mix[64];
+static uint32_t st_frames[1024], st_starve[1024], st_spl_info, st_spl_dest;
+
+static double db(double e, double n) { return e > 0 && n > 0 ? 10 * log10(e / n / (32768.0 * 32768.0)) : -999; }
+
+static void stats_print(Renderer *r) {
+    uint32_t F = 200;
+    LOG("[audstat] f%llu splitter records this second: %u info, %u dest\n", (unsigned long long)r->elapsed_frames,
+        st_spl_info, st_spl_dest);
+    st_spl_info = st_spl_dest = 0;
+    for (uint32_t vi = 0; vi < r->voices && vi < 1024; vi++) {
+        if (!st_frames[vi]) continue;
+        Voice *v = &r->voice[vi];
+        LOG("[audstat]  v%u fmt %u %uch %u Hz state %u vol %.3f level %.0f dB starved %u/%u", vi, v->fmt, v->chans,
+            v->rate, v->play_state, v->volume, db(st_in[vi], (double)st_frames[vi] * r->sample_count), st_starve[vi],
+            st_frames[vi]);
+        if (find_mix(r, v->mix_id)) {
+            ChanRes *cr = &r->chres[v->chan_ids[0] % r->voices];
+            LOG(" -> mix %d:", v->mix_id);
+            for (int b = 0; b < MIXBUF_MAX; b++) if (cr->mix[b] != 0) LOG(" %d=%.3f", b, cr->mix[b]);
+        } else if (v->splitter_id != 0xFFFFFFFF) {
+            LOG(" -> splitter %u (%u dests):", v->splitter_id,
+                v->splitter_id < r->splitters ? r->spl[v->splitter_id].ndest : 0);
+            SplitDest *d;
+            for (uint32_t k = 0; (d = split_dest(r, v->splitter_id, k)) != NULL && k < 8; k++) {
+                float mx = 0;
+                for (int b = 0; b < MIXBUF_MAX; b++) if (fabsf(d->vol[b]) > mx) mx = fabsf(d->vol[b]);
+                LOG(" [d%d mix %d%s used %u max %.3f]", r->spl[v->splitter_id].dest[k], d->mix,
+                    find_mix(r, d->mix) ? "" : "(none)", d->used, mx);
+            }
+        } else {
+            LOG(" -> nowhere (mix %d)", v->mix_id);
+        }
+        LOG("\n");
+        st_in[vi] = 0; st_frames[vi] = st_starve[vi] = 0;
+    }
+    for (uint32_t m = 0; m < r->nmix && m < 64; m++) {
+        Mix *x = &r->mix[m];
+        if (!x->used) continue;
+        LOG("[audstat]  mix %u vol %.3f bufs %u dest %d split %d level %.0f dB\n", m, x->volume, x->bufs, x->dest,
+            (int)x->dest_splitter, db(st_mix[m], (double)F * r->sample_count * (x->bufs ? x->bufs : 1)));
+        st_mix[m] = 0;
+    }
+}
+
+static void stats_mix(Renderer *r, uint32_t m, Mix *x) {
+    if (!stats_on || m >= 64) return;
+    uint32_t N = r->sample_count;
+    double e = 0;
+    for (uint32_t i = 0; i < x->bufs * N; i++) e += (double)x->buf[i] * x->buf[i];
+    st_mix[m] += e;
+}
+
 // add one channel's samples to every buffer of a mix, ramping the gain from pv * prev[b] to v * cur[b]
 static void mix_in(Mix *dst, uint32_t N, const float *smp, const float *prev, const float *cur, float pv, float v) {
     for (uint32_t b = 0; b < dst->bufs && b < MIXBUF_MAX; b++) {
@@ -532,6 +600,7 @@ static int mix_depth(Renderer *r, uint32_t m, int guard) {
 
 static void render_frame(Renderer *r, float *stereo) {
     if (hf_log < 0) hf_log = getenv("LARECOMP_AUDIO_HF") ? 1 : 0;
+    if (stats_on < 0) stats_on = getenv("LARECOMP_AUDIO_STATS") ? 1 : 0;
     uint32_t N = r->sample_count;
     for (uint32_t m = 0; m < r->nmix; m++)
         if (r->mix[m].buf) memset(r->mix[m].buf, 0, sizeof(float) * MIXBUF_MAX * N);
@@ -555,6 +624,11 @@ static void render_frame(Renderer *r, float *stereo) {
             memcpy(tmp, cs->hist, sizeof cs->hist);
             int got = decode_voice(v, c, cs, tmp + HIST, need);
             if (got < need) memset(tmp + HIST + got, 0, (need - got) * 2);
+            if (stats_on && c == 0 && vi < 1024) {
+                st_frames[vi]++;
+                if (got < need) st_starve[vi]++;
+                for (int i = 0; i < got; i++) st_in[vi] += (double)tmp[HIST + i] * tmp[HIST + i];
+            }
             float pos = cs->fraction;
             for (uint32_t i = 0; i < N; i++, pos += ratio) {
                 int k = (int)pos;
@@ -639,6 +713,7 @@ static void render_frame(Renderer *r, float *stereo) {
             Mix *s = &r->mix[m];
             if (!s->used || depth[m] != d) continue;
             apply_effects(r, (int32_t)m, s);
+            stats_mix(r, m, s);
             Mix *t = find_mix(r, s->dest);
             if (!t && s->dest_splitter != 0xFFFFFFFF) {
                 // sub mix buffer i -> splitter destinations i, i + bufs, ...
@@ -670,6 +745,8 @@ static void render_frame(Renderer *r, float *stereo) {
     // final mix -> device sink (FL FR FC LFE BL BR) -> stereo
     Mix *f = find_mix(r, 0);
     if (f) apply_effects(r, 0, f);
+    if (f) stats_mix(r, 0, f);
+    if (stats_on && r->elapsed_frames % 200 == 0) stats_print(r);
     for (uint32_t i = 0; i < N; i++) {
         float ch[6] = {0};
         if (f && r->sink_used)
@@ -901,6 +978,8 @@ static void update_splitters(Renderer *r, const uint8_t *p, const uint8_t *end) 
         uint32_t magic, id;
         memcpy(&magic, p, 4);
         memcpy(&id, p + 4, 4);
+        if (magic == 0x49444E53) st_spl_info++;
+        else if (magic == 0x44444E53) st_spl_dest++;
         if (magic == 0x49444E53) {  // SNDI
             uint32_t sr, cnt;
             memcpy(&sr, p + 8, 4);
