@@ -67,6 +67,7 @@ typedef struct {
     uint32_t vs_in_comp[32];
     bool uses_branches, uses_cc, uses_local, uses_shared, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane;
     bool uses_rscale;  // resolution-scale table (fragment/compute only)
+    uint64_t buf_used;  // texture slots read as buffer textures (bfetch<slot>)
     uint32_t flat_mask;           // fragment inputs using constant (flat) interpolation
     uint32_t noperspective_mask;  // fragment inputs using pass (linear) interpolation
     uint32_t omap_target, omap_depth;
@@ -650,6 +651,58 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
     else strcpy(out, e);
 }
 
+// Buffer textures (key buf_slot / buf_fmt): the NVN format of `slot` if the bound texture is a buffer, else -1.
+static int buf_tex_fmt(Ctx *c, int slot) {
+    const ShaderKey *k = c->key;
+    if (!k || !c->glsl || c->stage == STAGE_VERTEX) return -1;
+    if (k->buf_slot0 && k->buf_slot0 - 1 == slot) return k->buf_fmt0;
+    if (k->buf_slot1 && k->buf_slot1 - 1 == slot) return k->buf_fmt1;
+    return -1;
+}
+
+// TLDS 1D on a buffer texture: Vulkan has no 1D image that long (FE3H's light index list: 1052640 texels), so the
+// texels are read from the guest heap (gmem, the imported heap) at the offset / count the renderer puts in
+// rscale[slot + 1].zw (exec.c stage_set). bfetch<slot> returns the raw bits as floats, like the other fetches.
+static bool glsl_buffer_fetch(Ctx *c, int slot, const char *idx, char *call) {
+    if (buf_tex_fmt(c, slot) < 0 || slot >= 64) return false;
+    sprintf(call, "bfetch%d(int(%s))", slot, idx);
+    c->buf_used |= 1ull << slot;
+    c->uses_rscale = true;
+    c->info->uses_gmem = true;
+    return true;
+}
+
+static void glsl_buffer_fetch_fn(Ctx *c, Str *s, int slot) {
+    int f = buf_tex_fmt(c, slot);
+    // words per texel and how they become the 4 results (raw bits; integer formats: the integers' bits)
+    int words = 0;
+    const char *body = NULL;
+    switch (f) {
+    case 0x0A: words = 1; body = "vec4(uintBitsToFloat(w0), 0.0f, 0.0f, 1.0f)"; break;                       // R32F
+    case 0x0B: case 0x0C: words = 1; body = "vec4(uintBitsToFloat(w0), 0.0f, 0.0f, uintBitsToFloat(1u))"; break;  // R32UI / I
+    case 0x16: words = 2; body = "vec4(uintBitsToFloat(w0), uintBitsToFloat(w1), 0.0f, 1.0f)"; break;           // RG32F
+    case 0x17: case 0x18: words = 2; body = "vec4(uintBitsToFloat(w0), uintBitsToFloat(w1), 0.0f, uintBitsToFloat(1u))"; break;
+    case 0x22: words = 3; body = "vec4(uintBitsToFloat(w0), uintBitsToFloat(w1), uintBitsToFloat(w2), 1.0f)"; break;
+    case 0x23: case 0x24: words = 3; body = "vec4(uintBitsToFloat(w0), uintBitsToFloat(w1), uintBitsToFloat(w2), uintBitsToFloat(1u))"; break;
+    case 0x2E: case 0x2F: case 0x30: words = 4;
+        body = "vec4(uintBitsToFloat(w0), uintBitsToFloat(w1), uintBitsToFloat(w2), uintBitsToFloat(w3))"; break;
+    case 0x25: words = 1; body = "unpackUnorm4x8(w0)"; break;                                                   // RGBA8
+    case 0x11: words = 1; body = "vec4(unpackHalf2x16(w0), 0.0f, 1.0f)"; break;                                // RG16F
+    case 0x29: words = 2; body = "vec4(unpackHalf2x16(w0), unpackHalf2x16(w1))"; break;                        // RGBA16F
+    default: break;
+    }
+    sp(s, "vec4 bfetch%d(int i) {\n", slot);
+    if (!words) {
+        sp(s, "  return vec4(0.0f); }  // (buffer texture format %#x not decoded)\n", f);
+        return;
+    }
+    sp(s, "  uint off = floatBitsToUint(rscale[%d].z), n = floatBitsToUint(rscale[%d].w);\n", slot + 1, slot + 1);
+    sp(s, "  if (off == 0xFFFFFFFFu || uint(i) >= n) return vec4(0.0f);\n");
+    sp(s, "  uint b = (off >> 2) + uint(i) * %du;\n", words);
+    for (int k = 0; k < 4; k++) sp(s, "  uint w%d = %s;\n", k, k < words ? (k == 0 ? "gmem_.w[b]" : k == 1 ? "gmem_.w[b + 1u]" : k == 2 ? "gmem_.w[b + 2u]" : "gmem_.w[b + 3u]") : "0u");
+    sp(s, "  return %s;\n}\n", body);
+}
+
 // TEXS / TLDS in GLSL (same slot allocation order and result layout as the MSL switch in emit_texs)
 static bool glsl_texs(Ctx *c, uint64_t w, bool fetch, int *slot_out, char *call, const char *A, const char *A1,
                       const char *Bv, const char *B1) {
@@ -695,9 +748,11 @@ static bool glsl_texs(Ctx *c, uint64_t w, bool fetch, int *slot_out, char *call,
     } else {
         switch (info) {
         case 0: slot = tex_slot(c, index, TEXTYPE_1D, false, false);
-            sprintf(call, "texelFetch(t%d, int(%s), 0)", slot, A); break;
+            if (!glsl_buffer_fetch(c, slot, A, call)) sprintf(call, "texelFetch(t%d, int(%s), 0)", slot, A);
+            break;
         case 1: slot = tex_slot(c, index, TEXTYPE_1D, false, false);
-            sprintf(call, "texelFetch(t%d, int(%s), int(%s))", slot, A, Bv); break;
+            if (!glsl_buffer_fetch(c, slot, A, call)) sprintf(call, "texelFetch(t%d, int(%s), int(%s))", slot, A, Bv);
+            break;
         case 2: slot = tex_slot(c, index, TEXTYPE_2D, false, false);
             sprintf(call, "texelFetch(t%d, ivec2(%s), 0)", slot, RSC2(c, slot, "uint2(%s, %s)", A, Bv)); break;
         case 4: slot = tex_slot(c, index, TEXTYPE_2D, false, false);
@@ -1967,6 +2022,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         default: sp(&s, "ivec3 tsize%d(int l) { return ivec3(textureSize(t%d, l), 1); }\n", i, i);
         }
     }
+    for (int i = 0; i < info->ntex && i < 64; i++)
+        if (c->buf_used & (1ull << i)) glsl_buffer_fetch_fn(c, &s, i);
     if (stage == STAGE_VERTEX) {
         for (int i = 0; i < 32; i++) {
             if (!(c->in_attr_mask & (1u << i))) continue;

@@ -1340,6 +1340,10 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     const uint8_t *vb = (const uint8_t *)vkey;
     for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
+    if (fkey->buf_slot0) {  // (buffer textures: only keys that have them hash differently)
+        const uint8_t e[4] = {fkey->buf_slot0, fkey->buf_fmt0, fkey->buf_slot1, fkey->buf_fmt1};
+        for (int i = 0; i < 4; i++) { h ^= e[i]; h *= 0x100000001B3ull; }
+    }
     if (!h) h = 1;
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
     while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
@@ -2502,6 +2506,18 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             bi[n] = ubo_span(vk_transient_copy(gmap_tab, sizeof gmap_tab, 256), sizeof gmap_tab);
         } else if (b->binding == 18) {
             for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; }
+            for (int t = 0; t < si->ntex && t < 64; t++) {  // buffer textures (bfetch): heap byte offset, texel count
+                if (si->tex[t].type != TEXTYPE_1D) continue;
+                NvnTexture *bt = shader_texture_object(stage, &si->tex[t]);
+                if (!bt || bt->target != 10) continue;
+                const FormatInfo *fi = nvn_format_info(bt->format);
+                uint64_t bytes = (uint64_t)bt->width * (fi && fi->bpb ? fi->bpb : 4);
+                uint32_t off = 0xFFFFFFFFu, cnt = bt->width;
+                gmem_info();  // (imports the heap on first use)
+                if (bt->addr >= HEAP_BASE && bt->addr + bytes <= HEAP_BASE + gmem_size && gmem_buf) off = (uint32_t)(bt->addr - HEAP_BASE);
+                memcpy(&rs[1 + t][2], &off, 4);
+                memcpy(&rs[1 + t][3], &cnt, 4);
+            }
             bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, sizeof rs, 256), sizeof rs);
         } else {
             float zero[8] = {0};
@@ -2675,6 +2691,21 @@ static void draw_(CmdRec *r, bool indexed) {
     if (!pr || atomic_load(&pr->state) != 1)
         SKIP(SK_PROG, "vs %llx fs %llx state %d\n", (unsigned long long)st.program->stages[0].code_addr,
              (unsigned long long)st.program->stages[1].code_addr, pr ? atomic_load(&pr->state) : -1);
+    {   // buffer textures bound to the fragment shader's 1D slots: the variant that reads them from the guest heap
+        int nb = 0;
+        for (int i = 0; i < pr->fi->ntex && i < 64 && nb < 2; i++) {
+            if (pr->fi->tex[i].type != TEXTYPE_1D || pr->fi->tex[i].is_image) continue;
+            NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+            if (!t || t->target != 10) continue;
+            if (!nb) fkey.buf_slot0 = (uint8_t)(i + 1), fkey.buf_fmt0 = (uint8_t)t->format;
+            else fkey.buf_slot1 = (uint8_t)(i + 1), fkey.buf_fmt1 = (uint8_t)t->format;
+            nb++;
+        }
+        if (nb) {
+            pr = get_program(st.program, &vkey, &fkey);
+            if (!pr || atomic_load(&pr->state) != 1) SKIP(SK_PROG, "buffer-texture variant building\n");
+        }
+    }
     g_mirror_w = 0;
     {   // mirror mode (runtime/hle/mirror.c; as renderer.m): the scene's composite into the window image is mirrored
         extern bool mirror_draw(bool composite);
