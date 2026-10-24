@@ -2527,6 +2527,18 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 uint32_t off = 0xFFFFFFFFu, cnt = (bt->width < 0xFFFFFFu ? bt->width : 0xFFFFFFu) | (bt->format & 0xFFu) << 24;
                 gmem_info();  // (imports the heap on first use)
                 if (bt->addr >= HEAP_BASE && bt->addr + bytes <= HEAP_BASE + gmem_size && gmem_buf) off = (uint32_t)(bt->addr - HEAP_BASE);
+                {   // LARECOMP_WATCH_BUFTEX=1 (debug): watch the first compute-bound buffer texture's page - who touches it
+                    static bool armed;
+                    if (!armed && stage == 5 && getenv("LARECOMP_WATCH_BUFTEX") && renderer_present_count() >= 60) {
+                        extern uint64_t g_watch_lo, g_watch_hi;
+                        extern void watch_arm(void);
+                        armed = true;
+                        g_watch_lo = bt->addr;
+                        g_watch_hi = bt->addr + bytes;
+                        LOG("[buftex] watching %llx..%llx\n", (unsigned long long)g_watch_lo, (unsigned long long)g_watch_hi);
+                        watch_arm();
+                    }
+                }
                 {   // (log) each buffer texture when bound, and again 3 frames later (its GPU writes done by then)
                     static struct { uint64_t addr, bytes, frame; int stage, slot; bool rescanned; } bl[64];
                     static int nbl;
