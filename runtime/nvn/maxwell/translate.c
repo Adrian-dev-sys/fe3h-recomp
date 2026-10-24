@@ -869,7 +869,26 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
 }
 
 // ------------------------------------------------------------------ instruction translation
+// (test) LARECOMP_REPLACE_WORDS=<old hex>:<new hex>[,...]: translate instruction word <old> as <new> wherever it occurs,
+// e.g. to swap one instruction of a game shader for a MOV and see what that part of the shader does
+static uint64_t replace_word(uint64_t w) {
+    static uint64_t from[16], to[16];
+    static int n = -1;
+    if (n < 0) {
+        n = 0;
+        for (const char *p = getenv("LARECOMP_REPLACE_WORDS"); p && *p && n < 16;) {
+            from[n] = strtoull(p, (char **)&p, 16);
+            if (*p != ':') break;
+            to[n++] = strtoull(p + 1, (char **)&p, 16);
+            while (*p == ',') p++;
+        }
+    }
+    for (int i = 0; i < n; i++) if (w == from[i]) return to[i];
+    return w;
+}
+
 static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
+    w = replace_word(w);
     char t[2048], u[2048];
     int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8);
     int pr = (int)bits(w, 16, 3);
