@@ -962,9 +962,15 @@ static void vk_end_pass_at(int line) {
         if (multi) snprintf(path, sizeof path, "build/pass_%llu_%03d.png", (unsigned long long)debug_pass_frame, debug_pass_no++);
         else snprintf(path, sizeof path, "build/pass_%03d.png", debug_pass_no++);
         renderer_save_texture_tex(st.rt.color[0]->backend, path);
+        path[strlen(path) - 4] = 0;
+        for (int i = 1; i < st.rt.ncolor && i < 8; i++) {  // the other color targets: build/pass_NNN_c<i>.png
+            if (!st.rt.color[i] || !st.rt.color[i]->backend) continue;
+            char p2[280];
+            snprintf(p2, sizeof p2, "%s_c%d.png", path, i);
+            renderer_save_texture_tex(st.rt.color[i]->backend, p2);
+        }
         if (st.rt.depth && st.rt.depth->backend) {  // its depth / stencil too: build/pass_NNN_d.png, _s.png
             void renderer_save_depth_tex(TexBackend *b, const char *prefix);
-            path[strlen(path) - 4] = 0;
             renderer_save_depth_tex(st.rt.depth->backend, path);
         }
     }
@@ -3264,6 +3270,44 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         if (!t) { LOG("[draw]   tex%d: none\n", i); continue; }
         LOG("[draw]   tex%d: %p %ux%u f%#x lv %u -> %ux%u scale %.4f %.4f%s\n", i, (void *)t, t->width, t->height, t->format,
             b ? b->levels : 0, b ? b->width : 0, b ? b->height : 0, b ? b->sx : 0, b ? b->sy : 0, b && b->scalable ? " scalable" : "");
+    }
+    // LARECOMP_DUMP_TEX=<fs hash>[,...] and/or min:<n> (any fragment shader sampling at least n textures): with F9, save
+    // the textures the draw samples as build/tex_<hash>_<i>.png (depth as _d / _s; level 0, first layer, clamped to 0..1)
+    const char *dt = getenv("LARECOMP_DUMP_TEX");
+    if (dt && *dt) {
+        bool want = false;
+        for (const char *p = dt; *p;) {
+            if (!strncmp(p, "min:", 4)) {
+                if (pr->fi->ntex >= atoi(p + 4)) want = true;
+            } else if (strtoull(p, NULL, 16) == g_cur_fs_hash) {
+                want = true;
+            }
+            while (*p && *p != ',') p++;
+            while (*p == ',') p++;
+        }
+        static uint64_t done[32];
+        static int ndone;
+        static uint64_t done_frame = ~0ull;
+        if (done_frame != renderer_present_count()) done_frame = renderer_present_count(), ndone = 0;
+        for (int k = 0; k < ndone; k++) if (done[k] == g_cur_fs_hash) want = false;
+        if (want && ndone < 32) {
+            done[ndone++] = g_cur_fs_hash;
+            void renderer_save_depth_tex(TexBackend *b, const char *prefix);
+            for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
+                NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+                TexBackend *b = t ? (TexBackend *)t->backend : NULL;
+                if (!b || !b->image || b->width > 8192 || b->height > 8192 || b->height < 2) continue;  // (not texel buffers)
+                char path[96];
+                snprintf(path, sizeof path, "build/tex_%016llx_%d", (unsigned long long)g_cur_fs_hash, i);
+                if (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) {
+                    renderer_save_depth_tex(b, path);
+                } else {
+                    strcat(path, ".png");
+                    renderer_save_texture_tex(b, path);
+                }
+                LOG("[dumptex] %s: %ux%u f%#x\n", path, t->width, t->height, t->format);
+            }
+        }
     }
 }
 
