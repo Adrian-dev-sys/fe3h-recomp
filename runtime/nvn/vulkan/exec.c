@@ -3418,6 +3418,21 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     snap_reason = "buf2tex"; snapshots_invalidate(NULL);
     NvnTexture *t = (NvnTexture *)(uintptr_t)dst->tex;
     if (!t || !src) return;
+    if (t->target == 10) {
+        // A buffer texture is its memory: shaders read it from the heap (bfetch), not from an image. FE3H uploads its
+        // per-frame light tables this way.
+        const FormatInfo *bf = nvn_format_info(t->format);
+        uint32_t bpb = bf && bf->bpb ? bf->bpb : 4;
+        uint64_t x = dst->region[0] > 0 ? (uint64_t)dst->region[0] : 0;
+        uint64_t w = dst->region[3] > 0 ? (uint64_t)dst->region[3] : t->width;
+        if (x + w > t->width) w = x < t->width ? t->width - x : 0;
+        static int nlog;
+        if (nlog++ < 8)
+            LOG("[vk] buffer -> buffer texture %llx (%u texels fmt %#x): texels %llu+%llu from %llx\n", (unsigned long long)t->addr,
+                t->width, t->format, (unsigned long long)x, (unsigned long long)w, (unsigned long long)src);
+        if (t->addr && w) memmove((void *)(uintptr_t)(t->addr + x * bpb), (const void *)(uintptr_t)src, w * bpb);
+        return;
+    }
     alias_before_write(t, 0, "upload");
     vk_end_pass();
     const FormatInfo *fi;
