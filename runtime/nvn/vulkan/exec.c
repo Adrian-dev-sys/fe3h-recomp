@@ -2609,8 +2609,11 @@ static void build_compute(void *arg) {
     cp->p.layout = make_layout(&cp->p, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0);
     VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
     VkSpecializationInfo spec = {3, me, 12, cp->local};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sg32 = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = 32};
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                .pNext = g_vk.cs_subgroup32 ? &sg32 : NULL,
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main",
                                                 .pSpecializationInfo = &spec},
                                       .layout = cp->p.layout};

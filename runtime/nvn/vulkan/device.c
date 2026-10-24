@@ -175,7 +175,22 @@ static void create_device(void) {
     VkPhysicalDeviceCustomBorderColorFeaturesEXT cbc = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, .customBorderColors = VK_TRUE,
         .customBorderColorWithoutFormat = VK_TRUE, .pNext = g_vk.divisor ? &div : NULL};
+    {   // 32-lane subgroups for compute: guest shaders use warp-sized ballots / lane ids / shuffles (an AMD wave64 would
+        // split one warp's work across bits the 32-bit ballot results cannot hold)
+        VkPhysicalDeviceVulkan13Features q13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceFeatures2 qf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &q13};
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &qf);
+        VkPhysicalDeviceVulkan13Properties p13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+        VkPhysicalDeviceVulkan11Properties p11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, .pNext = &p13};
+        VkPhysicalDeviceProperties2 pp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &p11};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &pp);
+        g_vk.cs_subgroup32 = q13.subgroupSizeControl && p13.minSubgroupSize <= 32 && p13.maxSubgroupSize >= 32 &&
+                             (p13.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) && !getenv("LARECOMP_NO_SUBGROUP32");
+        LOG("[vk] subgroups: %u lanes (%u..%u)%s\n", p11.subgroupSize, p13.minSubgroupSize, p13.maxSubgroupSize,
+            g_vk.cs_subgroup32 ? ", compute at 32" : "");
+    }
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+                                            .subgroupSizeControl = g_vk.cs_subgroup32,
                                             .dynamicRendering = VK_TRUE, .synchronization2 = VK_TRUE,
                                             .shaderDemoteToHelperInvocation = VK_TRUE, .shaderTerminateInvocation = VK_TRUE,
                                             .maintenance4 = VK_TRUE,

@@ -1453,8 +1453,16 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         case 0x25: set_reg(c, d, "ctaid.x"); break;
         case 0x26: set_reg(c, d, "ctaid.y"); break;
         case 0x27: set_reg(c, d, "ctaid.z"); break;
-        case 0x00: set_reg(c, d, "0u"); break;
-        default: sprintf(t, "0u /* sr %#x */", sr); set_reg(c, d, t);
+        case 0x00: set_reg(c, d, c->glsl ? "gl_SubgroupInvocationID" : "0u"); break;  // LANEID
+        // lane masks (EQ LT LE GT GE): the warp's 32 lanes (compute runs 32-lane subgroups where the GPU allows)
+        case 0x38: if (c->glsl) { set_reg(c, d, "gl_SubgroupEqMask.x"); break; } goto unknown_sr;
+        case 0x39: if (c->glsl) { set_reg(c, d, "gl_SubgroupLtMask.x"); break; } goto unknown_sr;
+        case 0x3a: if (c->glsl) { set_reg(c, d, "gl_SubgroupLeMask.x"); break; } goto unknown_sr;
+        case 0x3b: if (c->glsl) { set_reg(c, d, "gl_SubgroupGtMask.x"); break; } goto unknown_sr;
+        case 0x3c: if (c->glsl) { set_reg(c, d, "gl_SubgroupGeMask.x"); break; } goto unknown_sr;
+        default:
+        unknown_sr:
+            sprintf(t, "0u /* sr %#x */", sr); set_reg(c, d, t);
         }
     } else if (OPM(0x5c30000000000000ull, 0xfff8000000000000ull) || OPM(0x4c30000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x3830000000000000ull, 0xfef8000000000000ull)) {  // FLO
