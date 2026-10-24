@@ -143,7 +143,12 @@ HLE_FUNC("_ZN5movie6BufferC1Em", buf_ctor_alloc) {
 HLE_FUNC("_ZN5movie6BufferC1ERKS0_", buf_copy) { *BUF(c->x[0]) = *BUF(c->x[1]); }
 HLE_FUNC("_ZN5movie6BufferaSERKS0_", buf_assign) { *BUF(c->x[0]) = *BUF(c->x[1]); }
 HLE_FUNC("_ZN5movie6BufferD1Ev", buf_dtor) { (void)c; }
-HLE_FUNC("_ZNK5movie6Buffer4BaseEv", buf_base) { c->x[0] = BUF(c->x[0])->base; }
+HLE_FUNC("_ZNK5movie6Buffer4BaseEv", buf_base) {
+    static int n;
+    if (getenv("LARECOMP_MOVIE_LOG") && n++ < 60) LOG("[movie] Buffer %llx Base -> %llx (lr=%llx)\n", (unsigned long long)c->x[0],
+                                                     (unsigned long long)BUF(c->x[0])->base, (unsigned long long)c->x[30]);
+    c->x[0] = BUF(c->x[0])->base;
+}
 HLE_FUNC("_ZNK5movie6Buffer4SizeEv", buf_size) { c->x[0] = (uint32_t)BUF(c->x[0])->size; }
 HLE_FUNC("_ZNK5movie6Buffer6OffsetEv", buf_offset) { c->x[0] = (uint32_t)BUF(c->x[0])->offset; }
 HLE_FUNC("_ZNK5movie6Buffer8CapacityEv", buf_capacity) { c->x[0] = BUF(c->x[0])->capacity; }
@@ -153,8 +158,16 @@ HLE_FUNC("_ZN5movie6Buffer18SetDataAndCapacityEPvm", buf_set_data) {
     b->base = c->x[1];
     b->capacity = c->x[2];
 }
-HLE_FUNC("_ZN5movie6Buffer12SetInt64DataEl", buf_set_i64) { BUF(c->x[0])->i64 = (int64_t)c->x[1]; }
-HLE_FUNC("_ZNK5movie6Buffer12GetInt64DataEv", buf_get_i64) { c->x[0] = (uint64_t)BUF(c->x[0])->i64; }
+HLE_FUNC("_ZN5movie6Buffer12SetInt64DataEl", buf_set_i64) {
+    if (getenv("LARECOMP_MOVIE_LOG")) LOG("[movie] Buffer %llx SetInt64Data(%llx) (lr=%llx)\n", (unsigned long long)c->x[0],
+                                         (unsigned long long)c->x[1], (unsigned long long)c->x[30]);
+    BUF(c->x[0])->i64 = (int64_t)c->x[1];
+}
+HLE_FUNC("_ZNK5movie6Buffer12GetInt64DataEv", buf_get_i64) {
+    if (getenv("LARECOMP_MOVIE_LOG")) LOG("[movie] Buffer %llx GetInt64Data -> %llx (lr=%llx)\n", (unsigned long long)c->x[0],
+                                         (unsigned long long)BUF(c->x[0])->i64, (unsigned long long)c->x[30]);
+    c->x[0] = (uint64_t)BUF(c->x[0])->i64;
+}
 HLE_FUNC("_ZN5movie6Buffer13SetUint32DataEj", buf_set_u32) { BUF(c->x[0])->u32 = (uint32_t)c->x[1]; }
 HLE_FUNC("_ZNK5movie6Buffer13GetUint32DataEv", buf_get_u32) { c->x[0] = BUF(c->x[0])->u32; }
 HLE_FUNC("_ZN5movie6Buffer12SetInt32DataEi", buf_set_i32) { BUF(c->x[0])->i32 = (int32_t)c->x[1]; }
@@ -791,7 +804,7 @@ static void dec_get_input_buffer(Cpu *c) {
     int i = (int)c->x[1];
     MBuffer *b = BUF(c->x[2]);
     if (i < 0 || i >= NIN) { c->x[0] = 1; return; }
-    memset(b, 0, sizeof *b);
+    b->offset = b->size = 0;  // (the user data fields stay the game's)
     b->base = (uint64_t)(uintptr_t)d->in_mem[i];
     b->capacity = d->in_cap;
     c->x[0] = 0;
@@ -918,6 +931,14 @@ static void dec_get_output_buffer(Cpu *c) {
     int i = (int)c->x[1];
     MBuffer *b = BUF(c->x[2]);
     if (i < 0 || i >= NOUT) { c->x[0] = 1; return; }
+    {
+        static int n;
+        if (n++ < 6)
+            LOG("[movie] GetOutputBuffer(%d) %s in: base %llx (-> %llx) capacity %llx offset %d size %d i64 %llx u32 %x i32 %d\n",
+                i, d->video ? "video" : "audio", (unsigned long long)b->base,
+                b->base ? (unsigned long long)*(uint64_t *)(uintptr_t)b->base : 0ull, (unsigned long long)b->capacity,
+                b->offset, b->size, (unsigned long long)b->i64, b->u32, b->i32);
+    }
     if (d->video && b->base && b->capacity == 8) {
         // texture output mode: the buffer points at the game's NVNtexture; write RGBA into it
         NvnTexture *t = *(NvnTexture **)(uintptr_t)b->base;
@@ -934,7 +955,7 @@ static void dec_get_output_buffer(Cpu *c) {
         c->x[0] = 0;
         return;
     }
-    memset(b, 0, sizeof *b);
+    b->offset = 0;  // (the user data fields i64 / u32 / i32 stay the game's)
     b->base = (uint64_t)(uintptr_t)d->out_mem[i];
     b->capacity = d->out_cap;
     b->size = (int32_t)d->out_size[i];
