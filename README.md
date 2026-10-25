@@ -81,7 +81,7 @@ The game sees every pack there as installed. The first launch converts each fold
 ### Cheats
 
 Cheats use the Atmosphere format: put them in `cheats.txt` in the project folder (a `[Name]` line, then its codes; a
-`{Name}` block is a master code, always on), and they show up in the menu's **Game** tab to switch on and off. The
+`{Name}` block is a master code, always on; `#` lines under the name describe it), and they show up in the menu's **Game** tab to switch on and off. The
 file stays out of git.
 
 Cheats that only change memory work straight away. Cheats that patch the game's code (most multipliers and "max"

@@ -9,6 +9,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <atomic>
+#include <string>
 #include <vector>
 
 #include "imgui.h"
@@ -584,13 +585,12 @@ static void tab_game(void) {
         CheatInfo ci;
         if (!cheatvm_info(i, &ci) || ci.master) continue;
         bool on = ci.on;
-        const char *d = ci.unsupported ? "This cheat uses an opcode the cheat engine doesn't support, so it can't run."
-                      : ci.needs_gen ? "This cheat patches the game's code, and that patch isn't built in yet: run "
-                                       "`make gen-main` and then `make`, and restart."
-                      : "From cheats.txt. Turning a cheat off puts back any game code it changed; values it already "
-                        "wrote (gold, stats...) stay as they are.";
+        std::string d = ci.desc && *ci.desc ? ci.desc : "From cheats.txt (no description: add # lines under its name).";
+        if (ci.unsupported) d += "\n\nThis cheat uses an opcode the cheat engine doesn't support, so it can't run.";
+        else if (ci.needs_gen) d += "\n\nIt patches the game's code, and that patch isn't built in yet: run `make gen-main` "
+                                    "and then `make`, and restart.";
         if (ci.unsupported || ci.needs_gen) opt_disable_next();
-        if (opt_toggle(ci.name, &on, false, d)) { cheatvm_set(i, on); settings_save(); }
+        if (opt_toggle(ci.name, &on, false, d.c_str())) { cheatvm_set(i, on); settings_save(); }
     }
     opt_end();
 }

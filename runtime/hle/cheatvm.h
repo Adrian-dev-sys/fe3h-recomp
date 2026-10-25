@@ -13,6 +13,7 @@ typedef struct {
     bool on, master;
     bool unsupported;  // an opcode the VM doesn't run
     bool needs_gen;    // an instruction it patches isn't compiled in yet (make gen-main, then make)
+    const char *desc;  // its "# ..." lines ("" if none)
 } CheatInfo;
 
 void cheatvm_frame(void);  // once a frame: the enabled cheats

@@ -1,7 +1,7 @@
 // Cheats: Atmosphere's cheat VM over cheats.txt (the project folder; Atmosphere's format, never committed).
 //
 // cheats.txt holds cheats as Atmosphere writes them: a [name] line, then the opcodes (8-digit hex words); {name} is a
-// master code, always on. The enabled ones run once a frame, as dmnt runs them on the console: memory writes and
+// master code, always on. Lines starting with # under a name describe it (shown in the menu). The enabled ones run once a frame, as dmnt runs them on the console: memory writes and
 // reads relative to the main module or the heap, conditionals, loops, registers, button conditions.
 //
 // A cheat that writes an instruction into the game's code (opcode 0, 4 bytes, inside main's .text) can't change a
@@ -27,6 +27,7 @@
 
 typedef struct {
     char name[96];
+    char desc[512];  // the "# ..." lines under its name (ours: Atmosphere has no descriptions)
     char key[96];  // the settings key: the name in lower case, other characters as '_'
     uint32_t *w;
     int n;
@@ -119,6 +120,13 @@ static void load(void) {
             continue;
         }
         if (!c) continue;
+        if (*p == '#') {  // a description line
+            p++;
+            while (*p == ' ') p++;
+            size_t l = strlen(c->desc);
+            snprintf(c->desc + l, sizeof c->desc - l, "%s%s", l ? " " : "", p);
+            continue;
+        }
         for (char *t = strtok(p, " \t"); t; t = strtok(NULL, " \t"))
             if (strlen(t) == 8 && strspn(t, "0123456789abcdefABCDEF") == 8 && c->n < MAX_WORDS)
                 c->w[c->n++] = (uint32_t)strtoul(t, NULL, 16);
@@ -309,6 +317,7 @@ bool cheatvm_info(int i, CheatInfo *out) {
     out->master = g_cheats[i].master;
     out->unsupported = g_cheats[i].bad;
     out->needs_gen = g_cheats[i].needs_gen;
+    out->desc = g_cheats[i].desc;
     return true;
 }
 

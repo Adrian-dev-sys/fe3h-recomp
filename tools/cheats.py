@@ -49,7 +49,7 @@ def parse(path):
                 cur = (m.group(1).strip(), [])
                 cheats.append(cur)
                 continue
-            if cur is None:
+            if cur is None or line.startswith('#'):  # (# lines: the cheat's description)
                 continue
             for tok in line.split():
                 if re.fullmatch(r'[0-9A-Fa-f]{8}', tok):
