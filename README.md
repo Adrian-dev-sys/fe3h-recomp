@@ -41,10 +41,12 @@ Added for *Three Houses*:
   barriers that are safe inside branches, 32-lane compute subgroups, and buffer clears.
 - **System services:** an always-offline network service (the calendar crashed without it).
 - **DLC:** the Expansion Pass, Cindered Shadows and the bonus waves, from your own DLC files.
+- **Cheats:** Atmosphere-format cheat codes from a `cheats.txt` of your own, switched on and off in the menu's Game
+  tab, including the ones that patch the game's code (see [Cheats](#cheats) below).
 
 The start screen and the in-game menu (F1) are FE3H's own: Video, Audio, Controls and Game settings in slate
-and gold. LAS's Link's Awakening features (randomizer, cheats, cosmetics, warps) are still in the code, switched
-off and out of the menus.
+and gold. LAS's Link's Awakening features (its randomizer, cheats, cosmetics, warps) are still in the code,
+switched off and out of the menus.
 
 The start screen shows your own picture if you put one in the game files folder as `extracted/background.png` (or
 `.jpg`); it isn't part of this repository, and `.gitignore` keeps it out.
@@ -87,7 +89,8 @@ file stays out of git.
 Cheats that only change memory work straight away. Cheats that patch the game's code (most multipliers and "max"
 cheats) can't be applied to an already-recompiled game at run time, so their patched instructions get compiled in
 beside the originals: after adding or changing those, run `make gen-main` and then `make`. The menu marks any cheat
-still waiting on that. Switching a cheat off puts back any code it changed; values it already wrote stay.
+still waiting on that. Switching a cheat off puts back any code it changed; values it already wrote stay. Cheats
+that patch the same instruction (Exp x2 / x4 / x8, say) exclude each other: switching one on turns the others off.
 
 ### Settings and logs
 
