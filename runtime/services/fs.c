@@ -606,10 +606,14 @@ SERVICE("fsp-srv", fsp_srv) {
         break;
     }
     case 200: ipc_return_object(resp, open_romfs_storage()); break;  // OpenDataStorageByCurrentProcess
-    case 202:  // OpenDataStorageByDataId (system data archives)
+    case 202: {  // OpenDataStorageByDataId: DLC (services/aoc.c), else system data archives (not available)
+        extern Service *aoc_open_storage(uint64_t id);
+        Service *dlc = aoc_open_storage(IN(uint64_t, 8));
+        if (dlc) { ipc_return_object(resp, dlc); break; }
         LOG("[fs] OpenDataStorageByDataId %llx (not available)\n", IN(uint64_t, 8));
         resp->result = MAKE_RESULT(2, 1001);
         break;
+    }
     case 1005: OUT(uint32_t, 0) = 0; resp_size(resp, 4); break;  // GetGlobalAccessLogMode
     case 1003: case 1004: case 1006: break;
     case 1011: memset(resp->data, 0, 0x10); resp_size(resp, 0x10); break;

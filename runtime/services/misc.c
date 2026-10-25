@@ -1,4 +1,4 @@
-// Small services: parental control, add-on content, and other mostly-stubbed interfaces.
+// Small services: parental control, nifm, and other mostly-stubbed interfaces.
 #include <string.h>
 
 #include "../hle.h"
@@ -34,18 +34,6 @@ SERVICE("pctl", pctl) { pctl_root(s, req, resp); }
 SERVICE("pctl:s", pctl_s) { pctl_root(s, req, resp); }
 SERVICE("pctl:a", pctl_a) { pctl_root(s, req, resp); }
 SERVICE("pctl:r", pctl_r) { pctl_root(s, req, resp); }
-
-// ------------------------------------------------------------------ aoc:u (no DLC)
-SERVICE("aoc:u", aoc_u) {
-    (void)s;
-    switch (req->cmd) {
-    case 2: OUT(uint32_t, 0) = 0; resp_size(resp, 4); break;   // CountAddOnContent
-    case 3: OUT(uint32_t, 0) = 0; resp_size(resp, 4); break;   // ListAddOnContent
-    case 5: OUT(uint64_t, 0) = 0x01006BB00C6F1000ull; resp_size(resp, 8); break;  // GetAddOnContentBaseId
-    case 8: resp->copy_handles[resp->ncopy++] = new_event_handle(); break;
-    default: ok_logger(s, req, resp);
-    }
-}
 
 // ------------------------------------------------------------------ nifm (network interface): always offline
 // FE3H asks for the console's IP address when the calendar first opens (its online features); with the logging stub
