@@ -6,6 +6,7 @@
 
 #include "hle.h"
 #include "input_bind.h"
+#include "paths.h"
 
 #define SETTINGS_FILE settings_file()
 
@@ -71,12 +72,24 @@ const char *settings_language_name(void) {
     return "English";
 }
 
+static void fe3h_settings(void) {
+    // Fire Emblem: Three Houses: Link's Awakening's options stay off whatever an older settings file says (their hooks
+    // patch that game's code and memory), and the game keeps its own 16:9 framing (no widescreen camera patch here).
+    g_settings.aspect = ASPECT_ORIGINAL, g_settings.aspect_asked = true;
+    g_settings.dpad_move = g_settings.move_360 = g_settings.blur_removal = g_settings.hide_hero_icon = false;
+    g_settings.mirror_mode = g_settings.cheat_hearts = g_settings.cheat_ammo = g_settings.cheat_rupees = false;
+    g_settings.cheat_hookshot = g_settings.no_buff_drops = g_settings.diff_ohko = g_settings.diff_hero = false;
+    g_settings.diff_damage = 1.0f;
+    g_settings.inv_keys = g_settings.tracker = false;
+    g_settings.rando_seed[0] = 0;
+}
+
 void settings_load(void) {
     static bool loaded;
     if (loaded) return;
     loaded = true;
     FILE *f = fopen(SETTINGS_FILE, "r");
-    if (!f) return;
+    if (!f) { fe3h_settings(); return; }
     char line[256];
     bool tip_key = false, aspect_key = false;
     while (fgets(line, sizeof line, f)) {
@@ -135,6 +148,7 @@ void settings_load(void) {
     fclose(f);
     if (!tip_key) g_settings.menu_tip_seen = true;  // (a settings file from before the note: not a first launch)
     if (!aspect_key) g_settings.aspect_asked = true;  // (likewise: the aspect ratio was chosen already)
+    fe3h_settings();
     if (g_settings.volume < 0) g_settings.volume = 0;
     if (g_settings.volume > 2) g_settings.volume = 2;
     LOG("[settings] loaded %s\n", SETTINGS_FILE);
@@ -143,7 +157,7 @@ void settings_load(void) {
 void settings_save(void) {
     FILE *f = fopen(SETTINGS_FILE, "w");
     if (!f) { LOG("[settings] cannot write %s\n", SETTINGS_FILE); return; }
-    fprintf(f, "# LAS Recomp settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
+    fprintf(f, "# " RT_APP_NAME " settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
     fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original" : "unlocked");
     fprintf(f, "fullscreen = %d\n", g_settings.fullscreen);
     fprintf(f, "volume = %.2f\n", g_settings.volume);

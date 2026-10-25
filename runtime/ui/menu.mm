@@ -15,6 +15,7 @@
 #include "option_rows.h"
 #include "imgui_internal.h"  // (NavCursorVisible)
 #include "osk.h"
+#include "theme.h"
 #ifdef __APPLE__
 #include "imgui_impl_metal.h"
 #else
@@ -289,31 +290,31 @@ static void style_init(void) {
     s.WindowRounding = 14; s.FrameRounding = 8; s.GrabRounding = 8; s.TabRounding = 8; s.ChildRounding = 10;
     s.WindowPadding = ImVec2(28, 24); s.FramePadding = ImVec2(14, 8); s.ItemSpacing = ImVec2(14, 12);
     s.WindowBorderSize = 0; s.ScrollbarSize = 18;
-    ImVec4 *c = s.Colors;
-    ImVec4 gold(0.93f, 0.76f, 0.33f, 1), gold_dim(0.62f, 0.49f, 0.20f, 1), green(0.15f, 0.36f, 0.25f, 1);
-    c[ImGuiCol_WindowBg] = ImVec4(0.06f, 0.09f, 0.08f, 0.94f);
-    c[ImGuiCol_ChildBg] = ImVec4(0.09f, 0.13f, 0.11f, 0.85f);
-    c[ImGuiCol_PopupBg] = ImVec4(0.07f, 0.10f, 0.09f, 0.98f);
-    c[ImGuiCol_Text] = ImVec4(0.96f, 0.94f, 0.88f, 1);
-    c[ImGuiCol_TextDisabled] = ImVec4(0.62f, 0.64f, 0.58f, 1);
-    c[ImGuiCol_FrameBg] = ImVec4(0.13f, 0.19f, 0.16f, 1);
-    c[ImGuiCol_FrameBgHovered] = green;
-    c[ImGuiCol_FrameBgActive] = ImVec4(0.19f, 0.45f, 0.31f, 1);
-    c[ImGuiCol_Button] = ImVec4(0.14f, 0.22f, 0.18f, 1);
-    c[ImGuiCol_ButtonHovered] = green;
-    c[ImGuiCol_ButtonActive] = ImVec4(0.21f, 0.50f, 0.34f, 1);
-    c[ImGuiCol_Header] = green;
-    c[ImGuiCol_HeaderHovered] = ImVec4(0.19f, 0.45f, 0.31f, 1);
-    c[ImGuiCol_HeaderActive] = ImVec4(0.21f, 0.50f, 0.34f, 1);
-    c[ImGuiCol_Tab] = ImVec4(0.12f, 0.18f, 0.15f, 1);
-    c[ImGuiCol_TabHovered] = green;
-    c[ImGuiCol_TabSelected] = ImVec4(0.21f, 0.44f, 0.31f, 1);
-    c[ImGuiCol_TabSelectedOverline] = gold;
-    c[ImGuiCol_CheckMark] = gold;
-    c[ImGuiCol_SliderGrab] = gold_dim;
-    c[ImGuiCol_SliderGrabActive] = gold;
-    c[ImGuiCol_NavCursor] = gold;
-    c[ImGuiCol_Separator] = ImVec4(0.30f, 0.36f, 0.30f, 1);
+    ImVec4 *c = s.Colors;  // (theme.h: slate and gold)
+    c[ImGuiCol_WindowBg] = THEME_WINDOW;
+    c[ImGuiCol_ChildBg] = THEME_CHILD;
+    c[ImGuiCol_PopupBg] = THEME_POPUP;
+    c[ImGuiCol_Text] = THEME_TEXT;
+    c[ImGuiCol_TextDisabled] = THEME_QUIET;
+    c[ImGuiCol_FrameBg] = THEME_FRAME;
+    c[ImGuiCol_FrameBgHovered] = THEME_HOVER;
+    c[ImGuiCol_FrameBgActive] = THEME_ACTIVE;
+    c[ImGuiCol_Button] = THEME_FRAME;
+    c[ImGuiCol_ButtonHovered] = THEME_HOVER;
+    c[ImGuiCol_ButtonActive] = THEME_ACTIVE;
+    c[ImGuiCol_Header] = THEME_HOVER;
+    c[ImGuiCol_HeaderHovered] = THEME_ACTIVE;
+    c[ImGuiCol_HeaderActive] = THEME_ACTIVE;
+    c[ImGuiCol_Tab] = THEME_TAB;
+    c[ImGuiCol_TabHovered] = THEME_HOVER;
+    c[ImGuiCol_TabSelected] = THEME_TAB_SELECTED;
+    c[ImGuiCol_TabSelectedOverline] = THEME_GOLD;
+    c[ImGuiCol_CheckMark] = THEME_GOLD;
+    c[ImGuiCol_SliderGrab] = THEME_GOLD_DIM;
+    c[ImGuiCol_SliderGrabActive] = THEME_GOLD;
+    c[ImGuiCol_NavCursor] = THEME_GOLD;
+    c[ImGuiCol_Separator] = THEME_SEPARATOR;
+    c[ImGuiCol_TableRowBgAlt] = ImVec4(1, 1, 1, 0.03f);
     c[ImGuiCol_TitleBg] = c[ImGuiCol_TitleBgActive] = c[ImGuiCol_WindowBg];
 }
 
@@ -381,7 +382,7 @@ static void drain_events(ImGuiIO &io) {
 // Section header in the big font.
 static void header(const char *t) {
     ImGui::PushFont(g_font_big);
-    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", t);
+    ImGui::TextColored(THEME_GOLD, "%s", t);
     ImGui::PopFont();
     ImGui::Separator();
     ImGui::Spacing();
@@ -436,11 +437,7 @@ extern "C" double output_scale_dynamic_factor(void);
 static void tab_display(void) {
     float scale = ImGui::GetFontSize() / 34;
     opt_begin("##video", scale);
-    opt_section("Display");
-    const char *aspects[] = {"Unlocked", "Original 16:9"};
-    opt_choice("Aspect ratio", &g_settings.aspect, aspects, 2, ASPECT_UNLOCKED,
-               "Unlocked: the view fills the window, so wider (or taller) windows show more of the island - up to "
-               "ultrawide; houses and dungeons keep their framing. Original 16:9: the game's own framing, with bars.");
+    opt_section("Display");  // (no aspect ratio choice: FE3H keeps its 16:9 framing, settings.c)
     bool fs = g_settings.fullscreen;
     if (opt_toggle("Fullscreen", &fs, false, "Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.")) {
         g_settings.fullscreen = fs;
@@ -462,7 +459,7 @@ static void tab_display(void) {
         float sx, sy;
         renderer_get_scale(&sx, &sy);
         char d[400];
-        int n = snprintf(d, sizeof d, "How sharp the 3D image is. Match display: your screen's own resolution. Dynamic: "
+        int n = snprintf(d, sizeof d, "How sharp the image is. Match display: your screen's own resolution. Dynamic: "
                                       "as sharp as your GPU keeps at full speed. 1x-4x: the Switch's 1080p times that. "
                                       "75%% / 50%% / 25%%: a share of the display, for slower machines.\n\nRendering at "
                                       "%.0f x %.0f.", 1920.0 * sx, 1080.0 * sy);
@@ -494,11 +491,6 @@ static void tab_display(void) {
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
 
-    opt_section("Game");
-    opt_toggle("Remove blur", &g_settings.blur_removal, false,
-               "Turns off the tilt-shift blur at the top and bottom of the screen.");
-    opt_toggle("Hide Hero Mode icon", &g_settings.hide_hero_icon, false,
-               "Hides the Hero Mode emblem in the corner of the screen while playing a Hero Mode file.");
     opt_end();
 }
 
@@ -525,9 +517,9 @@ static void tab_audio(void) {
                    "The game's volume. 100% is the game's own level; above it, louder."))
         g_settings.volume = pct / 100.0f;
     opt_toggle("Room reverb", &g_settings.reverb, true,
-               "The game's echo in caves, dungeons and big rooms.");
+               "The game's room acoustics: the echo in halls, the cathedral and other large spaces.");
     opt_toggle("Movie audio", &g_settings.movie_audio, true,
-               "Sound in the game's movies (the opening and the ending). Applies the next time a movie starts.");
+               "Sound in the game's animated cutscenes. Applies the next time a movie starts.");
     opt_end();
 }
 
@@ -540,8 +532,8 @@ static void tab_quit(float scale, bool in_game) {
         ask = 0;
     const char *lost = in_game ? "\n\nProgress since your last save is lost." : "";
     char d1[200], d2[200];
-    snprintf(d1, sizeof d1, "Leaves the game and goes back to the LAS Recomp start screen.%s", lost);
-    snprintf(d2, sizeof d2, "Closes LAS Recomp.%s", lost);
+    snprintf(d1, sizeof d1, "Leaves the game and goes back to the " RT_APP_NAME " start screen.%s", lost);
+    snprintf(d2, sizeof d2, "Closes " RT_APP_NAME ".%s", lost);
     opt_begin("##quit", scale);
     opt_section("Quit");
     if (!ask) {
@@ -566,34 +558,24 @@ static void tab_quit(float scale, bool in_game) {
     opt_end();
 }
 
+// Game: what the game itself is told (its language). Cheats will live here too.
+static void tab_game(void) {
+    opt_begin("##game", ImGui::GetFontSize() / 34);
+    opt_section("System");
+    // what the game is told the console's language is: its text follows this (runtime/settings.c)
+    char autol[64];
+    snprintf(autol, sizeof autol, "Auto (%s)", settings_language_name());
+    const char *names[N_LANGUAGES];
+    names[0] = autol;
+    for (int i = 1; i < N_LANGUAGES; i++) names[i] = g_language_names[i];
+    if (opt_choice("Language", &g_settings.language, names, N_LANGUAGES, 0,
+                   "The console language the game is told, which picks its text language (the voice language is in "
+                   "the game's own settings). Applies when the game restarts: Quit to Start Screen, then Play."))
+        settings_save();
+    opt_end();
+}
+
 static void tab_about(void) {
-    header("Movement");
-    toggle("D-pad moves Link", &g_settings.dpad_move);
-    toggle("360-degree movement", &g_settings.move_360);
-    hint("Link walks in the exact direction of the stick instead of snapping to 8 directions.");
-    ImGui::Spacing();
-    header("Button prompts");
-    {
-        static const char *const fam[] = {"Nintendo", "Xbox", "PlayStation"};
-        char autol[64];
-        snprintf(autol, sizeof autol, "Auto (%s)", fam[input_pad_family() % 3]);
-        const char *names[] = {autol, "Nintendo", "Xbox", "PlayStation"};
-        choice("Button icons", &g_settings.prompts, names, 4);
-    }
-    ImGui::Spacing();
-    header("System language");
-    {
-        // what the game is told the console's language is: its text follows this (runtime/settings.c)
-        char autol[64];
-        snprintf(autol, sizeof autol, "Auto (%s)", settings_language_name());
-        const char *names[N_LANGUAGES];
-        names[0] = autol;
-        for (int i = 1; i < N_LANGUAGES; i++) names[i] = g_language_names[i];
-        if (choice("Language", &g_settings.language, names, N_LANGUAGES)) settings_save();
-    }
-    hint("The game's text language, as its own system setting. Applies when the game restarts: Quit -> Title "
-         "screen, then Play.");
-    ImGui::Spacing();
     header("Controls");
     controls_bindings_draw(ImGui::GetFontSize() / 34);
     ImGui::Spacing();
@@ -628,7 +610,7 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
     ImGui::Begin("##kbd", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                                     ImGuiWindowFlags_AlwaysAutoResize);
     ImGui::PushFont(g_font_big);
-    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Enter your name");
+    ImGui::TextColored(THEME_GOLD, "Enter your name");
     ImGui::PopFont();
     static bool was_open, was_pad;
     bool pad = g_last_pad.load(), appearing = !was_open || pad != was_pad;  // (switching device: focus the new one)
@@ -683,10 +665,11 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     Tab tabs[11];
     int ntabs = 0;
     if (prelaunch) tabs[ntabs++] = {"Prelaunch", -1, true};
-    static const char *names[] = {"Video", "Audio", "Save Editor", "Randomizer", "Warp", "Cheats", "Gameplay",
+    static const char *names[] = {"Video", "Audio", "Save Editor", "Randomizer", "Warp", "Cheats", "Game",
                                   "Cosmetics", "Controls", "Quit"};
-    static const int order[] = {8, 0, 1, 6, 7, 3, 5, 4, 2, 9};  // Controls, Video, Audio, Gameplay, Cosmetics, Randomizer,
-                                                                // Cheats, Warp, Save Editor, Quit (ids stay: test hooks)
+    // Controls, Video, Audio, Game, Quit (ids stay: test hooks). Link's Awakening's pages - Save Editor, Randomizer,
+    // Warp, its Cheats and Cosmetics - aren't shown: they read and patch that game's memory.
+    static const int order[] = {8, 0, 1, 6, 9};
     for (int i : order)  // (Quit: in game only - the start screen has its own QUIT, and an eleventh tab cut names short)
         if (i != 9 || !prelaunch) tabs[ntabs++] = {names[i], i, in_game || (i != 2 && i != 4 && i != 5)};
     int cur = 0;  // g_tab / g_tab_request hold ids
@@ -726,8 +709,8 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
             bool lit = focused_tab == t.id && ImGui::GetCurrentContext()->NavCursorVisible;
             ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4(0, 0, 0, 0));
             if (lit) {
-                ImGui::PushStyleColor(ImGuiCol_Tab, ImVec4(0.19f, 0.27f, 0.22f, 1));
-                ImGui::PushStyleColor(ImGuiCol_TabHovered, ImVec4(0.19f, 0.27f, 0.22f, 1));
+                ImGui::PushStyleColor(ImGuiCol_Tab, THEME_HOVER);
+                ImGui::PushStyleColor(ImGuiCol_TabHovered, THEME_HOVER);
             }
             if (g_focus_tab == -1 && !prelaunch) g_focus_tab = 8;  // (no Prelaunch in game: Controls, the first tab)
             bool focus_here = g_focus_tab == t.id || (g_focus_tab == -100 && t.id == g_tab);
@@ -744,7 +727,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
                 float h = 4 * scale > 2 ? 4 * scale : 2;
                 ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(a.x + 2, b.y - h), ImVec2(b.x - 2, b.y),
-                                                          IM_COL32(236, 194, 84, 255));  // (the menu's gold)
+                                                          THEME_GOLD_U32);  // (the menu's gold)
             }
             if (ImGui::IsItemFocused()) focused_tab = t.id;
             else if (focused_tab == t.id) focused_tab = -99;
@@ -779,7 +762,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 case 3: rando_tab_draw(scale); break;
                 case 4: if (warp_tab_draw(scale)) set_open(false); break;
                 case 5: cheats_draw(scale); break;
-                case 6: difficulty_draw(scale); break;
+                case 6: tab_game(); break;
                 case 7: tab_cosmetics(); break;
                 case 8: tab_about(); break;
                 case 9: tab_quit(scale, in_game); break;
@@ -886,13 +869,14 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
         ImGui::Begin("##menu", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+        theme_trim(scale);
         ImFont *keep_big = g_font_big;  // (the window in the menu's font; header() uses g_font_big)
         g_font_big = g_menu_font_big;
         ImGui::PushFont(g_menu_font);
         // header as on the start screen's Settings: the title, and a close X in the corner (B / Esc too). ("Title
         // screen" - rt_request_reboot(RT_REBOOT_TITLE) - is to find a new home; user 2026-10-11.)
         ImGui::PushFont(g_font_big);
-        ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Settings");
+        ImGui::TextColored(THEME_GOLD, "Settings");
         ImGui::PopFont();
         {
             float bx = 44 * scale;
@@ -902,7 +886,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
             bool close = ImGui::InvisibleButton("##close", ImVec2(bx, bx), ImGuiButtonFlags_EnableNav);
             ImGui::PopStyleColor();
             bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
-            ImU32 col = hot ? IM_COL32(236, 194, 84, 255) : IM_COL32(220, 216, 205, 255);
+            ImU32 col = hot ? THEME_GOLD_U32 : THEME_TEXT_DIM_U32;
             float m = bx * 0.3f, t = (hot ? 3.0f : 2.4f) * scale * 1.5f;
             ImDrawList *dl = ImGui::GetWindowDrawList();
             if (hot) dl->AddRectFilled(p, ImVec2(p.x + bx, p.y + bx), IM_COL32(255, 255, 255, 20), 8 * scale);

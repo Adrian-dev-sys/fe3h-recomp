@@ -10,12 +10,13 @@
 
 #include "option_rows.h"
 #include "osk.h"
+#include "theme.h"
 
 static float g_scale = 1;
 static std::string g_desc_hover, g_desc_focus, g_desc_shown;  // this frame's hovered / selected row, and the last shown
 static std::string g_desc_first;  // the page's first row (shown until a row is selected or hovered)
 
-static const ImU32 kGold = IM_COL32(236, 194, 84, 255);
+static const ImU32 kGold = THEME_GOLD_U32;
 static bool g_next_disabled;
 void opt_disable_next(void) { g_next_disabled = true; }
 static int g_indent;
@@ -42,7 +43,7 @@ void opt_section(const char *title) {
     std::string t = title;
     for (char &c : t) c = (char)toupper((unsigned char)c);
     if (ImGui::GetCursorPosY() > ImGui::GetStyle().WindowPadding.y + 1) ImGui::Dummy(ImVec2(0, 10 * g_scale));
-    ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.52f, 1), "%s", t.c_str());
+    ImGui::TextColored(THEME_QUIET, "%s", t.c_str());
 }
 
 // One row: draws it, handles A / click and left / right while selected. Returns 2 (A / click), -1 / +1 (left / right) or 0.
@@ -88,14 +89,14 @@ static int row(const char *label, const std::string &value, bool changed, const 
     ImDrawList *dl = ImGui::GetWindowDrawList();
     float r = 9 * g_scale, pad = 16 * g_scale, fs = ImGui::GetFontSize();
     dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), hov || foc ? IM_COL32(255, 255, 255, 22) : IM_COL32(0, 0, 0, 40), r);
-    dl->AddRect(p, ImVec2(p.x + w, p.y + h), hov || foc ? (off ? IM_COL32(236, 194, 84, 120) : kGold)
+    dl->AddRect(p, ImVec2(p.x + w, p.y + h), hov || foc ? (off ? THEME_GOLD_SOFT_U32 : kGold)
                                                         : IM_COL32(255, 255, 255, off ? 18 : 38), r, 0,
                 hov || foc ? 2.0f : 1.0f);
     std::string t = label;
     if (upper)
         for (char &c : t) c = (char)toupper((unsigned char)c);
     float ty = p.y + (h - fs) * 0.5f;
-    ImU32 label_col = off ? IM_COL32(110, 110, 102, 255) : IM_COL32(240, 236, 224, 255);  // (greyed out: clearly dim)
+    ImU32 label_col = off ? IM_COL32(110, 110, 102, 255) : THEME_TEXT_U32;  // (greyed out: clearly dim)
     dl->AddText(ImVec2(p.x + pad, ty), label_col, t.c_str());
     float right = p.x + w - pad;  // (the value's right edge)
     if (arrows && !value.empty()) {  // ◀ value ▶, drawn (the fonts have no arrow glyphs); a click on one steps
@@ -215,7 +216,7 @@ void opt_end(void) {
     ImVec2 p = ImGui::GetCursorScreenPos(), avail = ImGui::GetContentRegionAvail();
     float gap = 24 * g_scale;
     ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x + gap * 0.5f, p.y), ImVec2(p.x + gap * 0.5f, p.y + avail.y),
-                                        IM_COL32(236, 194, 84, 110), 1.0f);
+                                        THEME_GOLD_SOFT_U32, 1.0f);
     ImGui::SetCursorScreenPos(ImVec2(p.x + gap, p.y));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14 * g_scale, 6 * g_scale));
     ImGui::BeginChild("##desc", ImVec2(0, avail.y), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoNav);
