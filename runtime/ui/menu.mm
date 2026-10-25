@@ -586,6 +586,7 @@ static void tab_game(void) {
         if (!cheatvm_info(i, &ci) || ci.master) continue;
         bool on = ci.on;
         std::string d = ci.desc && *ci.desc ? ci.desc : "From cheats.txt (no description: add # lines under its name).";
+        if (ci.excludes && *ci.excludes) d += std::string("\n\nOnly one at a time: switching this on turns off ") + ci.excludes + ".";
         if (ci.unsupported) d += "\n\nThis cheat uses an opcode the cheat engine doesn't support, so it can't run.";
         else if (ci.needs_gen) d += "\n\nIt patches the game's code, and that patch isn't built in yet: run `make gen-main` "
                                     "and then `make`, and restart.";

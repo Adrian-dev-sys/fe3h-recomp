@@ -33,6 +33,9 @@ typedef struct {
     int n;
     bool master, on, bad;  // bad: an opcode the VM doesn't know (not run)
     bool needs_gen;        // writes an instruction that isn't compiled in
+    uint64_t code[32];     // the instructions it patches: cheats patching the same one exclude each other (Exp x2 / x4)
+    int ncode;
+    char excludes[256];    // their names, for the menu
 } Cheat;
 
 static Cheat g_cheats[MAX_CHEATS];
@@ -72,6 +75,14 @@ static void make_key(const char *name, char *key, size_t cap) {
     if (cap > 57) cap = 57;  // (settings keys are read up to 63 characters, "cheat." included)
     for (const char *p = name; *p && n + 1 < cap; p++) key[n++] = isalnum((unsigned char)*p) ? (char)tolower((unsigned char)*p) : '_';
     key[n] = 0;
+}
+
+// both patch the same instruction of the game's code (only one can be on)
+static bool conflict(const Cheat *a, const Cheat *b) {
+    for (int i = 0; i < a->ncode; i++)
+        for (int j = 0; j < b->ncode; j++)
+            if (a->code[i] == b->code[j]) return true;
+    return false;
 }
 
 static int op_len(uint32_t w) {  // words in the opcode starting with w (0: unknown)
@@ -142,14 +153,23 @@ static void load(void) {
             if ((w >> 28) == 0 && ((w >> 24) & 0xF) == 4 && ((w >> 20) & 0xF) == 0 && ((w >> 16) & 0xF) == 0) {
                 uint64_t a = 0x7000000000ull + ((uint64_t)(w & 0xFF) << 32 | ch->w[k + 1]);
                 if (in_main_text(a) && !compiled(a, ch->w[k + 2])) ch->needs_gen = true;
+                if (in_main_text(a) && ch->ncode < 32) ch->code[ch->ncode++] = a;
             }
             k += n;
         }
         for (int j = 0; j < g_npending; j++)
             if (!strcmp(g_pending[j], ch->key)) ch->on = true;
+        for (int j = 0; j < i && ch->on && !ch->master; j++)  // (two that exclude each other were on: the first stays)
+            if (g_cheats[j].on && conflict(&g_cheats[j], ch)) ch->on = false;
         LOG("[cheats] %s%s%s%s\n", ch->name, ch->on ? " (on)" : "", ch->bad ? " (unsupported opcode: not run)" : "",
             ch->needs_gen ? " (its code patch isn't compiled in: make gen-main, then make)" : "");
     }
+    for (int i = 0; i < g_ncheats; i++)
+        for (int j = 0; j < g_ncheats; j++)
+            if (j != i && !g_cheats[j].master && conflict(&g_cheats[i], &g_cheats[j])) {
+                size_t l = strlen(g_cheats[i].excludes);
+                snprintf(g_cheats[i].excludes + l, sizeof g_cheats[i].excludes - l, "%s%s", l ? ", " : "", g_cheats[j].name);
+            }
     LOG("[cheats] %d from %s, %d instruction variants compiled in\n", g_ncheats, CHEATS_FILE, g_nvar);
 }
 
@@ -318,12 +338,20 @@ bool cheatvm_info(int i, CheatInfo *out) {
     out->unsupported = g_cheats[i].bad;
     out->needs_gen = g_cheats[i].needs_gen;
     out->desc = g_cheats[i].desc;
+    out->excludes = g_cheats[i].excludes;
     return true;
 }
 
 void cheatvm_set(int i, bool on) {
     pthread_mutex_lock(&g_lock);
     if (i >= 0 && i < g_ncheats && !g_cheats[i].master && g_cheats[i].on != on) {
+        if (on)  // the ones patching the same instruction go off (one multiplier at a time)
+            for (int j = 0; j < g_ncheats; j++)
+                if (j != i && g_cheats[j].on && !g_cheats[j].master && conflict(&g_cheats[i], &g_cheats[j])) {
+                    g_cheats[j].on = false;
+                    code_release(j);
+                    LOG("[cheats] %s off (shares code with %s)\n", g_cheats[j].name, g_cheats[i].name);
+                }
         g_cheats[i].on = on;
         if (!on) code_release(i);
         LOG("[cheats] %s %s\n", g_cheats[i].name, on ? "on" : "off");
