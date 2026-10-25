@@ -24,6 +24,7 @@
 #include "imgui_internal.h"  // (SetKeyOwner)
 #include "option_rows.h"
 #include "osk.h"
+#include "theme.h"
 #ifdef __APPLE__
 #include "imgui_impl_metal.h"
 #else
@@ -82,7 +83,9 @@ static void save_png(id<MTLTexture> tex, const char *path) {
 }
 #endif
 
-static const uint8_t BUILD_ID[8] = {0xae, 0x16, 0xf7, 0x1e, 0x00, 0x2a, 0xf8, 0xcb};  // Link's Awakening v1.0.0 main
+// Fire Emblem: Three Houses' program id (exefs/main.npdm): the game files are checked by it. Its romfs has nx/ at the top.
+#define FE3H_PROGRAM_ID 0x010055D009F78000ull
+#define ROMFS_MARKER "nx"
 // The release tag this build is (also names the release files; Makefile / tools/bundle_macos.sh / make_dmg.sh read
 // it): beta_<n> until 1.0, then v<major>.<minor>.<patch>.
 #define LARECOMP_VERSION "beta_4"
@@ -169,15 +172,30 @@ static bool file_exists(const std::string &p) {
 }
 
 // The copied game files alone ("" = there), without the game code built from them
-static std::string check_copied_files(const std::string &root) {
-    FILE *f = fopen((root + "/exefs/main").c_str(), "rb");
-    if (!f) return "No game files";
-    uint8_t id[8] = {0};
-    fseek(f, 0x40, SEEK_SET);
-    size_t n = fread(id, 1, 8, f);
+// The program id in a main.npdm (META header: the ACI0 section's offset at 0x70; its program id at 0x10). 0: none.
+static uint64_t npdm_program_id(const std::string &path) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return 0;
+    uint8_t meta[0x80] = {0}, aci[0x18] = {0};
+    uint64_t id = 0;
+    uint32_t off;
+    if (fread(meta, 1, sizeof meta, f) == sizeof meta && !memcmp(meta, "META", 4)) {
+        memcpy(&off, meta + 0x70, 4);
+        if (fseek(f, off, SEEK_SET) == 0 && fread(aci, 1, sizeof aci, f) == sizeof aci && !memcmp(aci, "ACI0", 4))
+            memcpy(&id, aci + 0x10, 8);
+    }
     fclose(f);
-    if (n != 8 || memcmp(id, BUILD_ID, 8)) return "Wrong game version (needs v1.0.0)";
-    if (!file_exists(root + "/romfs/region_common") || !file_exists(root + "/romfs.bin")) return "Game data missing";
+    return id;
+}
+
+static std::string check_copied_files(const std::string &root) {
+    if (!file_exists(root + "/exefs/main")) return "No game files";
+    uint64_t id = npdm_program_id(root + "/exefs/main.npdm");
+    if (id != FE3H_PROGRAM_ID) {
+        fprintf(stderr, "[launcher] exefs/main.npdm: program id %016llx\n", (unsigned long long)id);
+        return "Not Fire Emblem: Three Houses";
+    }
+    if (!file_exists(root + "/romfs/" ROMFS_MARKER) || !file_exists(root + "/romfs.bin")) return "Game data missing";
     return "";
 }
 
@@ -211,14 +229,14 @@ static void set_job(const std::string &s, bool failed = false, const std::string
 enum { FAIL_NOT_FOUND = 1, FAIL_UNUSABLE, FAIL_COPY, FAIL_VERSION, FAIL_MISSING, FAIL_BUILD };
 static void set_failure(int k) {
     static const char *const head[] = {"", "No game files found in that folder", "Those files can't be used",
-                                       "Setup didn't finish", "Wrong version of the game", "Game files incomplete",
+                                       "Setup didn't finish", "Not the right game", "Game files incomplete",
                                        "The game code didn't build"};
     static const char *const hint[] = {
         "",
         "Choose the folder that holds the game files.",
         "Choose the folder that holds the game files.",
         "Make sure there's about 12 GB free and try again.",
-        "LAS Recomp needs version 1.0.0 of the game, without updates.",
+        "Choose the files of Fire Emblem: Three Houses, version 1.2.0 (the game with its update applied).",
         "Some files are missing. Choose the folder again; if it happens again, copy your extracted game files again.",
         "Make sure there's about 2 GB free and try again. If it keeps happening, report it on GitHub."};
     if (k >= 1 && k <= 6) set_job(head[k], true, hint[k]);
@@ -229,12 +247,12 @@ static bool is_dir(const std::string &p) {
     return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-// exefs: the folder with main and main.npdm; romfs: the folder with region_common (the game's data root). Found
+// exefs: the folder with main and main.npdm; romfs: the folder with nx/ (the game's data root). Found
 // in the picked folder or a few levels below it (some folder layouts nest them).
 static void find_game(const std::string &dir, int depth, std::string &exefs, std::string &romfs, bool &unusable) {
     if (depth > 4 || (!exefs.empty() && !romfs.empty())) return;
     if (exefs.empty() && file_exists(dir + "/main") && file_exists(dir + "/main.npdm")) exefs = dir;
-    if (romfs.empty() && is_dir(dir + "/region_common")) romfs = dir;
+    if (romfs.empty() && is_dir(dir + "/" ROMFS_MARKER)) romfs = dir;
     DIR *d = opendir(dir.c_str());
     if (!d) return;
     std::vector<std::string> sub;
@@ -244,21 +262,16 @@ static void find_game(const std::string &dir, int depth, std::string &exefs, std
         std::string ext = n.size() > 4 ? n.substr(n.size() - 4) : "";
         for (auto &ch : ext) ch = (char)tolower((unsigned char)ch);
         if (ext == ".xci" || ext == ".nsp" || ext == ".nca" || ext == ".nsz" || ext == ".xcz") unusable = true;
-        if (n != "region_common" && is_dir(dir + "/" + n)) sub.push_back(dir + "/" + n);
+        if (n != ROMFS_MARKER && is_dir(dir + "/" + n)) sub.push_back(dir + "/" + n);
     }
     closedir(d);
     std::sort(sub.begin(), sub.end());
     for (auto &s : sub) find_game(s, depth + 1, exefs, romfs, unusable);
 }
 
-static bool build_id_ok(const std::string &main_path) {
-    FILE *f = fopen(main_path.c_str(), "rb");
-    if (!f) return false;
-    uint8_t id[8] = {0};
-    fseek(f, 0x40, SEEK_SET);
-    size_t n = fread(id, 1, 8, f);
-    fclose(f);
-    return n == 8 && !memcmp(id, BUILD_ID, 8);
+static bool build_id_ok(const std::string &main_path) {  // (the right game: main.npdm next to main)
+    std::string npdm = main_path.substr(0, main_path.size() - 4) + "main.npdm";
+    return npdm_program_id(npdm) == FE3H_PROGRAM_ID;
 }
 
 // progress (the overlay's bar): the romfs copy, then the image build - each about the size of romfs/
@@ -311,7 +324,7 @@ static void *extract_thread(void *) {
     if (exefs.empty() || romfs.empty()) { set_failure(unusable ? FAIL_UNUSABLE : FAIL_NOT_FOUND); goto done; }
     if (!build_id_ok(exefs + "/main")) { set_failure(FAIL_VERSION); goto done; }
     {
-        // (the picked folder can't be LAS Recomp's own copy: setting up again deletes that first)
+        // (the picked folder can't be our own copy: setting up again deletes that first)
         char a[4096], b[4096];
         mkdir(g_root.c_str(), 0755);
         if (realpath(exefs.c_str(), a) && realpath(g_root.c_str(), b) && !strncmp(a, b, strlen(b)) &&
@@ -428,8 +441,17 @@ typedef void *GpuDevice;
 #endif
 static int g_bg_w, g_bg_h;
 
+// The start screen's picture: the player's own, in the game files folder (background.png or background.jpg; not part
+// of this project: the game's art isn't ours to ship). None: a plain dark background.
+static std::string background_image(void) {
+    for (const char *n : {"background.png", "background.jpg", "background.jpeg"})
+        if (file_exists(g_root + "/" + n)) return g_root + "/" + n;
+    return "";
+}
+
 static void load_background(GpuDevice dev) {
-    std::string path = g_root + "/romfs/region_common/movie/title.webm";
+    std::string path = background_image();
+    if (path.empty()) return;
     AVFormatContext *fmt = NULL;
     if (avformat_open_input(&fmt, path.c_str(), NULL, NULL) < 0) return;
     int si = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
@@ -441,13 +463,11 @@ static void load_background(GpuDevice dev) {
         if (codec && avcodec_open2(cc, codec, NULL) == 0) {
             AVPacket *pkt = av_packet_alloc();
             AVFrame *fr = av_frame_alloc();
-            int64_t want = (int64_t)(6.0 / av_q2d(st->time_base));  // a few seconds in: the island, not black
-            av_seek_frame(fmt, si, want, AVSEEK_FLAG_BACKWARD);
             bool got = false;
             while (!got && av_read_frame(fmt, pkt) >= 0) {
                 if (pkt->stream_index == si && avcodec_send_packet(cc, pkt) == 0)
                     while (avcodec_receive_frame(cc, fr) == 0)
-                        if (fr->best_effort_timestamp >= want) { got = true; break; }
+                        { got = true; break; }  // (the first frame)
                 av_packet_unref(pkt);
             }
             if (got) {
@@ -493,7 +513,7 @@ static std::vector<std::string> list_seeds() {
 }
 
 // ------------------------------------------------------------------ screen
-static ImFont *g_font_title, *g_font_menu, *g_font_small;
+static ImFont *g_font_title, *g_font_menu, *g_font_small, *g_font_serif;
 enum Page { MAIN, SETTINGS, SETUP };  // SETTINGS: the in-game menu's tabs (runtime/ui/menu.mm)
 static int g_refocus = MAIN;  // back on the main page: select the item of the page we came from (controllers)
 
@@ -513,7 +533,7 @@ extern "C" void launcher_play_seed(const char *seed) {
 }
 static float g_menu_gap = 0.35f;  // space under each item, in line heights
 
-// The first PLAY ever (settings.menu_tip_seen): a note on opening the LAS Recomp menu in game (it isn't obvious),
+// The first PLAY ever (settings.menu_tip_seen): a note on opening our menu in game (it isn't obvious),
 // OK starts the game. Returns true once OK is pressed.
 static bool g_tip_test;  // (LARECOMP_LAUNCHER_SHOT=<frame>:tip)
 // First PLAY ever, before the menu note: authentic 16:9 or the unlocked (fill the window) aspect ratio.
@@ -574,7 +594,7 @@ static bool menu_tip(float s) {
         static const char *const home[] = {"Home button", "Xbox button", "PlayStation button"};  // (bind_label_family)
         static const char *const pad[] = {"Minus + Plus", "View + Menu", "Create + Options"};
         ImGui::PushTextWrapPos(0);
-        ImGui::TextUnformatted("LAS Recomp has its own menu for settings, the randomizer, cosmetics and more.");
+        ImGui::TextUnformatted(RT_APP_NAME " has its own menu for settings: video, audio, controls and more.");
         ImGui::Spacing();
         int fam = bind_label_family() % 3;
         ImGui::Text("Open it in game with F1 or Esc, or on a controller with the %s (or %s together).", home[fam], pad[fam]);
@@ -640,12 +660,12 @@ static bool menu_item(const char *label, bool enabled, bool *hovered = NULL, con
     bool hot = ImGui::IsItemFocused() || ImGui::IsItemHovered();
     ImGui::PopID();
     if (hovered) *hovered = hot;
-    ImU32 col = !enabled ? IM_COL32(170, 175, 200, 140) : hot ? IM_COL32(255, 214, 64, 255) : IM_COL32(250, 250, 255, 255);
+    ImU32 col = !enabled ? IM_COL32(170, 175, 200, 140) : hot ? IM_COL32(246, 224, 160, 255) : IM_COL32(246, 240, 226, 255);
     ImDrawList *dl = ImGui::GetWindowDrawList();
     if (hot && enabled) {  // a shadow band behind the item (like the version corner's), feathered, with a warm glow
         float x0 = ImGui::GetWindowPos().x, x1 = at.x + sz.x * 0.75f, x2 = at.x + sz.x + sz.y * 3.5f;
         float f = sz.y * 0.22f, y0 = at.y - f * 0.4f, y1 = y0 + f, y3 = at.y + sz.y + f * 0.2f, y2 = y3 - f;
-        ImU32 c = IM_COL32(6, 10, 34, 150), g = IM_COL32(255, 190, 80, 34), n = IM_COL32(6, 10, 34, 0), ng = IM_COL32(255, 190, 80, 0);
+        ImU32 c = IM_COL32(6, 10, 34, 150), g = IM_COL32(217, 184, 115, 30), n = IM_COL32(6, 10, 34, 0), ng = IM_COL32(217, 184, 115, 0);
         for (int pass = 0; pass < 2; pass++) {  // dark band, then the glow over it
             ImU32 a = pass ? g : c, z = pass ? ng : n;
             dl->AddRectFilledMultiColor(ImVec2(x0, y1), ImVec2(x1, y2), a, a, a, a);
@@ -656,7 +676,7 @@ static bool menu_item(const char *label, bool enabled, bool *hovered = NULL, con
             dl->AddRectFilledMultiColor(ImVec2(x1, y2), ImVec2(x2, y3), a, z, z, z);
         }
     }
-    ImU32 col_b = hot && enabled ? IM_COL32(255, 160, 50, 255) : col;
+    ImU32 col_b = hot && enabled ? IM_COL32(204, 160, 86, 255) : col;
     if (split && enabled) {
         std::string head(label, split - label);
         text_fx(dl, ImGui::GetFont(), ImGui::GetFontSize(), at, col, col_b, head.c_str(), sz.y * 0.05f);
@@ -768,7 +788,7 @@ static void reveal_folder(const std::string &dir) {
 static SDL_Window *g_launcher_win;
 static bool g_files_deleted;  // set here: the start screen goes back to setting the game files up
 static void prelaunch_tab(float sc) {
-    const ImVec4 gold(0.93f, 0.76f, 0.33f, 1);
+    const ImVec4 gold = THEME_GOLD;
     auto heading = [&](const char *t) {
         ImGui::PushFont(g_font_menu);
         ImGui::TextColored(gold, "%s", t);
@@ -793,8 +813,8 @@ static void prelaunch_tab(float sc) {
         ImGui::PushFont(g_font_menu);
         ImGui::TextColored(ImVec4(1, 0.72f, 0.4f, 1), "Are you sure?");
         ImGui::PopFont();
-        ImGui::Text("This deletes LAS Recomp's copy of the game files (%.1f GB).", gb);
-        ImGui::TextDisabled("Saves, seeds and settings are kept. Your own game files aren't touched.");
+        ImGui::Text("This deletes " RT_APP_NAME "'s copy of the game files (%.1f GB).", gb);
+        ImGui::TextDisabled("Saves and settings are kept. Your own game files aren't touched.");
         if (rt_dev_mode()) {  // (a source checkout: the files are the project's own extracted/)
             bool abs = !g_root.empty() && (g_root[0] == '/' || (g_root.size() > 1 && g_root[1] == ':'));
             std::string where = abs ? g_root : std::string(rt_data_root()) + "/" + g_root;
@@ -803,7 +823,7 @@ static void prelaunch_tab(float sc) {
         ImGui::Spacing();
         if (ImGui::Button("Delete", ImVec2(220 * sc, 0))) {
             bool ok = rt_remove_game_files(g_root.c_str());  // (runtime/paths.c: only what the extraction made)
-            set_job(ok ? "Game files deleted." : "Could not delete the game files (not in LAS Recomp's data folder?).", !ok);
+            set_job(ok ? "Game files deleted." : "Could not delete the game files (not in " RT_APP_NAME "'s data folder?).", !ok);
             g_files_deleted = true, gb = -1;
             ImGui::CloseCurrentPopup();
         }
@@ -813,6 +833,36 @@ static void prelaunch_tab(float sc) {
             ImGui::IsKeyPressed(ImGuiKey_Escape, false))
             ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
+    }
+    ImGui::Spacing();
+    ImGui::Spacing();
+    heading("DLC");
+    {  // the packs in <game files>/dlc (runtime/services/aoc.c): each folder named by its content id
+        static std::vector<std::pair<std::string, bool>> packs;  // (id, image built)
+        static bool scanned;
+        if (!scanned) {
+            scanned = true;
+            std::string dir = g_root + "/dlc";
+            if (DIR *d = opendir(dir.c_str())) {
+                while (struct dirent *e = readdir(d)) {
+                    std::string n = e->d_name;
+                    if (n.size() == 16 && is_dir(dir + "/" + n)) packs.push_back({n, file_exists(dir + "/" + n + ".romfs.bin")});
+                }
+                closedir(d);
+            }
+            std::sort(packs.begin(), packs.end());
+        }
+        if (packs.empty()) {
+            ImGui::TextUnformatted("No DLC found.");
+        } else {
+            ImGui::Text("%d pack%s installed:", (int)packs.size(), packs.size() == 1 ? "" : "s");
+            for (auto &pk : packs)
+                ImGui::Text("    %s    %s", pk.first.c_str(), pk.second ? "ready" : "prepared the first time the game uses it");
+        }
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("Each pack is a folder named by its content id in the game files' dlc folder, holding its "
+                            "extracted romfs: dlc/010055D009F79001/romfs/... The game sees every pack there as owned.");
+        ImGui::PopTextWrapPos();
     }
     ImGui::Spacing();
     ImGui::Spacing();
@@ -838,12 +888,7 @@ static void prelaunch_tab(float sc) {
 extern "C" void launcher_run(const char *root) {
     g_root = root;
     g_start_screen = 1;
-    static bool update_checked;  // (once per launch, not again after a "Title screen" reboot)
-    if (!update_checked && !getenv("LARECOMP_NO_UPDATE_CHECK")) {
-        update_checked = true;
-        pthread_t t;
-        if (pthread_create(&t, NULL, update_thread, NULL) == 0) pthread_detach(t);
-    }
+    // (no update check: it asks LAS Recomp's GitHub releases, and this fork has none)
     ui_window_init();
     SDL_Window *win = ui_window();
     g_launcher_win = win;
@@ -864,7 +909,7 @@ extern "C" void launcher_run(const char *root) {
     io.IniFilename = NULL;
     // fonts belong to this context: back here via "Title screen" (in-place reboot) the previous run's are gone with
     // its context, so load them again (a stale pointer here aborted in PushFont - user, 0.1 RC)
-    g_font_small = g_font_menu = g_font_title = NULL;
+    g_font_small = g_font_menu = g_font_title = g_font_serif = NULL;
     // Baloo 2 SemiBold (OFL, shipped: third_party/fonts/Baloo2) - rounded, game-like; it runs small, hence the sizes
     char baloo[1024];
     std::string own = rt_resource("Baloo2-SemiBold.ttf", "third_party/fonts/Baloo2/Baloo2-SemiBold.ttf", baloo, sizeof baloo) ? baloo : "";
@@ -880,11 +925,15 @@ extern "C" void launcher_run(const char *root) {
         g_font_title = io.Fonts->AddFontFromFileTTF(p, 92 * (b2 ? 2.3f : 1), NULL, ranges);
     }
     if (!g_font_menu) g_font_small = g_font_menu = g_font_title = io.Fonts->AddFontDefault();
+    // the title's serif: EB Garamond (OFL, shipped: third_party/fonts/EBGaramond), close to the game's own lettering
+    char serif[1024];
+    g_font_serif = rt_resource("EBGaramond12-Regular.ttf", "third_party/fonts/EBGaramond/EBGaramond12-Regular.ttf", serif, sizeof serif)
+                       ? io.Fonts->AddFontFromFileTTF(serif, 160) : g_font_title;
     ImGuiStyle &st = ImGui::GetStyle();
     st.Colors[ImGuiCol_Header] = ImVec4(0, 0, 0, 0);
     st.Colors[ImGuiCol_HeaderHovered] = ImVec4(1, 1, 1, 0.08f);
     st.Colors[ImGuiCol_HeaderActive] = ImVec4(1, 1, 1, 0.14f);
-    st.Colors[ImGuiCol_NavCursor] = ImVec4(0.95f, 0.78f, 0.35f, 1);
+    st.Colors[ImGuiCol_NavCursor] = THEME_GOLD;
     st.FrameRounding = st.WindowRounding = 10;
 #ifdef __APPLE__
     ImGui_ImplSDL3_InitForMetal(win);
@@ -899,7 +948,7 @@ extern "C" void launcher_run(const char *root) {
 
     std::string status = check_game_files(g_root);
     if (status.empty()) load_background(dev);
-    std::vector<std::string> seeds = list_seeds();
+    std::vector<std::string> seeds;  // (no randomizer seeds for this game: PLAY is the game itself)
     std::vector<std::string> choices = {"Vanilla"};
     choices.insert(choices.end(), seeds.begin(), seeds.end());
     int choice = 0;
@@ -960,12 +1009,7 @@ extern "C" void launcher_run(const char *root) {
         }
         if (g_play_seed_req) {  // the Randomizer tab's Play: that seed, then PLAY as if pressed (first-launch questions)
             g_play_seed_req = false;
-            seeds = list_seeds();
-            choices = {"Vanilla"};
-            choices.insert(choices.end(), seeds.begin(), seeds.end());
             choice = 0;
-            for (size_t i = 0; i < seeds.size(); i++)
-                if (seeds[i] == g_play_seed) choice = (int)i + 1;
             bind_capture_cancel();
             settings_save();
             page = MAIN;
@@ -1028,24 +1072,31 @@ extern "C" void launcher_run(const char *root) {
             float s = ds.y / 720.0f;  // layout scale (fonts are built for ~2x)
             ImGui::GetIO().FontGlobalScale = s * 0.5f;
             ImDrawList *bg = ImGui::GetBackgroundDrawList();
-            if (g_bg) {  // cover the window, keep the aspect
-                float ia = (float)g_bg_w / g_bg_h, wa = ds.x / ds.y;
+            float ia = g_bg ? (float)g_bg_w / g_bg_h : 1, wa = ds.x / ds.y;
+            if (g_bg && ia > wa * 1.15f) {  // a banner (wider than the window): the full width, centred, fading into the dark
+                float h = ds.x / ia, y = (ds.y - h) * 0.5f;
+                ImU32 d = IM_COL32(3, 6, 8, 255), z = IM_COL32(3, 6, 8, 0);
+                bg->AddRectFilled(ImVec2(0, 0), ds, d);
+                bg->AddImage(BG_TEXID, ImVec2(0, y), ImVec2(ds.x, y + h));
+                bg->AddRectFilledMultiColor(ImVec2(0, y - 1), ImVec2(ds.x, y + h * 0.25f), d, d, z, z);
+                bg->AddRectFilledMultiColor(ImVec2(0, y + h * 0.75f), ImVec2(ds.x, y + h + 1), z, z, d, d);
+            } else if (g_bg) {  // cover the window, keep the aspect
                 ImVec2 uv0(0, 0), uv1(1, 1);
                 if (wa > ia) { float v = ia / wa; uv0.y = (1 - v) / 2; uv1.y = 1 - uv0.y; }
                 else { float u = wa / ia; uv0.x = (1 - u) / 2; uv1.x = 1 - uv0.x; }
                 bg->AddImage(BG_TEXID, ImVec2(0, 0), ds, uv0, uv1);
             } else {
-                bg->AddRectFilledMultiColor(ImVec2(0, 0), ds, IM_COL32(18, 34, 40, 255), IM_COL32(40, 70, 64, 255),
-                                            IM_COL32(12, 20, 24, 255), IM_COL32(8, 12, 16, 255));
+                bg->AddRectFilledMultiColor(ImVec2(0, 0), ds, IM_COL32(16, 22, 44, 255), IM_COL32(38, 46, 82, 255),
+                                            IM_COL32(12, 16, 32, 255), IM_COL32(6, 8, 18, 255));
             }
             {  // a shadow banner fading in from the left behind the menu, and one from the right behind the version
                 const float stops[][2] = {{0.0f, 225}, {0.3f, 215}, {0.44f, 165}, {0.55f, 95}, {0.64f, 35}, {0.74f, 0}};
                 for (int i = 0; i + 1 < (int)(sizeof stops / sizeof stops[0]); i++) {
-                    ImU32 a = IM_COL32(6, 10, 34, (int)stops[i][1]), b = IM_COL32(6, 10, 34, (int)stops[i + 1][1]);
+                    ImU32 a = IM_COL32(3, 7, 10, (int)stops[i][1]), b = IM_COL32(3, 7, 10, (int)stops[i + 1][1]);
                     bg->AddRectFilledMultiColor(ImVec2(ds.x * stops[i][0], 0), ImVec2(ds.x * stops[i + 1][0], ds.y), a, b, b, a);
                 }
                 float y0 = ds.y - 190 * s, y1 = ds.y - 135 * s, y2 = ds.y - 40 * s, y3 = ds.y, x0r = ds.x * 0.5f;
-                ImU32 c0 = IM_COL32(6, 10, 34, 0), c1 = IM_COL32(6, 10, 34, 235);
+                ImU32 c0 = IM_COL32(3, 7, 10, 0), c1 = IM_COL32(3, 7, 10, 235);
                 bg->AddRectFilledMultiColor(ImVec2(x0r, y0), ImVec2(ds.x, y1), c0, c0, c1, c0);  // (feathered top)
                 bg->AddRectFilledMultiColor(ImVec2(x0r, y1), ImVec2(ds.x, y2), c0, c1, c1, c0);
                 bg->AddRectFilledMultiColor(ImVec2(x0r, y2), ImVec2(ds.x, y3), c0, c1, c0, c0);  // (feathered bottom)
@@ -1061,12 +1112,26 @@ extern "C" void launcher_run(const char *root) {
             float x0 = 90 * s;
             ImGui::SetCursorPos(ImVec2(x0, 120 * s));
             ImGui::PushFont(g_font_title);
-            if (page == MAIN) {  // gold to orange, shadowed (not behind the Settings / Game Files windows)
-                const char *t = "LAS Recompiled";
-                ImVec2 p = ImGui::GetCursorScreenPos();
-                text_fx(ImGui::GetWindowDrawList(), ImGui::GetFont(), ImGui::GetFontSize(), p, IM_COL32(255, 232, 120, 255),
-                        IM_COL32(255, 138, 48, 255), t, 3 * s);
-                ImGui::Dummy(ImGui::CalcTextSize(t));
+            if (page == MAIN) {  // the title in the serif (not behind the Settings / Game Files windows): "FIRE EMBLEM" and
+                                 // "RECOMPILED" letter-spaced above and below "Three Houses", pale gold to bronze
+                ImDrawList *dl = ImGui::GetWindowDrawList();
+                ImVec2 o = ImGui::GetWindowPos();
+                float big = 80 * s, small = 22.5f * s;
+                auto spaced = [&](ImVec2 at, const char *str, ImU32 col) {  // capitals with tracking, a shadow under
+                    for (const char *c = str; *c; c++) {
+                        char ch[2] = {*c, 0};
+                        if (*c != ' ') {
+                            for (float d : {2.0f, 1.0f})
+                                dl->AddText(g_font_serif, small, ImVec2(at.x + d * s, at.y + d * s), IM_COL32(2, 6, 8, 140), ch);
+                            dl->AddText(g_font_serif, small, at, col, ch);
+                        }
+                        at.x += g_font_serif->CalcTextSizeA(small, FLT_MAX, 0, ch).x + small * (*c == ' ' ? 0.55f : 0.30f);
+                    }
+                };
+                spaced(ImVec2(o.x + x0 + 3 * s, o.y + 130 * s), "FIRE EMBLEM", IM_COL32(222, 204, 160, 255));
+                text_fx(dl, g_font_serif, big, ImVec2(o.x + x0, o.y + 160 * s), IM_COL32(248, 236, 204, 255),
+                        IM_COL32(196, 152, 82, 255), "Three Houses", 2 * s);
+                spaced(ImVec2(o.x + x0 + 3 * s, o.y + 255 * s), "RECOMPILED", IM_COL32(196, 206, 214, 235));
             }
             ImGui::PopFont();
             ImGui::SetCursorPos(ImVec2(x0, 285 * s));
@@ -1083,12 +1148,11 @@ extern "C" void launcher_run(const char *root) {
                     ImGui::PopFont();
                     auto pitch = [&](float gap) { return h + 6 + gap * h + (gap >= 0 ? 2 : 1) * sp; };
                     g_menu_gap = -0.18f;
-                    ImGui::SetCursorPosY(285 * s + 3 * pitch(0.35f) - 3 * pitch(g_menu_gap));
+                    ImGui::SetCursorPosY(305 * s + 3 * pitch(0.35f) - 3 * pitch(g_menu_gap));
                 }
                 bool hov = false;
                 char label[192];
-                snprintf(label, sizeof label, "PLAY    \xe2\x80\xb9 %s%s \xe2\x80\xba", choice ? "Rando: " : "",
-                         choices[choice].c_str());  // (choice 0 = Vanilla)
+                snprintf(label, sizeof label, "Play");
                 ImGui::SetCursorPosX(x0);
                 // a long seed name may run past the other items (to 80% of the window); beyond that the line shrinks
                 ImGui::PushFont(g_font_menu);
@@ -1100,27 +1164,16 @@ extern "C" void launcher_run(const char *root) {
                 {
                     ImGui::PushFont(g_font_menu);
                     ImVec2 at = ImGui::GetCursorScreenPos();
-                    const char *lt = strstr(label, "\xe2\x80\xb9"), *rt = strstr(label, "\xe2\x80\xba");
-                    float h = ImGui::CalcTextSize(label).y, pad = h * 0.35f;
-                    float lx = at.x + ImGui::CalcTextSize(label, lt).x, rx = at.x + ImGui::CalcTextSize(label, rt).x;
-                    float aw = ImGui::CalcTextSize("\xe2\x80\xb9").x;
-                    ImVec2 m = ImGui::GetIO().MousePos;
-                    bool in_y = m.y >= at.y - pad && m.y <= at.y + h + pad;
-                    if (in_y && m.x >= lx - pad && m.x <= lx + aw + pad) arrow = -1;
-                    if (in_y && m.x >= rx - pad && m.x <= rx + aw + pad) arrow = 1;
+                    (void)at;  // (one choice: no arrows to click)
                     ImGui::PopFont();
                 }
                 static bool focused_once;
                 if (!focused_once) { ImGui::SetKeyboardFocusHere(); focused_once = true; }
                 ImVec2 play_at = ImGui::GetCursorScreenPos();
-                const char *name = strstr(label, "\xe2\x80\xb9") + 4, *name_end = strstr(label, " \xe2\x80\xba");
-                bool pressed = menu_item(label, status.empty(), &hov, name,
-                                         choice ? IM_COL32(250, 250, 255, 255) : IM_COL32(246, 232, 176, 255),
-                                         name_end);  // (the choice keeps its colour when hovered: "Rando: <seed>" white,
-                                                     //  "Vanilla" vanilla cream; the arrows stay white)
+                bool pressed = menu_item(label, status.empty(), &hov);
                 if (status.empty()) {  // PLAY twinkles now and then while the game is ready
                     ImGui::PushFont(g_font_menu);
-                    float w = ImGui::CalcTextSize("PLAY").x, h = ImGui::CalcTextSize("PLAY").y;
+                    float w = ImGui::CalcTextSize("Play").x, h = ImGui::CalcTextSize("Play").y;
                     ImGui::PopFont();
                     float t = (float)ImGui::GetTime(), ph = fmodf(t, 3.6f), ph2 = fmodf(t + 0.45f, 3.6f);
                     float k1 = ph < 0.9f ? sinf(ph / 0.9f * 3.14159265f) : 0, k2 = ph2 < 0.7f ? sinf(ph2 / 0.7f * 3.14159265f) : 0;
@@ -1159,7 +1212,7 @@ extern "C" void launcher_run(const char *root) {
                 }
                 ImGui::SetCursorPosX(x0);
                 if (g_refocus == SETTINGS) ImGui::SetKeyboardFocusHere(), g_refocus = MAIN;  // (back from Settings: it
-                if (menu_item("SETTINGS", true)) {                                             //  stays selected)
+                if (menu_item("Settings", true)) {                                             //  stays selected)
                     static bool opened;
                     menu_tabs_focus(!opened);  // (first time this session: Prelaunch; later: the selected tab)
                     opened = true;
@@ -1168,10 +1221,10 @@ extern "C" void launcher_run(const char *root) {
                 if (!status.empty() || busy) {  // (once set up, the game files are kept up in Settings > Prelaunch)
                     ImGui::SetCursorPosX(x0);
                     if (g_refocus == SETUP) ImGui::SetKeyboardFocusHere(), g_refocus = MAIN;
-                    if (menu_item("SET UP GAME FILES", !busy)) page = SETUP;
+                    if (menu_item("Set Up Game Files", !busy)) page = SETUP;
                 }
                 ImGui::SetCursorPosX(x0);
-                if (menu_item("QUIT", true)) exit(0);
+                if (menu_item("Quit", true)) exit(0);
                 g_menu_gap = 0.35f;
             } else if (page == SETTINGS) {
                 // the in-game menu's tabs (runtime/ui/menu.mm), in a window like the in-game one; tabs that need a
@@ -1181,15 +1234,16 @@ extern "C" void launcher_run(const char *root) {
                                                           ImGui::GetWindowPos().y + ds.y), IM_COL32(0, 0, 0, 110));
                 ImVec2 wp = ImGui::GetWindowPos();
                 ImGui::SetCursorScreenPos(ImVec2(wp.x + (ds.x - w) * 0.5f, wp.y + (ds.y - h) * 0.5f));
-                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.09f, 0.08f, 0.96f));
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, THEME_WINDOW);
                 ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14 * sc);
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(28 * sc, 24 * sc));
                 ImGui::BeginChild("##settings", ImVec2(w, h), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NavFlattened);
+                theme_trim(sc);
                 ImGui::PopStyleVar(2);
                 ImGui::PopStyleColor();
                 ImGui::PushFont(g_font_small);
                 ImGui::PushFont(g_font_menu);
-                ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Settings");
+                ImGui::TextColored(THEME_GOLD, "Settings");
                 ImGui::PopFont();
                 bool back;
                 {  // close: a drawn X in the corner (B / Esc too)
@@ -1200,7 +1254,7 @@ extern "C" void launcher_run(const char *root) {
                     back = ImGui::InvisibleButton("##close", ImVec2(bx, bx), ImGuiButtonFlags_EnableNav);
                     ImGui::PopStyleColor();
                     bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
-                    ImU32 col = hot ? IM_COL32(236, 194, 84, 255) : IM_COL32(220, 216, 205, 255);
+                    ImU32 col = hot ? THEME_GOLD_U32 : THEME_TEXT_DIM_U32;
                     float m = bx * 0.3f, t = (hot ? 3.0f : 2.4f) * sc * 1.5f;
                     ImDrawList *dl = ImGui::GetWindowDrawList();
                     if (hot) dl->AddRectFilled(p, ImVec2(p.x + bx, p.y + bx), IM_COL32(255, 255, 255, 20), 8 * sc);
@@ -1220,13 +1274,7 @@ extern "C" void launcher_run(const char *root) {
                     bind_capture_cancel();
                     settings_save();
                     page = MAIN, g_refocus = SETTINGS;
-                    std::string cur = choices[choice];  // seeds made / renamed / deleted in the Randomizer tab
-                    seeds = list_seeds();
-                    choices = {"Vanilla"};
-                    choices.insert(choices.end(), seeds.begin(), seeds.end());
                     choice = 0;
-                    for (size_t i = 0; i < choices.size(); i++)
-                        if (choices[i] == cur) choice = (int)i;
                 }
             } else {
                 // SETUP: the game files, in a window like Settings (option rows: runtime/ui/option_rows.h) - choose the
@@ -1236,15 +1284,16 @@ extern "C" void launcher_run(const char *root) {
                                                           ImGui::GetWindowPos().y + ds.y), IM_COL32(0, 0, 0, 110));
                 ImVec2 wp = ImGui::GetWindowPos();
                 ImGui::SetCursorScreenPos(ImVec2(wp.x + (ds.x - w) * 0.5f, wp.y + (ds.y - h) * 0.5f));
-                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.09f, 0.08f, 0.96f));
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, THEME_WINDOW);
                 ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14 * sc);
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(28 * sc, 24 * sc));
                 ImGui::BeginChild("##setup", ImVec2(w, h), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NavFlattened);
+                theme_trim(sc);
                 ImGui::PopStyleVar(2);
                 ImGui::PopStyleColor();
                 ImGui::PushFont(g_font_small);
                 ImGui::PushFont(g_font_menu);
-                ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Game Files");
+                ImGui::TextColored(THEME_GOLD, "Game Files");
                 ImGui::PopFont();
                 bool back = false;
                 if (!busy) {  // close: the drawn X in the corner, as Settings (B / Esc too)
@@ -1255,7 +1304,7 @@ extern "C" void launcher_run(const char *root) {
                     back = ImGui::InvisibleButton("##close", ImVec2(bx, bx), ImGuiButtonFlags_EnableNav);
                     ImGui::PopStyleColor();
                     bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
-                    ImU32 col = hot ? IM_COL32(236, 194, 84, 255) : IM_COL32(220, 216, 205, 255);
+                    ImU32 col = hot ? THEME_GOLD_U32 : THEME_TEXT_DIM_U32;
                     float m = bx * 0.3f, t = (hot ? 3.0f : 2.4f) * sc * 1.5f;
                     ImDrawList *dl = ImGui::GetWindowDrawList();
                     if (hot) dl->AddRectFilled(p, ImVec2(p.x + bx, p.y + bx), IM_COL32(255, 255, 255, 20), 8 * sc);
@@ -1283,12 +1332,12 @@ extern "C" void launcher_run(const char *root) {
                     dl->AddLine(ImVec2(x, cy), ImVec2(x + u * 0.35f, cy + u * 0.35f), g, fs * 0.11f);
                     dl->AddLine(ImVec2(x + u * 0.35f, cy + u * 0.35f), ImVec2(x + u, cy - u * 0.4f), g, fs * 0.11f);
                 };
-                std::string src_d = "The folder with your own game folders (exefs/romfs) of The Legend of Zelda: Link's "
-                                    "Awakening for Nintendo Switch, version 1.0.0. The game isn't included with LAS Recomp.";
+                std::string src_d = "The folder with your own game folders (exefs/romfs) of Fire Emblem: Three Houses for "
+                                    "Nintendo Switch, version 1.2.0. The game isn't included with " RT_APP_NAME ".";
                 if (!src.empty()) src_d += "\n\nChosen: " + src;
                 // the step that's running / its result, under the rows and in the Set up row's explanation
                 const std::string &job_line = job;
-                std::string ex_d = "Copies the game files LAS Recomp needs and recompiles the game from them. This only "
+                std::string ex_d = "Copies the game files " RT_APP_NAME " needs and recompiles the game from them. This only "
                                    "needs to be done once and may take a while. Your own files aren't changed.";
                 if (!job.empty()) ex_d += "\n\n" + job + (job_hint.empty() ? "" : ".\n" + job_hint);
 
@@ -1319,15 +1368,15 @@ extern "C" void launcher_run(const char *root) {
                     }
                     files_gb = -1;  // (re-measured after a setup)
                 } else {
-                    // DELETE: frees LAS Recomp's copy (runtime/paths.c removes only what the setup made, only inside
+                    // DELETE: frees our copy (runtime/paths.c removes only what the setup made, only inside
                     // the data root). Saves, seeds, settings and the user's own files stay.
                     if (files_gb < 0) files_gb = rt_game_files_size(g_root.c_str()) / 1e9;
                     char gb[32];
                     snprintf(gb, sizeof gb, "%.1f GB", files_gb);
                     opt_section("Game files");
                     if (!g_confirm_delete) {
-                        if (opt_action("Delete game files", gb, "Frees the space LAS Recomp's copy of the game files takes. "
-                                       "Saves, seeds and settings are kept, and your own game files aren't touched: you can "
+                        if (opt_action("Delete game files", gb, "Frees the space " RT_APP_NAME "'s copy of the game files takes. "
+                                       "Saves and settings are kept, and your own game files aren't touched: you can "
                                        "set the game files up again from them.", true))
                             g_confirm_delete = true;
                         first_row();
@@ -1336,7 +1385,7 @@ extern "C" void launcher_run(const char *root) {
                             bool ok = rt_remove_game_files(g_root.c_str());
                             status = check_game_files(g_root);
                             if (ok) set_job("Game files deleted.");
-                            else set_job("Couldn't delete the game files", true, "They aren't in LAS Recomp's data folder, "
+                            else set_job("Couldn't delete the game files", true, "They aren't in " RT_APP_NAME "'s data folder, "
                                          "so they were left alone.");
                             if (!status.empty()) g_bg = 0;
                             g_confirm_delete = false, files_gb = -1;
@@ -1347,7 +1396,7 @@ extern "C" void launcher_run(const char *root) {
                 if (!job_line.empty()) {  // the current step / result
                     ImGui::Dummy(ImVec2(0, 14 * sc));
                     ImGui::PushTextWrapPos(0);
-                    ImGui::TextColored(failed ? ImVec4(1, 0.5f, 0.4f, 1) : busy ? ImVec4(0.93f, 0.76f, 0.33f, 1)
+                    ImGui::TextColored(failed ? ImVec4(1, 0.5f, 0.4f, 1) : busy ? THEME_GOLD
                                               : ImVec4(0.45f, 0.95f, 0.55f, 1), "%s", job_line.c_str());
                     if (failed && !job_hint.empty())  // (what to do next, in the rows' own text colour)
                         ImGui::TextColored(ImVec4(0.86f, 0.85f, 0.80f, 1), "%s", job_hint.c_str());
@@ -1387,12 +1436,12 @@ extern "C" void launcher_run(const char *root) {
                     pw = fminf(fmaxf(pw, ts.x + 96 * sc), ds.x - 32 * sc);
                     float ph = bar_y + 24 * sc + 26 * sc + line_h + (nnotes ? 14 * sc + nnotes * line_h : 0) + 40 * sc;
                     ImVec2 a(o.x + (ds.x - pw) * 0.5f, o.y + (ds.y - ph) * 0.5f), b(a.x + pw, a.y + ph);
-                    fg->AddRectFilled(a, b, IM_COL32(15, 23, 20, 250), 14 * sc);
-                    fg->AddRect(a, b, IM_COL32(236, 194, 84, 140), 14 * sc, 0, 1.5f * sc);
-                    fg->AddText(g_font_menu, tfs, ImVec2((a.x + b.x - ts.x) * 0.5f, a.y + 36 * sc), IM_COL32(236, 194, 84, 255), title);
+                    fg->AddRectFilled(a, b, IM_COL32(13, 18, 31, 250), 14 * sc);
+                    fg->AddRect(a, b, THEME_GOLD_SOFT_U32, 14 * sc, 0, 1.5f * sc);
+                    fg->AddText(g_font_menu, tfs, ImVec2((a.x + b.x - ts.x) * 0.5f, a.y + 36 * sc), THEME_GOLD_U32, title);
                     ImVec2 ba(a.x + 48 * sc, a.y + bar_y), bb(b.x - 48 * sc, a.y + bar_y + 24 * sc);
                     fg->AddRectFilled(ba, bb, IM_COL32(255, 255, 255, 25), 12 * sc);
-                    if (f > 0) fg->AddRectFilled(ba, ImVec2(ba.x + (bb.x - ba.x) * f, bb.y), IM_COL32(236, 194, 84, 255), 12 * sc);
+                    if (f > 0) fg->AddRectFilled(ba, ImVec2(ba.x + (bb.x - ba.x) * f, bb.y), THEME_GOLD_U32, 12 * sc);
                     char line[200];
                     snprintf(line, sizeof line, "%s   %d%%", test_busy ? "Setting up the game files..." : job.c_str(),
                              (int)(f * 100));
@@ -1421,7 +1470,17 @@ extern "C" void launcher_run(const char *root) {
                 }
                 ImGui::TextColored(ImVec4(0.45f, 0.95f, 0.55f, 1), "Game files ready.");
                 ImGui::SetCursorPosX(x0);
-                ImGui::TextColored(ImVec4(0.66f, 0.76f, 0.98f, 1), "Nintendo Switch  \xc2\xb7  v1.0.0");
+                static int ndlc = -1;  // (the packs in <game files>/dlc: runtime/services/aoc.c)
+                if (ndlc < 0) {
+                    ndlc = 0;
+                    if (DIR *d = opendir((g_root + "/dlc").c_str())) {
+                        while (struct dirent *e = readdir(d))
+                            if (strlen(e->d_name) == 16 && is_dir(g_root + "/dlc/" + e->d_name)) ndlc++;
+                        closedir(d);
+                    }
+                }
+                if (ndlc) ImGui::TextColored(ImVec4(0.66f, 0.76f, 0.98f, 1), "Nintendo Switch  \xc2\xb7  v1.2.0  \xc2\xb7  %d DLC pack%s", ndlc, ndlc == 1 ? "" : "s");
+                else ImGui::TextColored(ImVec4(0.66f, 0.76f, 0.98f, 1), "Nintendo Switch  \xc2\xb7  v1.2.0");
             } else {
                 ImGui::TextColored(ImVec4(1, 0.72f, 0.4f, 1), "!  %s", busy ? "Setting up the game files..." : status.c_str());
                 ImGui::SetCursorPosX(x0);
@@ -1442,7 +1501,7 @@ extern "C" void launcher_run(const char *root) {
                     dl->AddText(font, size, p, col, t);
                     if (bold) dl->AddText(font, size, ImVec2(p.x + 0.7f * s, p.y), col, t);
                 };
-                std::string ver = tag_label(LARECOMP_VERSION, true);
+                std::string ver = RT_APP_NAME;  // (LAS's version tag stays in LARECOMP_VERSION for its build scripts)
                 float vs = fs * 1.4f, y = ImGui::GetWindowPos().y + ds.y - 134 * s;
                 ImVec2 vsz = font->CalcTextSizeA(vs, FLT_MAX, 0, ver.c_str());
                 text(ImVec2(right - vsz.x, y), vs, IM_COL32(255, 255, 255, 255), ver.c_str(), false);

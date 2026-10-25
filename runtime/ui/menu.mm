@@ -664,7 +664,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     struct Tab { const char *name; int id; bool on; };
     Tab tabs[11];
     int ntabs = 0;
-    if (prelaunch) tabs[ntabs++] = {"Prelaunch", -1, true};
+    if (prelaunch) tabs[ntabs++] = {"Game Files", -1, true};
     static const char *names[] = {"Video", "Audio", "Save Editor", "Randomizer", "Warp", "Cheats", "Game",
                                   "Cosmetics", "Controls", "Quit"};
     // Controls, Video, Audio, Game, Quit (ids stay: test hooks). Link's Awakening's pages - Save Editor, Randomizer,
