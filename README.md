@@ -36,8 +36,14 @@ Added for *Three Houses*:
 - **System services:** an always-offline network service (the calendar crashed without it).
 - **DLC:** the Expansion Pass, Cindered Shadows and the bonus waves, from your own DLC files.
 
-Known gaps: no packaged release; the start screen, settings and code still contain LAS's Link's Awakening features
-(the randomizer, cheats, cosmetics), which do nothing here.
+The start screen and the in-game menu (F1) are FE3H's own: Video, Audio, Controls and Game settings in the game's
+slate and gold. LAS's Link's Awakening features (randomizer, cheats, cosmetics, warps) are still in the code, switched
+off and out of the menus.
+
+The start screen shows your own picture if you put one in the game files folder as `extracted/background.png` (or
+`.jpg`); it isn't part of this repository, and `.gitignore` keeps it out.
+
+Known gaps: no packaged release.
 
 ## Building and running (Windows)
 
@@ -85,6 +91,8 @@ Nothing owned by Nintendo is ever committed: no game files, no extracted or gene
   renderer and almost everything else here (MIT). Its README lists its full credits and third-party components.
 - **[Ryujinx](https://ryujinx.app)** (MIT): the audio renderer's reverb, I3DL2 reverb and auxiliary send / return
   are ports of its implementation.
+- **[EB Garamond](https://github.com/georgd/EB-Garamond)** by Georg Duffner: the start screen's title (SIL Open Font License
+  1.1, `third_party/fonts/EBGaramond/OFL.txt`).
 - **[AMD FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR)** (MIT) and
   **[SMAA](https://github.com/iryoku/smaa)** (MIT), as used by LAS.
 - **Libraries:** [SDL 3](https://libsdl.org) (zlib), [FFmpeg](https://ffmpeg.org) (LGPL),
