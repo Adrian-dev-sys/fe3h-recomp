@@ -39,9 +39,9 @@ Then from the repo root:
     python3 -m venv tools/venv && tools/venv/bin/pip install lz4 capstone unicorn
     make -j         # the start screen only (no game code yet): set up the game files there, or put extracted/ here
     make gen        # once: recompile the game from your own game files
-    make -j         # -> build/lasrecomp and the game code library build/lasgame.so
+    make -j         # -> build/fe3hrecomp and the game code library build/fe3hgame.so
 
-Run `./build/lasrecomp` from the repo root: with `extracted/` in the starting folder it uses that folder for
+Run `./build/fe3hrecomp` from the repo root: with `extracted/` in the starting folder it uses that folder for
 everything (dev mode) instead of `~/.local/share/lasrecomp`.
 
 `ARCH` picks the target, separately from the OS: the generated code differs per arch (aarch64 runs the guest's
@@ -79,7 +79,7 @@ RELEASE or NOT READY; `build/smoke/sheet.png` shows every screenshot. It needs `
 save outside git (`~/.local/share/lasrecomp-smoketest/save`, or `LARECOMP_SMOKE_SAVE`): copy `save/` from any build
 after starting a new game once.
 
-The AppImage holds `lasrecomp`, `rando-gen/`, the start screen font and the bundled libraries (SDL3,
+The AppImage holds `fe3hrecomp`, `rando-gen/`, the start screen font and the bundled libraries (SDL3,
 FFmpeg, shaderc). Not bundled: glibc, libstdc++, the Vulkan loader and the GPU drivers (always the system's). No game
 files or fonts.
 
@@ -108,7 +108,7 @@ The aarch64 AppImage is experimental: built on x86-64, only its start screen has
        ./LAS.Recomp-beta_4-linux-aarch64.AppImage --appimage-extract    # -> squashfs-root/
        cd ~/.local/share/lasrecomp
        gdb -batch -ex 'handle SIGSEGV nostop noprint pass' -ex run -ex 'thread apply all bt 20' \
-           --args ~/squashfs-root/usr/bin/lasrecomp > gdb.txt 2>&1
+           --args ~/squashfs-root/usr/bin/fe3hrecomp > gdb.txt 2>&1
 
    (Adjust the `squashfs-root` path to where you extracted it. The game itself uses SIGSEGV for memory watches, hence
    the `handle` line; a real crash still ends in the backtrace. Attach `gdb.txt`.)

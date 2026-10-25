@@ -30,14 +30,14 @@ else
 fi
 
 # the app alone (the game code is built on the player's machine)
-make -j"$JOBS" B="$B" DEPS="$P" SHADERC=-lshaderc_shared "${MAKEARGS[@]}" "$B/lasrecomp"
-if nm "$B/lasrecomp" | grep ' f_70' >/dev/null; then echo "$B/lasrecomp has game code linked in"; exit 1; fi
+make -j"$JOBS" B="$B" DEPS="$P" SHADERC=-lshaderc_shared "${MAKEARGS[@]}" "$B/fe3hrecomp"
+if nm "$B/fe3hrecomp" | grep ' f_70' >/dev/null; then echo "$B/fe3hrecomp has game code linked in"; exit 1; fi
 ZIG_TARGET=$ARCH-linux tools/fetch_zig.sh
 
 # ---- AppDir
 rm -rf "$APPDIR" && mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
-cp "$B/lasrecomp" "$APPDIR/usr/bin/"
-llvm-strip --strip-debug "$APPDIR/usr/bin/lasrecomp"  # (symbols stay: crash backtraces name functions)
+cp "$B/fe3hrecomp" "$APPDIR/usr/bin/"
+llvm-strip --strip-debug "$APPDIR/usr/bin/fe3hrecomp"  # (symbols stay: crash backtraces name functions)
 cp docs/icon/icon_1024.png "$APPDIR/usr/bin/icon.png"
 cp third_party/fonts/Baloo2/Baloo2-SemiBold.ttf "$APPDIR/usr/bin/"  # (start screen font, OFL)
 cp third_party/fonts/Baloo2/OFL.txt "$APPDIR/usr/bin/Baloo2-OFL.txt"
@@ -56,7 +56,7 @@ cp docs/icon/icon_1024.png "$APPDIR/lasrecomp.png" && ln -sf lasrecomp.png "$APP
 # libraries: what lasrecomp needs (DT_NEEDED, recursively) that deps/ provides; anything else must be a system one
 needed() { readelf -d "$1" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'; }
 SYSTEM_LIBS='^(libc|libm|libdl|libpthread|librt|libresolv|libstdc\+\+|libgcc_s|libvulkan)\.so|^ld-linux'
-todo=("$APPDIR/usr/bin/lasrecomp")
+todo=("$APPDIR/usr/bin/fe3hrecomp")
 while [ ${#todo[@]} -gt 0 ]; do
     f=${todo[0]}; todo=("${todo[@]:1}")
     for n in $(needed "$f"); do
@@ -70,7 +70,7 @@ while [ ${#todo[@]} -gt 0 ]; do
         fi
     done
 done
-patchelf --set-rpath '$ORIGIN/../lib' "$APPDIR/usr/bin/lasrecomp"
+patchelf --set-rpath '$ORIGIN/../lib' "$APPDIR/usr/bin/fe3hrecomp"
 if ls "$APPDIR/usr/lib" | grep -iE 'x264|x265|xvid|postproc|vulkan'; then  # (no GPL codecs, no Vulkan loader)
     echo "package: library that must not ship"; exit 1
 fi
