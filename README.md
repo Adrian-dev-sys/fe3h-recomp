@@ -4,9 +4,15 @@ A static recompilation of *Fire Emblem: Three Houses* (Nintendo Switch, 2019) in
 built on [LAS Recomp](https://github.com/peiikai/LASRecomp) by Peiikai.
 
 > [!IMPORTANT]
-> **This is a personal project, made almost entirely with AI.** The FE3H-specific code, debugging and documentation
-> were written by an AI (Anthropic's Claude), directed and tested by me. It's shared as-is, with no support and no
-> releases. Run the code at your own discretion.
+> **This is a personal project, and I made it mostly for myself.** I wanted to play *Three Houses* on my PC, and so
+> far emulators haven't given me the experience I'm after — at least not without my CPU and GPU fans sounding like a
+> jet engine. So I built this instead, with a lot of help from an AI (Anthropic's Claude wrote most of the
+> FE3H-specific code; I directed and tested).
+>
+> I'm doing this casually, in my spare time, and I'm not planning to pour a ton of time, energy or resources into it.
+> Honestly, I doubt I'll finish a full playthrough before GTA VI comes out, and once that happens this will probably
+> fall by the wayside for a while. It's shared as-is: no support, no releases, no promises. Run it at your own
+> discretion.
 
 > [!NOTE]
 > **No game files are included**, and no instructions for obtaining them are provided. You need your own legally
@@ -36,8 +42,8 @@ Added for *Three Houses*:
 - **System services:** an always-offline network service (the calendar crashed without it).
 - **DLC:** the Expansion Pass, Cindered Shadows and the bonus waves, from your own DLC files.
 
-The start screen and the in-game menu (F1) are FE3H's own: Video, Audio, Controls and Game settings in the game's
-slate and gold. LAS's Link's Awakening features (randomizer, cheats, cosmetics, warps) are still in the code, switched
+The start screen and the in-game menu (F1) are FE3H's own: Video, Audio, Controls and Game settings in slate
+and gold. LAS's Link's Awakening features (randomizer, cheats, cosmetics, warps) are still in the code, switched
 off and out of the menus.
 
 The start screen shows your own picture if you put one in the game files folder as `extracted/background.png` (or
@@ -60,7 +66,7 @@ Requirements: Windows 10+ x86-64, a CPU with AVX2 and a GPU with Vulkan 1.3.
    make gen    # once: recompile the game code from extracted/exefs into generated/
    make
    ```
-4. **Run:** `./build/lasrecomp.exe extracted --play > run.log 2>&1`
+4. **Run:** `./build/fe3hrecomp.exe extracted --play > run.log 2>&1`
 
 ### DLC
 
