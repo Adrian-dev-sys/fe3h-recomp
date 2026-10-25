@@ -4,10 +4,9 @@ A static recompilation of *Fire Emblem: Three Houses* (Nintendo Switch, 2019) in
 built on [LAS Recomp](https://github.com/peiikai/LASRecomp) by Peiikai.
 
 > [!IMPORTANT]
-> **This is a personal project, and I made it mostly for myself.** I wanted to play *Three Houses* on my PC, and so
-> far emulators haven't given me the experience I'm after — at least not without my CPU and GPU fans sounding like a
-> jet engine. So I built this instead, with a lot of help from an AI (Anthropic's Claude wrote most of the
-> FE3H-specific code; I directed and tested).
+> **This is a personal project, and I made it mostly for myself.** I wanted to play *Three Houses* on my PC at a steady 60fps
+> and a higher resolution, and so far emulators haven't given me the experience I'm after. So I built this instead, with a
+> significant amount of help from an AI (Anthropic's Claude wrote most of the FE3H-specific code; I directed and tested).
 >
 > I'm doing this casually, in my spare time, and I'm not planning to pour a ton of time, energy or resources into it.
 > Honestly, I doubt I'll finish a full playthrough before GTA VI comes out, and once that happens this will probably
