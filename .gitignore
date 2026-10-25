@@ -12,6 +12,8 @@ build/
 /cache/
 save/
 /larecomp.ini
+/fe3hrecomp.ini
+/cheats.txt
 # tools and Python environments (machine-specific)
 tools/venv/
 venv/

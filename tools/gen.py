@@ -380,11 +380,11 @@ class Module:
         all_labels = bool(tables)
         if all_labels:
             labels = set(range(entry, end, 4))
-        rando_here = [a for a in range(entry, end, 4) if a - self.base in RANDO_CODE]
+        rando_here = [a for a in range(entry, end, 4) if a - self.base in VARIANTS]
         if rando_here:
             labels = set(labels)
             for a in rando_here:
-                for w in RANDO_CODE[a - self.base]:
+                for w in VARIANTS[a - self.base][1]:
                     v = self.lifter.lift(w, a)
                     if v.kind in ('b', 'bcond') and isinstance(v.target, int) and entry <= v.target < end:
                         labels.add(v.target)
@@ -394,11 +394,12 @@ class Module:
             if a in labels:
                 flush()
                 out.append(f'L_{a:x}:;')
-            if a - self.base in RANDO_CODE:  # randomizer patch site: the active seed picks the instruction
+            if a - self.base in VARIANTS:  # patch site (a randomizer seed or a cheat picks the instruction at run time)
                 flush()
-                out.append(f'    {{ extern uint32_t rando_word(uint64_t); uint32_t rw = rando_word({hx(a)});')
+                fn, words = VARIANTS[a - self.base]
+                out.append(f'    {{ extern uint32_t {fn}(uint64_t); uint32_t rw = {fn}({hx(a)});')
                 first = True
-                for w in RANDO_CODE[a - self.base]:
+                for w in words:
                     v = self.lifter.lift(w, a)
                     out.append(f'    {"if" if first else "else if"} (rw == {hx(w)}) {{ ' + ' '.join(self.render_single(v, a, jump, refs)) + ' }')
                     first = False
@@ -475,6 +476,10 @@ RANDO_CODE = {}
 if False:  # LA randomizer patches: off for FE3H
     for _a, _ws in _json.load(open(_rv))['code'].items():
         RANDO_CODE[int(_a, 16)] = [int(_w, 16) for _w in _ws]
+# Instruction variants compiled in beside the original, picked at run time: offset from the module's base ->
+# (the runtime function that names the active word, 0 = original; [words]). Randomizer patches (rando_word) and the
+# code patches of the cheats in cheats.txt (main only: tools/cheats.py, cheat_word in runtime/hle/cheatvm.c).
+VARIANTS = {a: ('rando_word', ws) for a, ws in RANDO_CODE.items()}
 
 
 def write_if_changed(path, text):
@@ -506,6 +511,18 @@ def main():
 
     t0 = time.time()
     m = Module(args.name, args.nso, args.base, args.simd)
+    if args.name == 'main':
+        import cheats
+        path = os.environ.get('LARECOMP_CHEATS', '../cheats.txt')  # (make gen runs in tools/: the project folder's)
+        cv = cheats.code_variants(path, lambda off: m.in_text(args.base + off))
+        for off, ws in cv.items():
+            VARIANTS[off] = ('cheat_word', ws)
+        if cv:
+            print(f'[gen] {path}: {len(cv)} instruction(s) with cheat variants', file=sys.stderr)
+        # what got compiled in, for the runtime (a cheat added since needs `make gen` again: the menu says so)
+        os.makedirs(args.outdir, exist_ok=True)
+        write_if_changed(os.path.join(args.outdir, 'cheat_variants.txt'),
+                         ''.join(f'{off:x} {w:08x}\n' for off, ws in sorted(cv.items()) for w in ws))
     starts = m.boundaries()
     hle = {}
     if args.hle and os.path.exists(args.hle):

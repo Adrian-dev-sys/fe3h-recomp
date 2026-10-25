@@ -16,6 +16,7 @@
 #include "imgui_internal.h"  // (NavCursorVisible)
 #include "osk.h"
 #include "theme.h"
+#include "../hle/cheatvm.h"
 #ifdef __APPLE__
 #include "imgui_impl_metal.h"
 #else
@@ -572,6 +573,25 @@ static void tab_game(void) {
                    "The console language the game is told, which picks its text language (the voice language is in "
                    "the game's own settings). Applies when the game restarts: Quit to Start Screen, then Play."))
         settings_save();
+    // cheats.txt (Atmosphere's format, in the project folder): runtime/hle/cheatvm.c
+    int nc = cheatvm_count();
+    opt_section("Cheats");
+    if (nc == 0)
+        opt_action("No cheats", "", "Put Atmosphere-format cheats in cheats.txt in the project folder (a [name] line, "
+                   "then its codes), then restart. Cheats that patch the game's code also need `make gen-main` and "
+                   "`make`.");
+    for (int i = 0; i < nc; i++) {
+        CheatInfo ci;
+        if (!cheatvm_info(i, &ci) || ci.master) continue;
+        bool on = ci.on;
+        const char *d = ci.unsupported ? "This cheat uses an opcode the cheat engine doesn't support, so it can't run."
+                      : ci.needs_gen ? "This cheat patches the game's code, and that patch isn't built in yet: run "
+                                       "`make gen-main` and then `make`, and restart."
+                      : "From cheats.txt. Turning a cheat off puts back any game code it changed; values it already "
+                        "wrote (gold, stats...) stay as they are.";
+        if (ci.unsupported || ci.needs_gen) opt_disable_next();
+        if (opt_toggle(ci.name, &on, false, d)) { cheatvm_set(i, on); settings_save(); }
+    }
     opt_end();
 }
 

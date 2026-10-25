@@ -7,13 +7,23 @@
 #include "hle.h"
 #include "input_bind.h"
 #include "paths.h"
+#include "hle/cheatvm.h"
 
 #define SETTINGS_FILE settings_file()
 
-// LARECOMP_SETTINGS=<path>: another settings file (test runs never touch the player's larecomp.ini)
+// LARECOMP_SETTINGS=<path>: another settings file (test runs never touch the player's fe3hrecomp.ini). LAS's
+// larecomp.ini is moved over the first time.
 static const char *settings_file(void) {
     const char *e = getenv("LARECOMP_SETTINGS");
-    return e && *e ? e : "larecomp.ini";
+    if (e && *e) return e;
+    static bool moved;
+    if (!moved) {
+        moved = true;
+        FILE *f = fopen("fe3hrecomp.ini", "r");
+        if (f) fclose(f);
+        else if (rename("larecomp.ini", "fe3hrecomp.ini") == 0) LOG("[settings] larecomp.ini is now fe3hrecomp.ini\n");
+    }
+    return "fe3hrecomp.ini";
 }
 
 Settings g_settings = {
@@ -143,6 +153,7 @@ void settings_load(void) {
         else if (!strcmp(key, "diff_hero")) g_settings.diff_hero = atoi(val) != 0;
         else if (!strcmp(key, "tunic")) { for (int i = 0; i < N_TUNIC_COLOURS; i++) if (!strcmp(val, g_tunic_colours[i])) g_settings.tunic = i; }
         else if (!strcmp(key, "hearts")) { for (int i = 0; i < N_HEART_COLOURS; i++) if (!strcmp(val, g_heart_colours[i])) g_settings.hearts = i; }
+        else if (cheatvm_settings_load(key, val)) {}  // cheat.<name>: runtime/hle/cheatvm.c
         else bind_settings_load(key, val);  // bind_pad_* / bind_key_*: runtime/hle/bindings.c
     }
     fclose(f);
@@ -194,6 +205,7 @@ void settings_save(void) {
             g_settings.diff_hero);
     fprintf(f, "tunic = %s\nhearts = %s\n", g_tunic_colours[g_settings.tunic], g_heart_colours[g_settings.hearts]);
     bind_settings_save(f);
+    cheatvm_settings_save(f);
     fprintf(f, "rando_seed = %s\n", g_settings.rando_seed);
     fclose(f);
 }

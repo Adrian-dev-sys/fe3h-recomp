@@ -78,11 +78,22 @@ extracted/dlc/010055D009F79002/romfs/...
 The game sees every pack there as installed. The first launch converts each folder into a single image next to it
 (once; it takes extra disk space about the size of the DLC).
 
+### Cheats
+
+Cheats use the Atmosphere format: put them in `cheats.txt` in the project folder (a `[Name]` line, then its codes; a
+`{Name}` block is a master code, always on), and they show up in the menu's **Game** tab to switch on and off. The
+file stays out of git.
+
+Cheats that only change memory work straight away. Cheats that patch the game's code (most multipliers and "max"
+cheats) can't be applied to an already-recompiled game at run time, so their patched instructions get compiled in
+beside the originals: after adding or changing those, run `make gen-main` and then `make`. The menu marks any cheat
+still waiting on that. Switching a cheat off puts back any code it changed; values it already wrote stay.
+
 ### Settings and logs
 
 - **F1** (or Minus + Plus on a controller) opens the settings overlay. For a sharp image use Internal resolution
   "Match display" or higher, with SMAA.
-- Saves are in `save/`, settings in `larecomp.ini`.
+- Saves are in `save/`, settings in `fe3hrecomp.ini` (an older `larecomp.ini` is renamed to it once).
 - `run.log` is the first place to look when something goes wrong. `LARECOMP_*` environment variables turn on extra
   logging for specific systems (audio, textures, shaders); they're documented where they're read in `runtime/`.
 
