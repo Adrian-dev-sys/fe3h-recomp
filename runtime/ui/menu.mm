@@ -492,6 +492,12 @@ static void tab_display(void) {
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
+    static const char *waits[] = {"Off", "Balanced", "Full"};
+    opt_choice("Wait for shaders", &g_settings.shader_wait, waits, 3, SHADER_WAIT_FULL,
+               "What happens when something appears whose shaders are still being prepared (mostly the first time "
+               "you see it; they're kept on disk for later sessions).\n\nFull: the frame waits for them (up to 50 ms), "
+               "so nothing pops in; the first visit to an area may pause briefly. Balanced: waits a few ms, then draws "
+               "without them. Off: never waits; the smoothest, but things can pop in for a frame or two.");
 
     opt_end();
 }

@@ -722,9 +722,36 @@ uint32_t nvn_window_origin(void);
 uint32_t nvn_depth_mode(void);
 bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
 
+// ================================================================== waiting for shaders being built
+// A draw (or dispatch) whose program or pipeline is still building used to be skipped: things popped in a frame or
+// more later, every time something was first seen. With the translations, SPIR-V and pipelines kept on disk most
+// builds take a millisecond or two, so the draw waits for them instead, up to a budget a frame (the menu's "Wait for
+// shaders": Full 50 ms, Balanced 4 ms, Off none) - past it the frame goes on and the rest are skipped as before.
+static _Atomic uint64_t wait_budget_ns, stat_build_wait_ns;
+static void wait_budget_reset(void) {
+    static const uint64_t budget_ms[3] = {0, 4, 50};
+    atomic_store(&wait_budget_ns, budget_ms[g_settings.shader_wait % 3] * 1000000ull);
+}
+// true when ready (state 1), after waiting for it to finish building within the frame's budget
+static bool wait_built(_Atomic int *state) {
+    int s = atomic_load(state);
+    if (s != 0) return s == 1;
+    uint64_t left = atomic_load(&wait_budget_ns);
+    if (!left) return false;
+    uint64_t t0 = SDL_GetTicksNS(), el = 0;
+    while ((s = atomic_load(state)) == 0 && el < left) {
+        SDL_DelayNS(50000);
+        el = SDL_GetTicksNS() - t0;
+    }
+    atomic_store(&wait_budget_ns, el < left ? left - el : 0);
+    atomic_fetch_add(&stat_build_wait_ns, el);
+    return s == 1;
+}
+
 // (LARECOMP_VK_PROF) called once per presented frame: frames over 50 ms are logged with where their time went.
 // present_ns: time in backend_present's acquire/blit/present.
 void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
+    wait_budget_reset();  // (each frame: its own budget for waiting on shaders)
     if (!prof) return;
     static uint64_t last_t, l_exec, l_wait, l_draws, l_subs;
     uint64_t now = SDL_GetTicksNS();
@@ -756,6 +783,11 @@ const char *renderer_stats(void) {
             size_t n = strlen(stats_text);
             snprintf(stats_text + n, sizeof stats_text - n, ", xlat %llu cached / %llu new %.0fms", (unsigned long long)hit,
                      (unsigned long long)miss, ns / 1e6);
+        }
+        uint64_t w = atomic_exchange(&stat_build_wait_ns, 0);
+        if (w) {
+            size_t n = strlen(stats_text);
+            snprintf(stats_text + n, sizeof stats_text - n, ", waited %.0fms for shaders", w / 1e6);
         }
     }
     stat_feedback_copies = stat_upload_bytes = 0;
@@ -2749,13 +2781,13 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     // the same compute shader again for every graphics combination)
     NvnProgram *csp = st.stage_prog[5] ? st.stage_prog[5] : st.program;
     CsProg *cp = compute_program(csp, 0);
-    if (!cp || atomic_load(&cp->p.state) != 1)
+    if (!cp || !wait_built(&cp->p.state))
         SKIP(SK_CS_PROG, "compute code %llx state %d\n", (unsigned long long)st.program->stages[5].code_addr, cp ? atomic_load(&cp->p.state) : -1);
     {
         uint32_t m = buffer_texture_mask(5, cp->si);
         if (m) {
             cp = compute_program(csp, m);
-            if (!cp || atomic_load(&cp->p.state) != 1) SKIP(SK_CS_PROG, "buffer-texture compute variant building\n");
+            if (!cp || !wait_built(&cp->p.state)) SKIP(SK_CS_PROG, "buffer-texture compute variant building\n");
         }
     }
     {   // LARECOMP_SKIP_CS=<code address hex> (debug): skip that compute shader's dispatches, to see what it does
@@ -2851,7 +2883,7 @@ static void draw_(CmdRec *r, bool indexed) {
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
     Prog *pr = get_program(st.program, &vkey, &fkey);
-    if (!pr || atomic_load(&pr->state) != 1)
+    if (!pr || !wait_built(&pr->state))
         SKIP(SK_PROG, "vs %llx fs %llx state %d\n", (unsigned long long)st.program->stages[0].code_addr,
              (unsigned long long)st.program->stages[1].code_addr, pr ? atomic_load(&pr->state) : -1);
     {   // buffer textures bound to the fragment shader's 1D slots: the variant that reads them from the guest heap
@@ -2859,7 +2891,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (m) {
             key_set_buf_mask(&fkey, m);
             pr = get_program(st.program, &vkey, &fkey);
-            if (!pr || atomic_load(&pr->state) != 1) SKIP(SK_PROG, "buffer-texture variant building\n");
+            if (!pr || !wait_built(&pr->state)) SKIP(SK_PROG, "buffer-texture variant building\n");
         }
     }
     g_mirror_w = 0;
@@ -2875,7 +2907,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (mirror_draw(composite)) {
             vkey.flip_x = fkey.flip_x = true;
             pr = get_program(st.program, &vkey, &fkey);
-            if (!pr || atomic_load(&pr->state) != 1) SKIP(SK_PROG_MIRROR, "\n");
+            if (!pr || !wait_built(&pr->state)) SKIP(SK_PROG_MIRROR, "\n");
             g_mirror_w = (float)st.rt.color[0]->width;
         }
     }
@@ -2981,7 +3013,7 @@ static void draw_(CmdRec *r, bool indexed) {
         pipe_tab[pslot].pipe = pp;
         run_job(build_pipeline, pp);
     }
-    if (atomic_load(&pp->state) != 1) SKIP(SK_PIPE, "state %d\n", atomic_load(&pp->state));
+    if (!wait_built(&pp->state)) SKIP(SK_PIPE, "state %d\n", atomic_load(&pp->state));
     ss_enabled();
     if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
     uint64_t prof_td_ = prof ? SDL_GetTicksNS() : 0;
