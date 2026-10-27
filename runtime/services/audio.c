@@ -1291,6 +1291,9 @@ static void update_mix(Renderer *r, const uint8_t *p, int id) {
     memcpy(&m->dest_splitter, p + 0x928, 4);
     memcpy(m->vol, p + 0x24, sizeof m->vol);
     if (!m->buf) m->buf = calloc(MIXBUF_MAX * r->sample_count, sizeof(float));
+    static int log_mix = -1;  // (LARECOMP_AUDIO_LOG: every mix update; FE3H sends them every frame - a 10 MB log)
+    if (log_mix < 0) log_mix = getenv("LARECOMP_AUDIO_LOG") != NULL;
+    if (!log_mix) return;
     LOG("[audren] mix %d used %u vol %.3f bufs %u dest %d:", id, m->used, m->volume, m->bufs, m->dest);
     for (int i = 0; i < MIXBUF_MAX * MIXBUF_MAX; i++)
         if (m->vol[i] != 0) LOG(" %d>%d=%.3f", i / MIXBUF_MAX, i % MIXBUF_MAX, m->vol[i]);
