@@ -114,5 +114,8 @@ extern const uint8_t *maxwell_dbg_vs;
 // code: shader binary (with the 0x50-byte SPH header for graphics stages)
 ShaderInfo *maxwell_translate(const uint8_t *code, size_t max_size, int stage, const ShaderKey *key);
 void maxwell_free(ShaderInfo *s);
+// The bytes maxwell_translate reads of a program (header, SPH and code up to its end, as it finds it): what a cached
+// translation is keyed on. 0 when the result also depends on bytes past that (a BRX jump table in the constants).
+size_t maxwell_input_size(const uint8_t *blob, size_t max_size, int stage);
 // Disassemble for debugging (writes text to f).
 void maxwell_disassemble(const uint8_t *code, size_t max_size, int stage, void *file);

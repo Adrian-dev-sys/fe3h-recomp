@@ -2439,6 +2439,25 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     return info;
 }
 
+size_t maxwell_input_size(const uint8_t *blob, size_t max_size, int stage) {
+    const uint8_t *code = stage == STAGE_COMPUTE ? blob : blob + 0x80;
+    size_t n = (max_size - (size_t)(code - blob)) / 8;
+    if (n > 65536) n = 65536;
+    size_t end = 0;
+    for (size_t i = 0; i < n; i++) {  // (the same end as maxwell_translate's)
+        uint64_t w = ((const uint64_t *)code)[i];
+        if (i % 4 == 0) continue;
+        if ((w & 0xfff0000000000000ull) == 0xe240000000000000ull && sbits(w, 20, 24) == -8 && end) break;
+        if (w == 0 && i > 4) break;
+        end = i + 1;
+    }
+    for (size_t i = 0; i < end; i++)  // BRX: its jump table sits in the constants after the code
+        if (i % 4 && (((const uint64_t *)code)[i] & 0xfff0000000000000ull) == 0xe250000000000000ull) return 0;
+    size_t words = (end + 3) & ~(size_t)3;  // (whole bundles: their scheduling words too)
+    if (words > n) words = n;
+    return (size_t)(code - blob) + words * 8;
+}
+
 void maxwell_free(ShaderInfo *s) {
     if (!s) return;
     free(s->msl);

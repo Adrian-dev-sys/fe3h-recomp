@@ -41,6 +41,7 @@ static _Atomic int stat_compiles;
 static uint64_t op_counts[CMD_COUNT];
 bool g_debug_frame;
 static char stats_text[2048];
+static _Atomic uint64_t xlat_hits, xlat_misses, xlat_ns;  // (translations: cache/xlat, below)
 void vk_collect_dead(void);
 
 // ================================================================== submissions
@@ -749,6 +750,14 @@ const char *renderer_stats(void) {
              (unsigned long long)stat_draws, (unsigned long long)stat_skipped, (unsigned long long)stat_passes,
              (unsigned long long)stat_dispatches, (unsigned long long)stat_flushes, (double)stat_wait_ns / 1e6,
              atomic_exchange(&stat_compiles, 0), (unsigned long long)stat_feedback_copies, (double)stat_upload_bytes / 1048576.0);
+    {  // translations this period: from the disk cache / translated (and the translator's time)
+        uint64_t hit = atomic_exchange(&xlat_hits, 0), miss = atomic_exchange(&xlat_misses, 0), ns = atomic_exchange(&xlat_ns, 0);
+        if (hit || miss) {
+            size_t n = strlen(stats_text);
+            snprintf(stats_text + n, sizeof stats_text - n, ", xlat %llu cached / %llu new %.0fms", (unsigned long long)hit,
+                     (unsigned long long)miss, ns / 1e6);
+        }
+    }
     stat_feedback_copies = stat_upload_bytes = 0;
     if (stat_skipped) {
         size_t n = strlen(stats_text);
@@ -1286,6 +1295,85 @@ static void save_glsl(const char *src, uint64_t addr, const char *suffix) {
     if (f) { fputs(src, f); fclose(f); }
 }
 
+// ================================================================== translations kept on disk
+// A program's translation (ShaderInfo and its GLSL) depends only on the bytes the translator reads and the key, so it
+// is kept in cache/xlat/<hash>.bin and reused by later sessions: the shaders met before skip the translator (one
+// thread, its queue the main cause of the draws skipped on entering an area) and are ready a frame or two after first
+// use instead of many. The SPIR-V (cache/spirv) and the driver's pipelines (cache/vk_pipelines.bin) were already
+// kept. TRANSLATOR_ID (Makefile: a hash of translate.c and shader.h) keys a new translator to new entries.
+// LARECOMP_VK_NO_XLAT_CACHE=1 turns it off.
+#ifndef TRANSLATOR_ID
+#define TRANSLATOR_ID "dev"
+#endif
+#define XLAT_MAGIC 0x54414C58u  // "XLAT"
+
+static uint64_t xlat_hash(const uint8_t *blob, size_t n, int stage, const ShaderKey *key) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (const char *p = TRANSLATOR_ID; *p; p++) { h ^= (uint8_t)*p; h *= 0x100000001B3ull; }
+    // (and the translator's settings: denormals, the guest heap's place)
+    uint64_t g[4] = {(uint64_t)stage, maxwell_glsl_denorm_preserve, maxwell_gmem_base, maxwell_gmem_size};
+    for (size_t i = 0; i < sizeof g; i++) { h ^= ((const uint8_t *)g)[i]; h *= 0x100000001B3ull; }
+    for (size_t i = 0; i < sizeof *key; i++) { h ^= ((const uint8_t *)key)[i]; h *= 0x100000001B3ull; }
+    for (size_t i = 0; i < n; i++) { h ^= blob[i]; h *= 0x100000001B3ull; }
+    return h;
+}
+
+static ShaderInfo *xlat_load(uint64_t h) {
+    char path[64];
+    snprintf(path, sizeof path, "cache/xlat/%016llx.bin", (unsigned long long)h);
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    uint32_t magic = 0, len = 0, size = 0;
+    ShaderInfo *si = calloc(1, sizeof *si);
+    bool ok = fread(&magic, 4, 1, f) == 1 && magic == XLAT_MAGIC && fread(&size, 4, 1, f) == 1 && size == sizeof *si &&
+              fread(si, sizeof *si, 1, f) == 1 && fread(&len, 4, 1, f) == 1 && len < (16u << 20);
+    if (ok) {
+        si->msl = malloc(len + 1);
+        ok = fread(si->msl, 1, len, f) == len;
+        if (ok) si->msl[len] = 0;
+    } else si->msl = NULL;
+    fclose(f);
+    if (!ok) { free(si->msl); free(si); return NULL; }
+    return si;
+}
+
+static void xlat_store(uint64_t h, const ShaderInfo *si) {
+    if (!si->msl) return;  // (failures aren't kept: a fixed translator retries them)
+    static bool made;
+    if (!made) { made = true; mkdir("cache", 0755); mkdir("cache/xlat", 0755); }
+    char path[64], tmp[72];
+    snprintf(path, sizeof path, "cache/xlat/%016llx.bin", (unsigned long long)h);
+    snprintf(tmp, sizeof tmp, "%s.%llx", path, (unsigned long long)(uintptr_t)si);  // (two threads, one entry)
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    ShaderInfo copy = *si;
+    copy.msl = NULL;
+    uint32_t magic = XLAT_MAGIC, size = sizeof copy, len = (uint32_t)strlen(si->msl);
+    bool ok = fwrite(&magic, 4, 1, f) == 1 && fwrite(&size, 4, 1, f) == 1 && fwrite(&copy, sizeof copy, 1, f) == 1 &&
+              fwrite(&len, 4, 1, f) == 1 && fwrite(si->msl, 1, len, f) == len;
+    if (fclose(f) || !ok) { remove(tmp); return; }
+    remove(path);
+    if (rename(tmp, path)) remove(tmp);
+}
+
+// maxwell_translate through the disk cache (translate_lock taken here, around the translation only)
+static ShaderInfo *translate_cached(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_VK_NO_XLAT_CACHE") != NULL;
+    size_t n = off || maxwell_dbg_code ? 0 : maxwell_input_size(blob, max_size, stage);  // (debugging: not cached)
+    uint64_t h = n ? xlat_hash(blob, n, stage, key) : 0;
+    ShaderInfo *si = h ? xlat_load(h) : NULL;
+    if (si) { atomic_fetch_add(&xlat_hits, 1); return si; }
+    uint64_t t0 = SDL_GetTicksNS();
+    pthread_mutex_lock(&translate_lock);
+    si = maxwell_translate(blob, max_size, stage, key);
+    pthread_mutex_unlock(&translate_lock);
+    atomic_fetch_add(&xlat_ns, SDL_GetTicksNS() - t0);
+    atomic_fetch_add(&xlat_misses, 1);
+    if (h) xlat_store(h, si);
+    return si;
+}
+
 static void compile_program(void *arg) {
     Prog *p = arg;
     size_t nv = 0, nf = 0;
@@ -1307,13 +1395,11 @@ static void translate_program(void *arg) {
     Prog *p = arg;
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
-    pthread_mutex_lock(&translate_lock);
-    p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
+    p->vi = translate_cached((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
         p->fkey.vs_out_mask = p->vi->out_mask;
-        p->fi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[1], p->cmax[1], STAGE_FRAGMENT, &p->fkey);
+        p->fi = translate_cached((const uint8_t *)(uintptr_t)p->code[1], p->cmax[1], STAGE_FRAGMENT, &p->fkey);
     }
-    pthread_mutex_unlock(&translate_lock);
     if (!p->vi->msl) {
         LOG("[shader] VS translate failed: %s (code %llx)\n", p->vi->error, (unsigned long long)p->code[0]);
         atomic_store(&p->state, 2);
@@ -2639,9 +2725,8 @@ static CsProg *compute_program(NvnProgram *np, uint32_t bufmask) {
     ShaderKey k = {0};
     k.glsl = 1;
     key_set_buf_mask(&k, bufmask);
-    pthread_mutex_lock(&translate_lock);
-    cp->si = maxwell_translate((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, STAGE_COMPUTE, &k);
-    pthread_mutex_unlock(&translate_lock);
+    cp->si = translate_cached((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000,
+                              STAGE_COMPUTE, &k);
     cp->p.vi = cp->si;
     if (!cp->si->msl) {
         LOG("[compute] translate failed: %s (code %llx)\n", cp->si->error, (unsigned long long)ss->code_addr);

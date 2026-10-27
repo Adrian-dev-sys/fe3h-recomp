@@ -126,6 +126,10 @@ $(B)/obj/%.o: $(GEN)/%.c runtime/cpu.h
 $(B)/obj/tools/gamelib_entry.o: tools/gamelib_entry.c $(GAMELIB_SRCS)
 	@mkdir -p $(dir $@)
 	$(CC) $(GENFLAGS) -DGAMELIB_ID='"$(GAMELIB_ID)"' -c $< -o $@
+# the shader translator's id: cached translations (cache/xlat, runtime/nvn/vulkan/exec.c) from another one aren't used
+TRANSLATOR_ID := $(shell cat runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
+$(B)/rt/nvn/vulkan/exec.o: runtime/nvn/maxwell/translate.c
+$(B)/rt/nvn/vulkan/exec.o: RTFLAGS += -DTRANSLATOR_ID='"$(TRANSLATOR_ID)"'
 $(B)/rt/gamelib.o: $(GAMELIB_SRCS)
 $(B)/rt/gamelib.o: RTFLAGS += -DGAMELIB_ID='"$(GAMELIB_ID)"'
 # the start screen's build of it (runtime/gamebuild.c) uses the same flags
