@@ -31,7 +31,7 @@ Settings g_settings = {
     .fullscreen = false,
     .volume = 1.0f,
     .reverb = true,
-    .shader_wait = SHADER_WAIT_FULL,
+    .shader_wait = SHADER_WAIT_BALANCED,
     .movie_audio = true,
     .show_fps = false,
     .inv_keys = true,
@@ -127,7 +127,7 @@ void settings_load(void) {
         else if (!strcmp(key, "upscaler")) g_settings.upscaler = !strcmp(val, "bilinear") ? UPSCALE_BILINEAR : UPSCALE_SHARP;  // (metalfx / fsr1: this OS's)
         else if (!strcmp(key, "antialias")) g_settings.antialias = !strcmp(val, "off") ? AA_OFF : AA_SMAA;  // ("fxaa": SMAA now)
         else if (!strcmp(key, "shader_wait")) g_settings.shader_wait = !strcmp(val, "off") ? SHADER_WAIT_OFF :
-                                                                    !strcmp(val, "balanced") ? SHADER_WAIT_BALANCED : SHADER_WAIT_FULL;
+                                                                    !strcmp(val, "full") ? SHADER_WAIT_FULL : SHADER_WAIT_BALANCED;
         else if (!strcmp(key, "inv_keys")) g_settings.inv_keys = atoi(val) != 0;
         else if (!strcmp(key, "dpad_move")) g_settings.dpad_move = atoi(val) != 0;
         else if (!strcmp(key, "move_360")) g_settings.move_360 = atoi(val) != 0;

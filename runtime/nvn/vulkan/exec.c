@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include "../../kernel.h"
 #include "shaders.h"
@@ -601,17 +602,35 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size) {
 // LARECOMP_SYNC_SHADERS=1 builds on first use, blocking (deterministic tests).
 typedef struct Job { void (*fn)(void *); void *arg; struct Job *next; } Job;
 static Job *jobs_head, *jobs_tail;
+static Job *ljobs_head, *ljobs_tail;  // low priority (prewarm, below): taken when nothing else is waiting
 static pthread_mutex_t jobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
+
+// Builds finishing (a program's or pipeline's state leaving 0) wake the draws waiting for them (wait_built)
+static pthread_mutex_t built_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t built_cond = PTHREAD_COND_INITIALIZER;
+static void set_state(_Atomic int *state, int v) {
+    pthread_mutex_lock(&built_lock);
+    atomic_store(state, v);
+    pthread_cond_broadcast(&built_cond);
+    pthread_mutex_unlock(&built_lock);
+}
 
 static void *worker(void *a) {
     (void)a;
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
-        while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
-        Job *j = jobs_head;
-        jobs_head = j->next;
-        if (!jobs_head) jobs_tail = NULL;
+        while (!jobs_head && !ljobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
+        Job *j;
+        if (jobs_head) {
+            j = jobs_head;
+            jobs_head = j->next;
+            if (!jobs_head) jobs_tail = NULL;
+        } else {
+            j = ljobs_head;
+            ljobs_head = j->next;
+            if (!ljobs_head) ljobs_tail = NULL;
+        }
         pthread_mutex_unlock(&jobs_lock);
         j->fn(j->arg);
         free(j);
@@ -659,7 +678,7 @@ static void run_translate(void (*fn)(void *), void *arg) {
     pthread_mutex_unlock(&tjobs_lock);
 }
 
-static void run_job(void (*fn)(void *), void *arg) {
+static void run_job_at(void (*fn)(void *), void *arg, bool low) {
     if (sync_shaders()) { fn(arg); return; }
     static bool started;
     if (!started) {
@@ -673,11 +692,13 @@ static void run_job(void (*fn)(void *), void *arg) {
     Job *j = malloc(sizeof *j);
     j->fn = fn; j->arg = arg; j->next = NULL;
     pthread_mutex_lock(&jobs_lock);
-    if (jobs_tail) jobs_tail->next = j; else jobs_head = j;
-    jobs_tail = j;
+    Job **head = low ? &ljobs_head : &jobs_head, **tail = low ? &ljobs_tail : &jobs_tail;
+    if (*tail) (*tail)->next = j; else *head = j;
+    *tail = j;
     pthread_cond_signal(&jobs_cond);
     pthread_mutex_unlock(&jobs_lock);
 }
+static void run_job(void (*fn)(void *), void *arg) { run_job_at(fn, arg, false); }
 
 // ================================================================== state
 typedef struct {
@@ -729,7 +750,7 @@ bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
 // shaders": Full 50 ms, Balanced 4 ms, Off none) - past it the frame goes on and the rest are skipped as before.
 static _Atomic uint64_t wait_budget_ns, stat_build_wait_ns;
 static void wait_budget_reset(void) {
-    static const uint64_t budget_ms[3] = {0, 4, 50};
+    static const uint64_t budget_ms[3] = {0, 4, 50};  // (Off, Balanced, Full)
     atomic_store(&wait_budget_ns, budget_ms[g_settings.shader_wait % 3] * 1000000ull);
 }
 // true when ready (state 1), after waiting for it to finish building within the frame's budget
@@ -739,10 +760,16 @@ static bool wait_built(_Atomic int *state) {
     uint64_t left = atomic_load(&wait_budget_ns);
     if (!left) return false;
     uint64_t t0 = SDL_GetTicksNS(), el = 0;
-    while ((s = atomic_load(state)) == 0 && el < left) {
-        SDL_DelayNS(50000);
-        el = SDL_GetTicksNS() - t0;
-    }
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    uint64_t end = (uint64_t)dl.tv_sec * 1000000000ull + (uint64_t)dl.tv_nsec + left;
+    dl.tv_sec = (time_t)(end / 1000000000ull);
+    dl.tv_nsec = (long)(end % 1000000000ull);
+    pthread_mutex_lock(&built_lock);
+    while ((s = atomic_load(state)) == 0)
+        if (pthread_cond_timedwait(&built_cond, &built_lock, &dl)) { s = atomic_load(state); break; }
+    pthread_mutex_unlock(&built_lock);
+    el = SDL_GetTicksNS() - t0;
     atomic_store(&wait_budget_ns, el < left ? left - el : 0);
     atomic_fetch_add(&stat_build_wait_ns, el);
     return s == 1;
@@ -1305,6 +1332,8 @@ typedef struct {
     VkDescriptorSetLayout set_layout[2];
     VkPipelineLayout layout;
     bool vs_uses_vid;
+    uint64_t xh[2];     // the translations' cache hashes (cache/xlat): the program by content, 0 when not cached
+    bool warm;          // prebuilt at launch (prewarm below)
     _Atomic int state;  // 0 building, 1 ready, 2 failed
 } Prog;
 
@@ -1389,11 +1418,12 @@ static void xlat_store(uint64_t h, const ShaderInfo *si) {
 }
 
 // maxwell_translate through the disk cache (translate_lock taken here, around the translation only)
-static ShaderInfo *translate_cached(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
+static ShaderInfo *translate_cached(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key, uint64_t *hash) {
     static int off = -1;
     if (off < 0) off = getenv("LARECOMP_VK_NO_XLAT_CACHE") != NULL;
     size_t n = off || maxwell_dbg_code ? 0 : maxwell_input_size(blob, max_size, stage);  // (debugging: not cached)
     uint64_t h = n ? xlat_hash(blob, n, stage, key) : 0;
+    if (hash) *hash = h;
     ShaderInfo *si = h ? xlat_load(h) : NULL;
     if (si) { atomic_fetch_add(&xlat_hits, 1); return si; }
     uint64_t t0 = SDL_GetTicksNS();
@@ -1411,7 +1441,7 @@ static void compile_program(void *arg) {
     size_t nv = 0, nf = 0;
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
     uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
-    if (!sv || !sf) { free(sv); free(sf); atomic_store(&p->state, 2); return; }
+    if (!sv || !sf) { free(sv); free(sf); set_state(&p->state, 2); return; }
     p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
     p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
     p->vs = vk_module(sv, nv);
@@ -1420,26 +1450,26 @@ static void compile_program(void *arg) {
     free(sf);
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
     atomic_fetch_add(&stat_compiles, 1);
-    atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
+    set_state(&p->state, p->vs && p->fs ? 1 : 2);
 }
 
 static void translate_program(void *arg) {
     Prog *p = arg;
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
-    p->vi = translate_cached((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
+    p->vi = translate_cached((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey, &p->xh[0]);
     if (p->vi->msl) {
         p->fkey.vs_out_mask = p->vi->out_mask;
-        p->fi = translate_cached((const uint8_t *)(uintptr_t)p->code[1], p->cmax[1], STAGE_FRAGMENT, &p->fkey);
+        p->fi = translate_cached((const uint8_t *)(uintptr_t)p->code[1], p->cmax[1], STAGE_FRAGMENT, &p->fkey, &p->xh[1]);
     }
     if (!p->vi->msl) {
         LOG("[shader] VS translate failed: %s (code %llx)\n", p->vi->error, (unsigned long long)p->code[0]);
-        atomic_store(&p->state, 2);
+        set_state(&p->state, 2);
         return;
     }
     if (!p->fi->msl) {
         LOG("[shader] FS translate failed: %s\n", p->fi->error);
-        atomic_store(&p->state, 2);
+        set_state(&p->state, 2);
         return;
     }
     p->vs_uses_vid = strstr(p->vi->msl, "gl_VertexIndex") != NULL;
@@ -1463,8 +1493,11 @@ static uint32_t buffer_texture_mask(int stage, const ShaderInfo *si) {
     return m;
 }
 
+static Prog *warm_find(NvnProgram *np, const ShaderKey *vkey, const ShaderKey *fkey);
+static void warm_start(void);
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
+    warm_start();
     uint64_t h = 0xcbf29ce484222325ull;
     for (int i = 0; i < 2; i++) { uint64_t a = np->stages[i].code_addr; for (int k = 0; k < 8; k++) { h ^= (a >> (k * 8)) & 0xFF; h *= 0x100000001B3ull; } }
     const uint8_t *vb = (const uint8_t *)vkey;
@@ -1477,7 +1510,18 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     if (!h) h = 1;
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
     while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
-    if (prog_tab[slot].key) return prog_tab[slot].prog;
+    if (prog_tab[slot].key) {
+        Prog *q = prog_tab[slot].prog;
+        if (!q->warm || atomic_load(&q->state) != 2) return q;
+        // (a prebuilt one that failed - its cached translation gone: the game's own build instead)
+    }
+    Prog *w = prog_tab[slot].key ? NULL : warm_find(np, vkey, fkey);  // (built at launch from an earlier session's)
+    if (w && atomic_load(&w->state) == 2) w = NULL;
+    if (w) {
+        prog_tab[slot].key = h;
+        prog_tab[slot].prog = w;
+        return w;
+    }
     Prog *p = calloc(1, sizeof *p);
     prog_tab[slot].key = h;
     prog_tab[slot].prog = p;
@@ -1677,7 +1721,7 @@ typedef struct {
 } PipeKey;
 
 typedef struct { PipeKey k; uint64_t hash; VkPipeline pipe; _Atomic int state; } Pipe;  // state: 0 building, 1 ready, 2 failed
-#define PIPE_TAB 8192
+#define PIPE_TAB 32768
 static struct { uint64_t key; Pipe *pipe; } pipe_tab[PIPE_TAB];
 
 // 8 bytes a step (PipeKey is ~700 bytes, hashed per draw); in-memory tables only - hmix values are compared with
@@ -1699,6 +1743,7 @@ static VkPrimitiveTopology topo_class_base(uint8_t c) {
     return c == 0 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : c == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 }
 
+static void warm_record(const Pipe *pp);
 static void build_pipeline(void *arg) {
     Pipe *pp = arg;
     PipeKey *k = &pp->k;
@@ -1760,8 +1805,199 @@ static void build_pipeline(void *arg) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
     }
+    if (r == VK_SUCCESS) warm_record(pp);
     atomic_fetch_add(&stat_compiles, 1);
-    atomic_store(&pp->state, r == VK_SUCCESS ? 1 : 2);
+    set_state(&pp->state, r == VK_SUCCESS ? 1 : 2);
+}
+
+// ================================================================== prewarm: last sessions' pipelines, built at launch
+// Every pipeline built is recorded (cache/warm.bin) by content: its two translations' cache hashes (cache/xlat) and
+// its PipeKey. At the first draw of a session (the game's first loading), each recorded program and its pipelines
+// are built again on the workers, at low priority, from the caches on disk. A program the game then binds is
+// recognised by its translations' hashes (worked out on the spot: no translation) and the prebuilt one is used, with
+// its pipelines: an area entered before draws everything at once, with no pop-in and no wait. New ones are recorded
+// as they come. LARECOMP_VK_NO_PREWARM=1 turns it off (LARECOMP_VK_NO_XLAT_CACHE=1 too).
+#define WARM_MAGIC 0x4D524157u  // "WARM"
+#define WARM_VERSION 1
+#define WARM_PROGS 8192         // (table sizes; at most half of each used)
+#define WARM_PIPES 16384
+typedef struct { uint64_t xh[2]; uint32_t vs_out_mask, pad; PipeKey k; } WarmRec;  // (k.prog NULL on disk)
+typedef struct { uint64_t vxh, fxh; Prog *p; uint32_t vs_out_mask; Pipe **pipes; int npipes, cap; _Atomic int taken; } WarmProg;
+static WarmProg warm_progs[WARM_PROGS];
+static int nwarm_progs;
+static Pipe **warm_pipes;   // every prebuilt pipeline (put back in pipe_tab after a reset)
+static int nwarm_pipes;
+static uint64_t warm_seen[WARM_PIPES * 2];  // records written or loaded, by hash (no duplicates in the file)
+static int nwarm_seen;
+static pthread_mutex_t warm_lock = PTHREAD_MUTEX_INITIALIZER;
+static FILE *warm_file;
+static _Atomic int warm_left;
+static uint64_t warm_t0;
+
+static bool warm_off(void) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_VK_NO_PREWARM") || getenv("LARECOMP_VK_NO_XLAT_CACHE") || sync_shaders();
+    return off;
+}
+
+static uint64_t pair_hash(uint64_t a, uint64_t b) { uint64_t h = a * 0x9E3779B97F4A7C15ull ^ b; return h ^ (h >> 31); }
+
+static WarmProg *warm_prog_slot(uint64_t vxh, uint64_t fxh, bool add) {
+    uint32_t i = (uint32_t)pair_hash(vxh, fxh) & (WARM_PROGS - 1);
+    while (warm_progs[i].vxh && (warm_progs[i].vxh != vxh || warm_progs[i].fxh != fxh)) i = (i + 1) & (WARM_PROGS - 1);
+    if (warm_progs[i].vxh) return &warm_progs[i];
+    if (!add || nwarm_progs >= WARM_PROGS / 2) return NULL;
+    nwarm_progs++;
+    warm_progs[i].vxh = vxh;
+    warm_progs[i].fxh = fxh;
+    return &warm_progs[i];
+}
+
+// a vertex shader's output mask (the fragment shader's key depends on it), from the recorded programs that use it
+static bool warm_vs_mask(uint64_t vxh, uint32_t *mask) {
+    for (int i = 0; i < WARM_PROGS; i++)  // (only while the game meets a program for the first time this session)
+        if (warm_progs[i].vxh == vxh) { *mask = warm_progs[i].vs_out_mask; return true; }
+    return false;
+}
+
+static bool warm_seen_add(uint64_t h) {  // (warm_lock held) false: already there
+    if (!h) h = 1;
+    uint32_t i = (uint32_t)(h ^ (h >> 29)) & (WARM_PIPES * 2 - 1);
+    while (warm_seen[i] && warm_seen[i] != h) i = (i + 1) & (WARM_PIPES * 2 - 1);
+    if (warm_seen[i] || nwarm_seen >= WARM_PIPES) return false;
+    warm_seen[i] = h;
+    nwarm_seen++;
+    return true;
+}
+
+static void warm_record(const Pipe *pp) {
+    const Prog *pr = pp->k.prog;
+    if (warm_off() || !pr || !pr->xh[0] || !pr->xh[1] || !pr->vi) return;
+    WarmRec r;
+    memset(&r, 0, sizeof r);
+    r.xh[0] = pr->xh[0];
+    r.xh[1] = pr->xh[1];
+    r.vs_out_mask = pr->vi->out_mask;
+    r.k = pp->k;
+    r.k.prog = NULL;
+    uint64_t h = hash_words(0xcbf29ce484222325ull, &r, sizeof r);
+    pthread_mutex_lock(&warm_lock);
+    if (warm_seen_add(h)) {
+        if (!warm_file) {
+            mkdir("cache", 0755);
+            warm_file = fopen("cache/warm.bin", "ab");
+            if (warm_file && (fseek(warm_file, 0, SEEK_END), ftell(warm_file)) == 0) {
+                uint32_t hdr[4] = {WARM_MAGIC, WARM_VERSION, (uint32_t)sizeof r, 0};
+                fwrite(hdr, sizeof hdr, 1, warm_file);
+            }
+        }
+        if (warm_file) { fwrite(&r, sizeof r, 1, warm_file); fflush(warm_file); }
+    }
+    pthread_mutex_unlock(&warm_lock);
+}
+
+static void warm_insert(Pipe *pp) {  // into pipe_tab, as get_pipeline would
+    uint64_t ph = hash_words(0xcbf29ce484222325ull, &pp->k, sizeof pp->k);
+    if (!ph) ph = 1;
+    uint32_t s = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
+    while (pipe_tab[s].key && pipe_tab[s].key != ph) s = (s + 1) & (PIPE_TAB - 1);
+    if (pipe_tab[s].key) return;
+    pipe_tab[s].key = ph;
+    pipe_tab[s].pipe = pp;
+}
+
+static void warm_done(int n) {
+    if (atomic_fetch_sub(&warm_left, n) == n)
+        LOG("[shader] prewarm done: %d programs, %d pipelines in %.1f s\n", nwarm_progs, nwarm_pipes,
+            (SDL_GetTicksNS() - warm_t0) / 1e9);
+}
+
+static void warm_build(void *arg) {  // one recorded program and its pipelines (a worker, low priority)
+    WarmProg *w = arg;
+    if (atomic_exchange(&w->taken, 1)) return;  // (already built: the game needed it first, warm_find)
+    Prog *p = w->p;
+    p->vi = xlat_load(w->vxh);
+    p->fi = p->vi ? xlat_load(w->fxh) : NULL;
+    if (p->vi && p->fi && p->vi->msl && p->fi->msl) {
+        p->vs_uses_vid = strstr(p->vi->msl, "gl_VertexIndex") != NULL;
+        compile_program(p);
+    } else {
+        if (!p->vi) p->vi = calloc(1, sizeof *p->vi);  // (gone from cache/xlat: never ready, the game's own builds instead)
+        if (!p->fi) p->fi = calloc(1, sizeof *p->fi);
+        set_state(&p->state, 2);
+    }
+    for (int i = 0; i < w->npipes; i++) {
+        if (atomic_load(&p->state) == 1) build_pipeline(w->pipes[i]);
+        else set_state(&w->pipes[i]->state, 2);
+    }
+    warm_done(1);
+}
+
+// The program the game binds, if it was prebuilt: its translations' hashes as translate_program would compute them
+static Prog *warm_find(NvnProgram *np, const ShaderKey *vkey, const ShaderKey *fkey) {
+    if (!nwarm_progs || maxwell_dbg_code) return NULL;
+    maxwell_gmem_base = HEAP_BASE;  // (as translate_program: part of the hash)
+    maxwell_gmem_size = HEAP_MAX;
+    const uint8_t *vc = (const uint8_t *)(uintptr_t)np->stages[0].code_addr, *fc = (const uint8_t *)(uintptr_t)np->stages[1].code_addr;
+    size_t vmax = np->stages[0].const_offset ? np->stages[0].const_offset : 0x10000;
+    size_t fmax = np->stages[1].const_offset ? np->stages[1].const_offset : 0x10000;
+    size_t vn = maxwell_input_size(vc, vmax, STAGE_VERTEX);
+    if (!vn) return NULL;
+    uint64_t vxh = xlat_hash(vc, vn, STAGE_VERTEX, vkey);
+    ShaderKey fk = *fkey;
+    if (!warm_vs_mask(vxh, &fk.vs_out_mask)) return NULL;
+    size_t fn = maxwell_input_size(fc, fmax, STAGE_FRAGMENT);
+    if (!fn) return NULL;
+    WarmProg *w = warm_prog_slot(vxh, xlat_hash(fc, fn, STAGE_FRAGMENT, &fk), false);
+    if (!w) return NULL;
+    if (!atomic_load(&w->taken)) run_job(warm_build, w);  // (needed now: ahead of the rest of the prewarm)
+    return w->p;
+}
+
+// At the first draw: the recorded programs and pipelines, queued to be built
+static void warm_start(void) {
+    static bool started;
+    if (started || warm_off()) return;
+    started = true;
+    FILE *f = fopen("cache/warm.bin", "rb");
+    if (!f) return;
+    uint32_t hdr[4] = {0};
+    if (fread(hdr, sizeof hdr, 1, f) != 1 || hdr[0] != WARM_MAGIC || hdr[1] != WARM_VERSION || hdr[2] != sizeof(WarmRec)) {
+        fclose(f);
+        LOG("[shader] cache/warm.bin is from another version: starting a new one\n");
+        remove("cache/warm.bin");
+        return;
+    }
+    warm_t0 = SDL_GetTicksNS();
+    WarmRec r;
+    warm_pipes = calloc(WARM_PIPES, sizeof *warm_pipes);
+    pthread_mutex_lock(&warm_lock);
+    while (fread(&r, sizeof r, 1, f) == 1 && nwarm_pipes < WARM_PIPES) {
+        if (!warm_seen_add(hash_words(0xcbf29ce484222325ull, &r, sizeof r))) continue;
+        WarmProg *w = warm_prog_slot(r.xh[0], r.xh[1], true);
+        if (!w) continue;
+        if (!w->p) {
+            w->p = calloc(1, sizeof *w->p);
+            w->p->warm = true;
+            w->p->xh[0] = r.xh[0];
+            w->p->xh[1] = r.xh[1];
+            w->vs_out_mask = r.vs_out_mask;
+        }
+        Pipe *pp = calloc(1, sizeof *pp);
+        pp->k = r.k;
+        pp->k.prog = w->p;
+        if (w->npipes == w->cap) { w->cap = w->cap ? w->cap * 2 : 4; w->pipes = realloc(w->pipes, w->cap * sizeof *w->pipes); }
+        w->pipes[w->npipes++] = pp;
+        warm_pipes[nwarm_pipes++] = pp;
+        warm_insert(pp);
+    }
+    pthread_mutex_unlock(&warm_lock);
+    fclose(f);
+    if (!nwarm_progs) return;
+    LOG("[shader] prewarm: building %d programs, %d pipelines from earlier sessions\n", nwarm_progs, nwarm_pipes);
+    atomic_store(&warm_left, nwarm_progs);
+    for (int i = 0; i < WARM_PROGS; i++)
+        if (warm_progs[i].p) run_job_at(warm_build, &warm_progs[i], true);
 }
 
 // ================================================================== feedback snapshots (renderer.m resolve_feedback)
@@ -2518,6 +2754,7 @@ static int g_cs_n;  // (compute program table below)
 void vk_exec_reset(void) {
     memset(prog_tab, 0, sizeof prog_tab);
     memset(pipe_tab, 0, sizeof pipe_tab);
+    for (int i = 0; i < nwarm_pipes; i++) warm_insert(warm_pipes[i]);  // (by content: still valid)
     g_cs_n = 0;
     gcopy_gen++;
     if (gmem_buf) {
@@ -2720,7 +2957,7 @@ static void build_compute(void *arg) {
     CsProg *cp = arg;
     size_t n = 0;
     uint32_t *spv = vk_glsl_to_spirv(cp->si->msl, STAGE_COMPUTE, "cs", &n);
-    if (!spv) { atomic_store(&cp->p.state, 2); return; }
+    if (!spv) { set_state(&cp->p.state, 2); return; }
     cp->p.nbinds = vk_reflect(spv, n, cp->p.binds, MAX_BIND);
     VkShaderModule m = vk_module(spv, n);
     free(spv);
@@ -2737,7 +2974,7 @@ static void build_compute(void *arg) {
                                       .layout = cp->p.layout};
     VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
     atomic_fetch_add(&stat_compiles, 1);
-    atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
+    set_state(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
     if (r != VK_SUCCESS) LOG("[compute] pipeline failed: %d\n", r);
 }
 
@@ -2758,11 +2995,11 @@ static CsProg *compute_program(NvnProgram *np, uint32_t bufmask) {
     k.glsl = 1;
     key_set_buf_mask(&k, bufmask);
     cp->si = translate_cached((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000,
-                              STAGE_COMPUTE, &k);
+                              STAGE_COMPUTE, &k, NULL);
     cp->p.vi = cp->si;
     if (!cp->si->msl) {
         LOG("[compute] translate failed: %s (code %llx)\n", cp->si->error, (unsigned long long)ss->code_addr);
-        atomic_store(&cp->p.state, 2);
+        set_state(&cp->p.state, 2);
         return cp;
     }
     for (int i = 0; i < 3; i++) {

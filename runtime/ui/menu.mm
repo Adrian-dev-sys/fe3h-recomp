@@ -493,11 +493,11 @@ static void tab_display(void) {
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
     static const char *waits[] = {"Off", "Balanced", "Full"};
-    opt_choice("Wait for shaders", &g_settings.shader_wait, waits, 3, SHADER_WAIT_FULL,
-               "What happens when something appears whose shaders are still being prepared (mostly the first time "
-               "you see it; they're kept on disk for later sessions).\n\nFull: the frame waits for them (up to 50 ms), "
-               "so nothing pops in; the first visit to an area may pause briefly. Balanced: waits a few ms, then draws "
-               "without them. Off: never waits; the smoothest, but things can pop in for a frame or two.");
+    opt_choice("Wait for shaders", &g_settings.shader_wait, waits, 3, SHADER_WAIT_BALANCED,
+               "What happens when something appears whose shaders aren't ready yet. Shaders seen in earlier sessions "
+               "are prepared while the game starts, so this mostly matters for things you're seeing for the first "
+               "time.\n\nBalanced: waits a few ms, then draws without them. Full: waits up to 50 ms, so nothing pops "
+               "in, but a new area may hitch. Off: never waits; things can pop in for a frame or two.");
 
     opt_end();
 }

@@ -12,7 +12,7 @@ enum { UPSCALE_BILINEAR = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /
 #define UPSCALE_SHARP UPSCALE_FSR1
 #endif
 enum { AA_OFF = 0, AA_SMAA = 1 };
-// Draws whose shaders are still being built: skipped (OFF: pop-in), or waited for up to a few ms a frame (BALANCED) or
+// Draws whose shaders are still being built: skipped (OFF: pop-in), or waited for up to 4 ms a frame (BALANCED) or
 // up to 50 ms a frame (FULL): runtime/nvn/vulkan/exec.c wait_built
 enum { SHADER_WAIT_OFF = 0, SHADER_WAIT_BALANCED = 1, SHADER_WAIT_FULL = 2 };
 enum { PROMPTS_AUTO = 0, PROMPTS_NINTENDO = 1, PROMPTS_XBOX = 2, PROMPTS_PLAYSTATION = 3 };
