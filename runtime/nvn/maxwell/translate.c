@@ -1714,6 +1714,53 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             }
         }
         sp(&c->body, "    }\n");
+    } else if (OPM(0x5bd0000000000000ull, 0xfff8000000000000ull) || OPM(0x4bd0000000000000ull, 0xfff8000000000000ull) ||
+               OPM(0x36d0000000000000ull, 0xfef8000000000000ull)) {  // LEA (.LO): Rd = B + (A << scale)
+        // B: register (20) / constant / immediate as other ALU ops; scale 39-43, .NEG 45 (A negated first)
+        if (bits(w, 46, 1) || bits(w, 47, 1) || bits(w, 48, 3) != PT) { fail(c, "LEA .X / .CC / predicate out at %#x", pc); return; }
+        const char *bv = B(false);
+        sprintf(t, "(%s + (%s%s << %uu))", bv, bits(w, 45, 1) ? "-" : "", R(a), (unsigned)bits(w, 39, 5));
+        set_reg(c, d, t);
+    } else if (OPM(0x5bd8000000000000ull, 0xfff8000000000000ull) || OPM(0x1800000000000000ull, 0xfe00000000000000ull)) {  // LEA.HI
+        // Rd = B + low word of ((C:A as 64 bits, negated with .NEG) >> (32 - scale)): the high word of a scaled 64-bit
+        // address. Register form: B = R20, C = R39, scale 28-32, .NEG 37, .X 38; constant form: B = c[34][20],
+        // C = R39, scale 51-55, .NEG 56, .X 57.
+        bool rform = (w >> 56) == 0x5b;
+        int scale = (int)(rform ? bits(w, 28, 5) : bits(w, 51, 5));
+        bool neg = rform ? bits(w, 37, 1) : bits(w, 56, 1), x = rform ? bits(w, 38, 1) : bits(w, 57, 1);
+        if (x || bits(w, 47, 1) || bits(w, 48, 3) != PT) { fail(c, "LEA.HI .X / .CC / predicate out at %#x", pc); return; }
+        char cb[256];
+        const char *bv = rform ? R((int)bits(w, 20, 8)) : cbuf_ref(c, (int)bits(w, 34, 5), bits(w, 20, 14) * 4, NULL, cb);
+        const char *hi = R((int)bits(w, 39, 8));
+        char off[160];
+        sprintf(off, neg ? "(0ul - (ulong(%s) << 32 | ulong(%s)))" : "(ulong(%s) << 32 | ulong(%s))", hi, R(a));
+        sprintf(t, "(%s + uint(%s >> %du))", bv, off, 32 - scale);
+        set_reg(c, d, t);
+    } else if (OPM(0xed00000000000000ull, 0xff00000000000000ull)) {  // ATOM (global memory)
+        // Rd = old value at [Ra (+ Ra+1 << 32 with .E, 48) + imm20 (28)], combined with Rb; size 49-51, op 52-55.
+        // 32-bit only, compute only: on the gfast copy when the address is in it, else the heap (as LDG / STG).
+        if (!c->glsl || c->stage != STAGE_COMPUTE) { fail(c, "ATOM outside a GLSL compute shader at %#x", pc); return; }
+        int size = (int)bits(w, 49, 3), aop = (int)bits(w, 52, 4);
+        int64_t off = sbits(w, 28, 20);
+        static const char *const fn[] = {"atomicAdd", "atomicMin", "atomicMax", NULL, NULL, "atomicAnd", "atomicOr", "atomicXor", "atomicExchange"};
+        if (size > 1 || aop > 8 || !fn[aop] || (size == 1 && (aop == 1 || aop == 2))) {
+            fail(c, "ATOM size %d op %d at %#x", size, aop, pc);
+            return;
+        }
+        c->info->uses_gmem = c->info->uses_gmem_map = c->info->uses_gmem_store = true;
+        c->uses_gmem_store = true;
+        char addr[256];
+        if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
+        else if (bits(w, 48, 1)) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);
+        else sprintf(addr, "(ulong(%s) + ulong(%lld))", R(a), (long long)off);
+        const char *bv = R((int)bits(w, 20, 8));
+        sp(&c->body, "    { ulong ga = %s - 0x%llxul; bool ok = ga < 0x%llxul; uint ov_ = 0u;\n", addr,
+           (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size);
+        sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
+        sp(&c->body, "      if (fw != 0xFFFFFFFFu) ov_ = %s(gfast_.w[fw], %s); else if (ok) ov_ = %s(gmem_.w[uint(ga >> 2)], %s);\n",
+           fn[aop], bv, fn[aop], bv);
+        if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = ov_;\n", d); }
+        sp(&c->body, "    }\n");
     } else if (OPM(0xec00000000000000ull, 0xff00000000000000ull)) {  // ATOMS
         // atomic on compute shared memory: Rd = old value at [Ra + imm22 * 4], combined with Rb. 32-bit only.
         if (!c->glsl || c->stage != STAGE_COMPUTE) { fail(c, "ATOMS outside a GLSL compute shader at %#x", pc); return; }
