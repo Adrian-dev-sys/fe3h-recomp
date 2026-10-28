@@ -748,17 +748,23 @@ bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
 // more later, every time something was first seen. With the translations, SPIR-V and pipelines kept on disk most
 // builds take a millisecond or two, so the draw waits for them instead, up to a budget a frame (the menu's "Wait for
 // shaders": Full 50 ms, Balanced 4 ms, Off none) - past it the frame goes on and the rest are skipped as before.
+// A build still not done after a whole frame's budget of waiting is a long one (a driver compile never seen before):
+// it isn't waited for again - its draws are skipped until it's ready, instead of each frame losing its budget to it.
 static _Atomic uint64_t wait_budget_ns, stat_build_wait_ns;
+static uint64_t wait_frame_ns;
 static void wait_budget_reset(void) {
     static const uint64_t budget_ms[3] = {0, 4, 50};  // (Off, Balanced, Full)
-    atomic_store(&wait_budget_ns, budget_ms[g_settings.shader_wait % 3] * 1000000ull);
+    wait_frame_ns = budget_ms[g_settings.shader_wait % 3] * 1000000ull;
+    atomic_store(&wait_budget_ns, wait_frame_ns);
 }
-// true when ready (state 1), after waiting for it to finish building within the frame's budget
-static bool wait_built(_Atomic int *state) {
+// true when ready (state 1), after waiting for it to finish building within the frame's budget. waited_ns: the
+// object's own total so far.
+static bool wait_built(_Atomic int *state, uint64_t *waited_ns) {
     int s = atomic_load(state);
     if (s != 0) return s == 1;
     uint64_t left = atomic_load(&wait_budget_ns);
-    if (!left) return false;
+    if (!left || *waited_ns >= wait_frame_ns) return false;
+    if (left > wait_frame_ns - *waited_ns) left = wait_frame_ns - *waited_ns;
     uint64_t t0 = SDL_GetTicksNS(), el = 0;
     struct timespec dl;
     clock_gettime(CLOCK_REALTIME, &dl);
@@ -770,7 +776,9 @@ static bool wait_built(_Atomic int *state) {
         if (pthread_cond_timedwait(&built_cond, &built_lock, &dl)) { s = atomic_load(state); break; }
     pthread_mutex_unlock(&built_lock);
     el = SDL_GetTicksNS() - t0;
-    atomic_store(&wait_budget_ns, el < left ? left - el : 0);
+    *waited_ns += el;
+    uint64_t all = atomic_load(&wait_budget_ns);
+    atomic_store(&wait_budget_ns, el < all ? all - el : 0);
     atomic_fetch_add(&stat_build_wait_ns, el);
     return s == 1;
 }
@@ -1334,6 +1342,7 @@ typedef struct {
     bool vs_uses_vid;
     uint64_t xh[2];     // the translations' cache hashes (cache/xlat): the program by content, 0 when not cached
     bool warm;          // prebuilt at launch (prewarm below)
+    uint64_t waited_ns; // draws' time waiting for it to build (wait_built)
     _Atomic int state;  // 0 building, 1 ready, 2 failed
 } Prog;
 
@@ -1720,7 +1729,7 @@ typedef struct {
     uint32_t write_mask[8];
 } PipeKey;
 
-typedef struct { PipeKey k; uint64_t hash; VkPipeline pipe; _Atomic int state; } Pipe;  // state: 0 building, 1 ready, 2 failed
+typedef struct { PipeKey k; uint64_t hash; VkPipeline pipe; _Atomic int state; uint64_t waited_ns; } Pipe;  // state: 0 building, 1 ready, 2 failed
 #define PIPE_TAB 32768
 static struct { uint64_t key; Pipe *pipe; } pipe_tab[PIPE_TAB];
 
@@ -1971,11 +1980,23 @@ static void warm_start(void) {
     warm_t0 = SDL_GetTicksNS();
     WarmRec r;
     warm_pipes = calloc(WARM_PIPES, sizeof *warm_pipes);
+    WarmRec *live = malloc(WARM_PIPES * sizeof *live);  // (records whose translations are still cached)
+    int nlive = 0, ndead = 0;
     pthread_mutex_lock(&warm_lock);
     while (fread(&r, sizeof r, 1, f) == 1 && nwarm_pipes < WARM_PIPES) {
+        // (a translator update retires every cached translation: their records go too, rewritten below)
+        bool have = warm_prog_slot(r.xh[0], r.xh[1], false) != NULL;
+        if (!have) {
+            char p0[64], p1[64];
+            struct stat sb;
+            snprintf(p0, sizeof p0, "cache/xlat/%016llx.bin", (unsigned long long)r.xh[0]);
+            snprintf(p1, sizeof p1, "cache/xlat/%016llx.bin", (unsigned long long)r.xh[1]);
+            if (stat(p0, &sb) || stat(p1, &sb)) { ndead++; continue; }
+        }
         if (!warm_seen_add(hash_words(0xcbf29ce484222325ull, &r, sizeof r))) continue;
         WarmProg *w = warm_prog_slot(r.xh[0], r.xh[1], true);
         if (!w) continue;
+        live[nlive++] = r;
         if (!w->p) {
             w->p = calloc(1, sizeof *w->p);
             w->p->warm = true;
@@ -1991,8 +2012,17 @@ static void warm_start(void) {
         warm_pipes[nwarm_pipes++] = pp;
         warm_insert(pp);
     }
-    pthread_mutex_unlock(&warm_lock);
     fclose(f);
+    if (ndead) {  // (the file without them)
+        FILE *o = fopen("cache/warm.bin.tmp", "wb");
+        bool ok = o && fwrite(hdr, sizeof hdr, 1, o) == 1 && (int)fwrite(live, sizeof *live, nlive, o) == nlive;
+        if (o && fclose(o)) ok = false;
+        if (ok) { remove("cache/warm.bin"); ok = !rename("cache/warm.bin.tmp", "cache/warm.bin"); }
+        if (!ok) remove("cache/warm.bin.tmp");
+        LOG("[shader] prewarm: %d records dropped (their translations are from an older translator)\n", ndead);
+    }
+    pthread_mutex_unlock(&warm_lock);
+    free(live);
     if (!nwarm_progs) return;
     LOG("[shader] prewarm: building %d programs, %d pipelines from earlier sessions\n", nwarm_progs, nwarm_pipes);
     atomic_store(&warm_left, nwarm_progs);
@@ -3018,13 +3048,13 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     // the same compute shader again for every graphics combination)
     NvnProgram *csp = st.stage_prog[5] ? st.stage_prog[5] : st.program;
     CsProg *cp = compute_program(csp, 0);
-    if (!cp || !wait_built(&cp->p.state))
+    if (!cp || !wait_built(&cp->p.state, &cp->p.waited_ns))
         SKIP(SK_CS_PROG, "compute code %llx state %d\n", (unsigned long long)st.program->stages[5].code_addr, cp ? atomic_load(&cp->p.state) : -1);
     {
         uint32_t m = buffer_texture_mask(5, cp->si);
         if (m) {
             cp = compute_program(csp, m);
-            if (!cp || !wait_built(&cp->p.state)) SKIP(SK_CS_PROG, "buffer-texture compute variant building\n");
+            if (!cp || !wait_built(&cp->p.state, &cp->p.waited_ns)) SKIP(SK_CS_PROG, "buffer-texture compute variant building\n");
         }
     }
     {   // LARECOMP_SKIP_CS=<code address hex> (debug): skip that compute shader's dispatches, to see what it does
@@ -3120,7 +3150,7 @@ static void draw_(CmdRec *r, bool indexed) {
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
     Prog *pr = get_program(st.program, &vkey, &fkey);
-    if (!pr || !wait_built(&pr->state))
+    if (!pr || !wait_built(&pr->state, &pr->waited_ns))
         SKIP(SK_PROG, "vs %llx fs %llx state %d\n", (unsigned long long)st.program->stages[0].code_addr,
              (unsigned long long)st.program->stages[1].code_addr, pr ? atomic_load(&pr->state) : -1);
     {   // buffer textures bound to the fragment shader's 1D slots: the variant that reads them from the guest heap
@@ -3128,7 +3158,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (m) {
             key_set_buf_mask(&fkey, m);
             pr = get_program(st.program, &vkey, &fkey);
-            if (!pr || !wait_built(&pr->state)) SKIP(SK_PROG, "buffer-texture variant building\n");
+            if (!pr || !wait_built(&pr->state, &pr->waited_ns)) SKIP(SK_PROG, "buffer-texture variant building\n");
         }
     }
     g_mirror_w = 0;
@@ -3144,7 +3174,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (mirror_draw(composite)) {
             vkey.flip_x = fkey.flip_x = true;
             pr = get_program(st.program, &vkey, &fkey);
-            if (!pr || !wait_built(&pr->state)) SKIP(SK_PROG_MIRROR, "\n");
+            if (!pr || !wait_built(&pr->state, &pr->waited_ns)) SKIP(SK_PROG_MIRROR, "\n");
             g_mirror_w = (float)st.rt.color[0]->width;
         }
     }
@@ -3250,7 +3280,7 @@ static void draw_(CmdRec *r, bool indexed) {
         pipe_tab[pslot].pipe = pp;
         run_job(build_pipeline, pp);
     }
-    if (!wait_built(&pp->state)) SKIP(SK_PIPE, "state %d\n", atomic_load(&pp->state));
+    if (!wait_built(&pp->state, &pp->waited_ns)) SKIP(SK_PIPE, "state %d\n", atomic_load(&pp->state));
     ss_enabled();
     if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
     uint64_t prof_td_ = prof ? SDL_GetTicksNS() : 0;
