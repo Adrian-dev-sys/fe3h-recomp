@@ -37,6 +37,7 @@ typedef struct {
     bool custom_border, divisor, host_import;
     // VK_EXT_depth_bias_control: depth bias in 24-bit units on the float depth that stands in for DEPTH24 (exec.c)
     bool bias_unorm, bias_exact;
+    bool storage_images;  // shaderStorageImageWriteWithoutFormat: compute shaders can store to images (SUST)
     bool cs_subgroup32;  // compute pipelines run with 32-lane subgroups (as the Switch's warps; VK 1.3 size control)
     PFN_vkCmdSetDepthBias2EXT set_bias2;
     // window
@@ -90,6 +91,7 @@ typedef struct TexBackend {
     int tp;              // runtime/nvn/texpatch.c: 0 not checked yet, -1 none, else known UI texture + 1
     uint32_t tp_gen;     // texpatch_generation() it was last uploaded with
     int reg;  // slot in textures.c's live list + 1 (a reboot destroys them all)
+    VkFormat storage_fmt;  // NVN image textures (compute stores): the view format for that, else VK_FORMAT_UNDEFINED
 } TexBackend;
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)

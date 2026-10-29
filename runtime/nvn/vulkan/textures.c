@@ -173,6 +173,7 @@ uint64_t renderer_present_count(void);
 static bool tex_scalable(const NvnTexture *t) {
     if (getenv("LARECOMP_NO_SCALE")) return false;
     if (t->target != 1 || t->samples > 1 || !(t->flags & 8) || t->width < 32 || t->height < 16) return false;
+    if (t->flags & 4) return false;  // (NVN image textures: compute shaders store at their texel coordinates)
     float a = (float)t->width / (float)t->height;
     return a > 1.74f && a < 1.81f;
 }
@@ -315,6 +316,21 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     else if (format_supports(vf, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     VkImageCreateFlags flags = 0;
     if (!depthfmt) flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // format views (NVN texture views, raw sRGB views)
+    // NVN image textures (flag 4): stored to by compute shaders (SUST) - storage usage, in the format itself or, for
+    // the sRGB ones, through a UNORM view (extended usage)
+    VkFormat storage_fmt = VK_FORMAT_UNDEFINED;
+    if ((t->flags & 4) && !depthfmt && samples == 1 && g_vk.storage_images) {
+        VkFormat sf = vf == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM : vf == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM
+                    : vf == VK_FORMAT_A8B8G8R8_SRGB_PACK32 ? VK_FORMAT_A8B8G8R8_UNORM_PACK32 : vf;
+        if (format_supports(sf, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+            storage_fmt = sf;
+            usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+            if (sf != vf) flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+        } else {
+            static int nlog;
+            if (nlog++ < 10) LOG("[vk] image texture: format %d (nvn %#x) can't be stored to by shaders\n", vf, t->format);
+        }
+    }
     if (type == VK_IMAGE_TYPE_2D && layers >= 6 && tw == th && samples == 1) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = type, .format = vf,
                             .extent = {tw, th, depth}, .mipLevels = levels, .arrayLayers = layers,
@@ -327,11 +343,13 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         ci.format = vf = VK_FORMAT_R8G8B8A8_UNORM;
         ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        ci.flags &= ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+        ci.flags &= ~(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
         VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL));
         depthfmt = false;
+        storage_fmt = VK_FORMAT_UNDEFINED;
     }
     b->format = vf;
+    b->storage_fmt = storage_fmt;
     b->width = tw; b->height = th; b->depth = depth; b->layers = layers; b->levels = levels; b->samples = samples;
     b->aspect = depthfmt ? aspect_of(t->format) : VK_IMAGE_ASPECT_COLOR_BIT;
     b->base_type = type == VK_IMAGE_TYPE_1D ? (layers > 1 ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D)

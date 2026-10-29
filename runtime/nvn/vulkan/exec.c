@@ -470,7 +470,8 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
             if (s->npools == 16) FATAL("descriptor pools exhausted\n");
             VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
                                             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
-                                            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024}};
+                                            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024},
+                                            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}};
             VkDescriptorPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 8192,
                                              .poolSizeCount = 5, .pPoolSizes = sizes};
             VK_CHECK(vkCreateDescriptorPool(g_vk.dev, &ci, NULL, &s->pools[s->npools++]));
@@ -2805,6 +2806,42 @@ void vk_exec_reset(void) {
     st_defaults();
 }
 
+// Images (SUST in compute shaders): their 64-bit handles follow the 32 textures' in the bound handles (0x120 on),
+// each the index of a texture pool entry registered as an image (nvnTexturePoolRegisterImage).
+static NvnTexEntry *image_entry(int stage, const ShaderTexture *st_) {
+    int slot = ((int)st_->handle_offset - 0x120) / 8;
+    uint64_t h = (slot >= 0 && slot < 8) ? st.img[stage][slot] : 0;
+    uint32_t tic = h & 0xFFFFF;
+    if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
+    NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
+    return e->tex ? e : NULL;
+}
+
+// A storage view of the image (one level), or VK_NULL_HANDLE when it can't be stored to: its writes are kept as the
+// GPU's (never re-uploaded from guest memory over them).
+static VkImageView image_view(int stage, const ShaderTexture *st_) {
+    NvnTexEntry *e = image_entry(stage, st_);
+    if (!e) return VK_NULL_HANDLE;
+    TexBackend *b = vk_tex(e->tex, false);  // (its data uploaded first if the CPU wrote it)
+    if (!b->storage_fmt || rt_kind(e->tex->format)) {  // (integer formats: the translator stores floats)
+        static int nlog;
+        if (nlog++ < 10) LOG("[vk] image %p (nvn fmt %#x flags %#x) isn't a storage image: compute store skipped\n", (void *)e->tex,
+                             e->tex->format, e->tex->flags);
+        return VK_NULL_HANDLE;
+    }
+    b->gpu_owned = true;
+    uint32_t lv = e->has_view && (e->view.setmask & 1) ? e->view.base_level : 0;
+    if (lv >= b->levels) lv = 0;
+    VkImageViewType vt = st_->type == TEXTYPE_1D ? VK_IMAGE_VIEW_TYPE_1D : st_->type == TEXTYPE_3D ? VK_IMAGE_VIEW_TYPE_3D
+                       : st_->type == TEXTYPE_2D_ARRAY ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    bool want3d = vt == VK_IMAGE_VIEW_TYPE_3D, have3d = b->base_type == VK_IMAGE_VIEW_TYPE_3D;
+    if (want3d != have3d) return VK_NULL_HANDLE;
+    static const VkComponentMapping id = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                                          VK_COMPONENT_SWIZZLE_IDENTITY};
+    uint32_t nly = vt == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? b->layers : 1;
+    return vk_image_view(b, vt, b->storage_fmt, lv, 1, 0, have3d ? 1 : nly, id, VK_IMAGE_ASPECT_COLOR_BIT);
+}
+
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
     ShaderTexture *st_ = &si->tex[i];
     int slot = ((int)st_->handle_offset - 0x20) / 8;  // 64-bit handles from offset 0x20
@@ -2881,6 +2918,11 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 tex_sc[sg][ti][0] = sc[0]; tex_sc[sg][ti][1] = sc[1];
                 tex_wh[sg][ti][0] = wh[0]; tex_wh[sg][ti][1] = wh[1];
             }
+            w[n].pImageInfo = &ii[n];
+        } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && b->binding >= 32) {
+            int ti = (int)b->binding - 32;
+            VkImageView v = ti < si->ntex ? image_view(stage, &si->tex[ti]) : VK_NULL_HANDLE;  // (checked before: images_ready)
+            ii[n] = (VkDescriptorImageInfo){VK_NULL_HANDLE, v, VK_IMAGE_LAYOUT_GENERAL};
             w[n].pImageInfo = &ii[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding < 17) {
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
@@ -3075,6 +3117,12 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
             LOG("\n");
         }
     }
+    bool images = false;  // (SUST) every image the shader stores to: storable, else the dispatch is skipped
+    for (int i = 0; i < cp->si->ntex; i++)
+        if (cp->si->tex[i].is_image) {
+            images = true;
+            if (!image_view(5, &cp->si->tex[i])) SKIP(SK_CS_PROG, "image %d not storable\n", i);
+        }
     vk_end_pass();
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
@@ -3095,6 +3143,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
     vkCmdDispatch(cb, gx, gy, gz);
+    if (images) vk_full_barrier(cb);  // (its image stores, before they're sampled)
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
     if (cp->si->uses_gmem_store) vc_mark_sbufs(5);
     stat_dispatches++;
