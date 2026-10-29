@@ -604,6 +604,9 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size) {
 typedef struct Job { void (*fn)(void *); void *arg; struct Job *next; } Job;
 static Job *jobs_head, *jobs_tail;
 static Job *ljobs_head, *ljobs_tail;  // low priority (prewarm, below): taken when nothing else is waiting
+static _Atomic int jobs_queued, jobs_running, nworkers;  // (high-priority jobs; the stats line and wait_built)
+static Job *heavy_head, *heavy_tail;  // builds of very large shaders: their own thread (heavy_worker), so a driver
+static pthread_cond_t heavy_cond = PTHREAD_COND_INITIALIZER;  // compile taking minutes can't hold up the others
 static pthread_mutex_t jobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
@@ -627,11 +630,29 @@ static void *worker(void *a) {
             j = jobs_head;
             jobs_head = j->next;
             if (!jobs_head) jobs_tail = NULL;
+            atomic_fetch_sub(&jobs_queued, 1);
         } else {
             j = ljobs_head;
             ljobs_head = j->next;
             if (!ljobs_head) ljobs_tail = NULL;
         }
+        pthread_mutex_unlock(&jobs_lock);
+        atomic_fetch_add(&jobs_running, 1);
+        j->fn(j->arg);
+        atomic_fetch_sub(&jobs_running, 1);
+        free(j);
+    }
+    return NULL;
+}
+
+static void *heavy_worker(void *a) {
+    (void)a;
+    for (;;) {
+        pthread_mutex_lock(&jobs_lock);
+        while (!heavy_head) pthread_cond_wait(&heavy_cond, &jobs_lock);
+        Job *j = heavy_head;
+        heavy_head = j->next;
+        if (!heavy_head) heavy_tail = NULL;
         pthread_mutex_unlock(&jobs_lock);
         j->fn(j->arg);
         free(j);
@@ -679,27 +700,53 @@ static void run_translate(void (*fn)(void *), void *arg) {
     pthread_mutex_unlock(&tjobs_lock);
 }
 
+static void start_workers(void) {
+    // first entry into an area builds dozens of pipelines at once: use most of the CPU (draws wait for them)
+    int n = SDL_GetNumLogicalCPUCores() - 4;
+    if (n < 4) n = 4;
+    if (n > 16) n = 16;
+    for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, worker, NULL); }
+    atomic_store(&nworkers, n);
+    pthread_t t;
+    pthread_create(&t, NULL, heavy_worker, NULL);
+}
+static pthread_once_t workers_once = PTHREAD_ONCE_INIT;
+
 static void run_job_at(void (*fn)(void *), void *arg, bool low) {
     if (sync_shaders()) { fn(arg); return; }
-    static bool started;
-    if (!started) {
-        started = true;
-        // first entry into an area builds dozens of pipelines at once: use most of the CPU (draws wait for them)
-        int n = SDL_GetNumLogicalCPUCores() - 4;
-        if (n < 4) n = 4;
-        if (n > 16) n = 16;
-        for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, worker, NULL); }
-    }
+    pthread_once(&workers_once, start_workers);
     Job *j = malloc(sizeof *j);
     j->fn = fn; j->arg = arg; j->next = NULL;
     pthread_mutex_lock(&jobs_lock);
     Job **head = low ? &ljobs_head : &jobs_head, **tail = low ? &ljobs_tail : &jobs_tail;
     if (*tail) (*tail)->next = j; else *head = j;
     *tail = j;
+    if (!low) atomic_fetch_add(&jobs_queued, 1);
     pthread_cond_signal(&jobs_cond);
     pthread_mutex_unlock(&jobs_lock);
 }
 static void run_job(void (*fn)(void *), void *arg) { run_job_at(fn, arg, false); }
+static void run_heavy_job(void (*fn)(void *), void *arg) {
+    if (sync_shaders()) { fn(arg); return; }
+    pthread_once(&workers_once, start_workers);
+    Job *j = malloc(sizeof *j);
+    j->fn = fn; j->arg = arg; j->next = NULL;
+    pthread_mutex_lock(&jobs_lock);
+    if (heavy_tail) heavy_tail->next = j; else heavy_head = j;
+    heavy_tail = j;
+    pthread_cond_signal(&heavy_cond);
+    pthread_mutex_unlock(&jobs_lock);
+}
+
+// Builds slower than a quarter second are logged (what, how long, where the time went)
+static void slow_build_log(const char *what, uint64_t code, uint32_t insts, uint64_t t0, uint64_t t_spirv) {
+    uint64_t t1 = SDL_GetTicksNS();
+    if (t1 - t0 < 250000000ull) return;
+    static _Atomic int nlog;
+    if (atomic_fetch_add(&nlog, 1) < 40)
+        LOG("[shader] slow build: %s %llx (%u instructions) %.2f s (GLSL to SPIR-V %.2f s, driver %.2f s)\n", what,
+            (unsigned long long)code, insts, (t1 - t0) / 1e9, (t_spirv - t0) / 1e9, (t1 - t_spirv) / 1e9);
+}
 
 // ================================================================== state
 typedef struct {
@@ -765,6 +812,7 @@ static bool wait_built(_Atomic int *state, uint64_t *waited_ns) {
     if (s != 0) return s == 1;
     uint64_t left = atomic_load(&wait_budget_ns);
     if (!left || *waited_ns >= wait_frame_ns) return false;
+    if (atomic_load(&jobs_queued) > atomic_load(&nworkers)) return false;  // (a backlog: it won't be done in time)
     if (left > wait_frame_ns - *waited_ns) left = wait_frame_ns - *waited_ns;
     uint64_t t0 = SDL_GetTicksNS(), el = 0;
     struct timespec dl;
@@ -819,6 +867,11 @@ const char *renderer_stats(void) {
             size_t n = strlen(stats_text);
             snprintf(stats_text + n, sizeof stats_text - n, ", xlat %llu cached / %llu new %.0fms", (unsigned long long)hit,
                      (unsigned long long)miss, ns / 1e6);
+        }
+        int q = atomic_load(&jobs_queued);
+        if (q) {
+            size_t n = strlen(stats_text);
+            snprintf(stats_text + n, sizeof stats_text - n, ", %d builds queued", q);
         }
         uint64_t w = atomic_exchange(&stat_build_wait_ns, 0);
         if (w) {
@@ -1449,6 +1502,7 @@ static ShaderInfo *translate_cached(const uint8_t *blob, size_t max_size, int st
 static void compile_program(void *arg) {
     Prog *p = arg;
     size_t nv = 0, nf = 0;
+    uint64_t t0 = SDL_GetTicksNS();
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
     uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
     if (!sv || !sf) { free(sv); free(sf); set_state(&p->state, 2); return; }
@@ -1459,6 +1513,7 @@ static void compile_program(void *arg) {
     free(sv);
     free(sf);
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
+    slow_build_log("program vs/fs", p->code[1] ? p->code[1] : p->xh[1], p->fi->num_insts, t0, SDL_GetTicksNS());
     atomic_fetch_add(&stat_compiles, 1);
     set_state(&p->state, p->vs && p->fs ? 1 : 2);
 }
@@ -1810,7 +1865,9 @@ static void build_pipeline(void *arg) {
                                        .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = k->prog->layout};
+    uint64_t t0 = SDL_GetTicksNS();
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
+    slow_build_log("pipeline of vs/fs", k->prog->code[1] ? k->prog->code[1] : k->prog->xh[1], k->prog->fi ? k->prog->fi->num_insts : 0, t0, t0);
     if (r != VK_SUCCESS) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
@@ -3028,7 +3085,9 @@ typedef struct { Prog p; ShaderInfo *si; VkPipeline pipe; uint32_t local[3]; } C
 static void build_compute(void *arg) {
     CsProg *cp = arg;
     size_t n = 0;
+    uint64_t t0 = SDL_GetTicksNS();
     uint32_t *spv = vk_glsl_to_spirv(cp->si->msl, STAGE_COMPUTE, "cs", &n);
+    uint64_t t_spirv = SDL_GetTicksNS();
     if (!spv) { set_state(&cp->p.state, 2); return; }
     cp->p.nbinds = vk_reflect(spv, n, cp->p.binds, MAX_BIND);
     VkShaderModule m = vk_module(spv, n);
@@ -3045,6 +3104,7 @@ static void build_compute(void *arg) {
                                                 .pSpecializationInfo = &spec},
                                       .layout = cp->p.layout};
     VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
+    slow_build_log("compute shader", cp->p.code[0], cp->si->num_insts, t0, t_spirv);
     atomic_fetch_add(&stat_compiles, 1);
     set_state(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
     if (r != VK_SUCCESS) LOG("[compute] pipeline failed: %d\n", r);
@@ -3069,6 +3129,7 @@ static CsProg *compute_program(NvnProgram *np, uint32_t bufmask) {
     cp->si = translate_cached((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000,
                               STAGE_COMPUTE, &k, NULL);
     cp->p.vi = cp->si;
+    cp->p.code[0] = ss->code_addr;
     if (!cp->si->msl) {
         LOG("[compute] translate failed: %s (code %llx)\n", cp->si->error, (unsigned long long)ss->code_addr);
         set_state(&cp->p.state, 2);
@@ -3079,7 +3140,10 @@ static CsProg *compute_program(NvnProgram *np, uint32_t bufmask) {
         if (!cp->local[i]) cp->local[i] = 1;
     }
     save_glsl(cp->si->msl, ss->code_addr, "cs");
-    run_job(build_compute, cp);
+    // (very large ones - thousands of instructions, a subroutine-call state machine - on their own thread: a driver
+    // compile of minutes held up every other build, and new things went undrawn for the rest of the session)
+    if (cp->si->num_insts > 2000) run_heavy_job(build_compute, cp);
+    else run_job(build_compute, cp);
     return cp;
 }
 
