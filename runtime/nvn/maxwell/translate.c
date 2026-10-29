@@ -65,7 +65,7 @@ typedef struct {
     uint8_t pred_used[8];
     uint32_t in_attr_mask, out_attr_mask;
     uint32_t vs_in_comp[32];
-    bool uses_branches, uses_cc, uses_local, uses_shared, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane;
+    bool uses_branches, uses_cal, uses_cc, uses_local, uses_shared, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane;
     bool uses_rscale;  // resolution-scale table (fragment/compute only)
     uint64_t buf_used;  // texture slots read as buffer textures (bfetch<slot>)
     uint32_t flat_mask;           // fragment inputs using constant (flat) interpolation
@@ -976,6 +976,16 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         sp(&c->body, "    pcnt[pcnt_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xf0f8000000000000ull, 0xfff8000000000000ull)) {  // SYNC
         sp(&c->body, "    pc = ssy[--ssy_n]; continue;\n");
+    } else if (OPM(0xe260000000000000ull, 0xfff0000000000020ull)) {  // CAL: call a subroutine (relative), RET comes back
+        c->uses_branches = true; c->uses_cal = true;
+        sp(&c->body, "    if (cal_n < 16u) cal[cal_n++] = %uu; pc = %uu; continue;\n", norm_target((int64_t)pc + 8),
+           norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
+    } else if (OPM(0xe270000000000000ull, 0xfff0000000000020ull)) {  // PRET: push a return address for a later RET
+        c->uses_branches = true; c->uses_cal = true;
+        sp(&c->body, "    if (cal_n < 16u) cal[cal_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
+    } else if (OPM(0xe320000000000000ull, 0xfff0000000000000ull)) {  // RET
+        c->uses_cal = true;
+        sp(&c->body, "    if (cal_n == 0u) { exit_now = true; break; } pc = cal[--cal_n]; continue;\n");
     } else if (OPM(0xe340000000000000ull, 0xfff0000000000000ull)) {  // BRK
         sp(&c->body, "    pc = pbk[--pbk_n]; continue;\n");
     } else if (OPM(0xe350000000000000ull, 0xfff0000000000000ull)) {  // CONT
@@ -1761,6 +1771,57 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
            fn[aop], bv, fn[aop], bv);
         if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = ov_;\n", d); }
         sp(&c->body, "    }\n");
+    } else if (OPM(0xebf8000000000000ull, 0xfff8000000000000ull)) {  // RED (global memory reduction: ATOM without a result)
+        // value Rd (0), address Ra (8) (+ Ra+1 << 32 with .E, 48) + imm20 (28); size 20-22, op 23-25
+        if (!c->glsl || c->stage != STAGE_COMPUTE) { fail(c, "RED outside a GLSL compute shader at %#x", pc); return; }
+        int size = (int)bits(w, 20, 3), rop = (int)bits(w, 23, 3);
+        int64_t off = sbits(w, 28, 20);
+        static const char *const fn[] = {"atomicAdd", "atomicMin", "atomicMax", NULL, NULL, "atomicAnd", "atomicOr", "atomicXor"};
+        if (size > 1 || !fn[rop] || (size == 1 && (rop == 1 || rop == 2))) { fail(c, "RED size %d op %d at %#x", size, rop, pc); return; }
+        c->info->uses_gmem = c->info->uses_gmem_map = c->info->uses_gmem_store = true;
+        c->uses_gmem_store = true;
+        char addr[256];
+        if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
+        else if (bits(w, 48, 1)) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);
+        else sprintf(addr, "(ulong(%s) + ulong(%lld))", R(a), (long long)off);
+        const char *v = R(d);
+        sp(&c->body, "    { ulong ga = %s - 0x%llxul; bool ok = ga < 0x%llxul;\n", addr,
+           (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size);
+        sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
+        sp(&c->body, "      if (fw != 0xFFFFFFFFu) %s(gfast_.w[fw], %s); else if (ok) %s(gmem_.w[uint(ga >> 2)], %s);\n    }\n",
+           fn[rop], v, fn[rop], v);
+    } else if (OPM(0xeb20000000000000ull, 0xffe0000000000000ull)) {  // SUST (surface store)
+        // .P (formatted, bit 52 clear): Rd.. (0) are the components in the mask (20-23), as floats; coordinates from
+        // Ra (8); target 32-35 (0 1D, 6 2D, 8 2D array, 10 3D); the image: an immediate handle offset (bit 51, 36-48),
+        // in the bound image handles after the textures' (exec.c image_object). GLSL compute only.
+        if (!c->glsl || c->stage != STAGE_COMPUTE) { fail(c, "SUST outside a GLSL compute shader at %#x", pc); return; }
+        if (bits(w, 52, 1)) { fail(c, "SUST.B at %#x", pc); return; }
+        if (!bits(w, 51, 1)) { fail(c, "SUST with a register handle at %#x", pc); return; }
+        int tgt = (int)bits(w, 32, 4), type;
+        char co[160];
+        switch (tgt) {
+        case 0: type = TEXTYPE_1D; sprintf(co, "int(%s)", R(a)); break;
+        case 6: type = TEXTYPE_2D; sprintf(co, "ivec2(int(%s), int(%s))", R(a), R(a + 1)); break;
+        case 8: type = TEXTYPE_2D_ARRAY; sprintf(co, "ivec3(int(%s), int(%s), int(%s))", R(a), R(a + 1), R(a + 2)); break;
+        case 10: type = TEXTYPE_3D; sprintf(co, "ivec3(int(%s), int(%s), int(%s))", R(a), R(a + 1), R(a + 2)); break;
+        default: fail(c, "SUST target %d at %#x", tgt, pc); return;
+        }
+        int slot = tex_slot(c, (uint32_t)bits(w, 36, 13), type, false, tgt == 8);
+        if (c->fail) return;
+        c->info->tex[slot].is_image = true;
+        uint32_t mask = (uint32_t)bits(w, 20, 4);
+        char v[4][24];
+        int k = 0;
+        for (int i = 0; i < 4; i++) {
+            if ((mask >> i) & 1) { sprintf(v[i], "uintBitsToFloat(%s)", d + k < RZ ? R(d + k) : "0u"); k++; }
+            else strcpy(v[i], "0.0");
+        }
+        const char *cmp = tgt == 0 ? "uint(ic_) < uint(imageSize(t%d))" : tgt == 6 ? "all(lessThan(uvec2(ic_), uvec2(imageSize(t%d))))"
+                                                                         : "all(lessThan(uvec3(ic_), uvec3(imageSize(t%d))))";
+        char cond[96];
+        sprintf(cond, cmp, slot);
+        sp(&c->body, "    { %s ic_ = %s; if (%s) imageStore(t%d, ic_, vec4(%s, %s, %s, %s)); }\n",
+           tgt == 0 ? "int" : tgt == 6 ? "ivec2" : "ivec3", co, cond, slot, v[0], v[1], v[2], v[3]);
     } else if (OPM(0xec00000000000000ull, 0xff00000000000000ull)) {  // ATOMS
         // atomic on compute shared memory: Rd = old value at [Ra + imm22 * 4], combined with Rb. 32-bit only.
         if (!c->glsl || c->stage != STAGE_COMPUTE) { fail(c, "ATOMS outside a GLSL compute shader at %#x", pc); return; }
@@ -2087,6 +2148,13 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     }
     for (int i = 0; i < info->ntex; i++) {
         ShaderTexture *t = &info->tex[i];
+        if (t->is_image) {  // (SUST: a storage image, written without a declared format)
+            static const char *const it[] = {[TEXTYPE_1D] = "image1D", [TEXTYPE_2D] = "image2D", [TEXTYPE_2D_ARRAY] = "image2DArray",
+                                             [TEXTYPE_3D] = "image3D"};
+            const char *ty = t->type < (int)(sizeof it / sizeof *it) && it[t->type] ? it[t->type] : "image2D";
+            sp(&s, "layout(set = %d, binding = %d) uniform writeonly %s t%d;\n", set, 32 + i, ty, i);
+            continue;
+        }
         sp(&s, "layout(set = %d, binding = %d) uniform %s t%d;\n", set, 32 + i, glsl_sampler_type(t), i);
         // size of level l as (width, height, depth or layers)
         switch (t->type) {
@@ -2145,7 +2213,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (c->uses_local) sp(&s, "  uint lmem[%d]; for (int li_ = 0; li_ < %d; li_++) lmem[li_] = 0u;\n", LMEM_WORDS, LMEM_WORDS);
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
     if (any_branch) {
-        sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0u; uint pbk[16]; uint pbk_n = 0u; uint pcnt[16]; uint pcnt_n = 0u;\n");
+        sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0u; uint pbk[16]; uint pbk_n = 0u; uint pcnt[16]; uint pcnt_n = 0u;%s\n", c->uses_cal ? " uint cal[16]; uint cal_n = 0u;" : "");
         sp(&s, "  bool exit_now = false;\n");
         if (c->uses_bar_split) sp(&s, "  bool bar_now = false;\n  for (uint bar_i = 0u; bar_i < 256u; bar_i++) {\n");
         sp(&s, "  for (uint guard = 0u; guard < 100000u; guard++) {\n  switch (pc) {\n");
@@ -2287,6 +2355,8 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         uint64_t w = ((const uint64_t *)code)[i];
         uint32_t pc = (uint32_t)(i * 8);
         bool is_flow = (w & 0xfff0000000000020ull) == 0xe240000000000000ull ||
+                       (w & 0xfff0000000000020ull) == 0xe260000000000000ull ||  // CAL (its return point: below)
+                       (w & 0xfff0000000000020ull) == 0xe270000000000000ull ||  // PRET
                        (w & 0xfff0000000000020ull) == 0xe290000000000000ull ||
                        (w & 0xfff0000000000020ull) == 0xe2a0000000000000ull ||
                        (w & 0xfff0000000000020ull) == 0xe2b0000000000000ull;
@@ -2305,8 +2375,12 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             if (j < end) label[j] = 1;
         }
         if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull || (w & 0xfff0000000000000ull) == 0xe340000000000000ull ||
-            (w & 0xfff0000000000000ull) == 0xe350000000000000ull)
+            (w & 0xfff0000000000000ull) == 0xe350000000000000ull || (w & 0xfff0000000000000ull) == 0xe320000000000000ull)
             any_branch = true;
+        if ((w & 0xfff0000000000020ull) == 0xe260000000000000ull) {  // CAL: RET resumes at the next instruction
+            int64_t t = norm_target((int64_t)pc + 8);
+            if (t >= 0 && (size_t)(t / 8) < end) label[t / 8] = 1;
+        }
         (void)is_branch_target_op;
     }
     // translate
@@ -2433,7 +2507,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     if (c->uses_local) sp(&s, "  uint lmem[%d] = {};\n", LMEM_WORDS);
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
     if (any_branch) {
-        sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0; uint pbk[16]; uint pbk_n = 0; uint pcnt[16]; uint pcnt_n = 0;\n");
+        sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0; uint pbk[16]; uint pbk_n = 0; uint pcnt[16]; uint pcnt_n = 0;%s\n", c->uses_cal ? " uint cal[16]; uint cal_n = 0;" : "");
         sp(&s, "  bool exit_now = false;\n");
         sp(&s, "  for (uint guard = 0; guard < 100000u; guard++) {\n  switch (pc) {\n");
         sp(&s, "%s", c->body.buf ? c->body.buf : "");
