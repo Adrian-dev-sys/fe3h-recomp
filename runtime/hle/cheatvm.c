@@ -220,6 +220,17 @@ static uint64_t rd(uint64_t a, int width) {
 static void wr(uint64_t a, uint64_t v, int width, int owner) {
     if (width == 4 && in_main_text(a)) { code_write(a, (uint32_t)v, owner); return; }
     if (!mem_ok(a, width) || (width != 1 && width != 2 && width != 4 && width != 8)) return;
+    static int log = -1, nlog;
+    if (log < 0) log = getenv("LARECOMP_CHEAT_LOG") != NULL;
+    if (log && nlog < 500) {  // (debug) each memory write a cheat makes that changes something
+        uint64_t old = 0;
+        memcpy(&old, (void *)(uintptr_t)a, (size_t)width);
+        if (old != (width == 8 ? v : v & ((1ull << (width * 8)) - 1))) {
+            nlog++;
+            LOG("[cheats] %s: %u bytes at %llx (heap +%llx): %llx -> %llx\n", g_cheats[owner].name, width, (unsigned long long)a,
+                (unsigned long long)(a - HEAP_BASE), (unsigned long long)old, (unsigned long long)v);
+        }
+    }
     memcpy((void *)(uintptr_t)a, &v, (size_t)width);
 }
 
