@@ -352,29 +352,21 @@ class Module:
             return ['return;']
         raise Unsupported(k)
 
+    # A function this long (guest bytes) is emitted as parts of SPLIT_PART bytes, each a C function of its own (in
+    # files of their own: they compile in parallel). One function of megabytes of C compiled for 15 minutes on one
+    # core at the end of the start screen's build; as parts, a few minutes on all of them. A branch into another
+    # part sets c->pc and tail-calls that part, which starts with a switch on c->pc to the right label.
+    SPLIT_AT = 0x4000
+    SPLIT_PART = 0x2000
+
     def emit_function(self, entry, end, labels, tables, hle):
+        self._parts = []
         out = [f'void {fname(entry)}(Cpu *c) {{']
         if entry in hle:
             out.append(f'    {sanitize(hle[entry])}(c);')
             out.append('}')
             return out
-        out.append(f'    FN_ENTER({hx(entry)});')
-        batch = []
         refs = set()
-
-        def flush():
-            if batch:
-                out.append('    ' + emit_asm_batch(batch))
-                batch.clear()
-
-        def jump(t):
-            if entry <= t < end:
-                return f'goto L_{t:x};'
-            if not self.in_text(t):
-                return f'c->pc = {hx(t)}; __attribute__((musttail)) return rt_dispatch(c);'
-            refs.add(t)
-            return f'__attribute__((musttail)) return {fname(t)}(c);'
-
         # Functions with jump tables also get the all-instruction fallback: a table whose emulation
         # missed some cases then still reaches the right instruction instead of aborting.
         all_labels = bool(tables)
@@ -388,8 +380,97 @@ class Module:
                     v = self.lifter.lift(w, a)
                     if v.kind in ('b', 'bcond') and isinstance(v.target, int) and entry <= v.target < end:
                         labels.add(v.target)
+
+        def outside(t):
+            if not self.in_text(t):
+                return f'c->pc = {hx(t)}; __attribute__((musttail)) return rt_dispatch(c);'
+            refs.add(t)
+            return f'__attribute__((musttail)) return {fname(t)}(c);'
+
+        def finish(last, lo, hi, jump, out, router):
+            if last not in ('b', 'br', 'ret', 'trap'):
+                out.append('    ' + jump(hi) if hi < self.hi else f'    rt_udf(c, {hx(hi)});')
+            if all_labels:
+                out.append('L_dispatch:')
+                cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in range(lo, hi, 4))
+                out.append(f'    switch (c->pc) {{ {cases} default: break; }}')
+                out.append(f'    __attribute__((musttail)) return {router}(c);')
+            out.append('}')
+
+        if end - entry < self.SPLIT_AT:
+            out.append(f'    FN_ENTER({hx(entry)});')
+
+            def jump(t):
+                return f'goto L_{t:x};' if entry <= t < end else outside(t)
+            last = self.emit_body(entry, end, labels, tables, jump, refs, out)
+            finish(last, entry, end, jump, out, 'rt_dispatch')
+            self._refs = refs
+            return out
+
+        bounds = list(range(entry, end, self.SPLIT_PART)) + [end]
+        if end - bounds[-2] < self.SPLIT_PART // 4 and len(bounds) > 2:  # (no small last part)
+            del bounds[-2]
+        nparts = len(bounds) - 1
+        pname = lambda k: f'{fname(entry)}_p{k}'
+        rname = f'{fname(entry)}_r'
+        part_of = lambda t: next(k for k in range(nparts) if bounds[k] <= t < bounds[k + 1])
+        decls = [f'void {pname(k)}(Cpu *c);' for k in range(nparts)] + [f'void {rname}(Cpu *c);']
+        out = decls + out
+        out.append(f'    FN_ENTER({hx(entry)});')
+        out.append(f'    c->pc = {hx(entry)}; __attribute__((musttail)) return {pname(0)}(c);')
+        out.append('}')
+        # the router: a dispatch (jump table) to any instruction of the function, to its part
+        out.append(f'void {rname}(Cpu *c) {{')
+        for k in range(nparts):
+            out.append(f'    if (c->pc >= {hx(bounds[k])} && c->pc < {hx(bounds[k + 1])}) {{ __attribute__((musttail)) return {pname(k)}(c); }}')
+        out.append('    __attribute__((musttail)) return rt_dispatch(c);')
+        out.append('}')
+        for k in range(nparts):
+            lo, hi = bounds[k], bounds[k + 1]
+            prefs = set()
+
+            def jump(t, lo=lo, hi=hi, prefs=prefs):
+                if lo <= t < hi:
+                    return f'goto L_{t:x};'
+                if entry <= t < end:
+                    return f'c->pc = {hx(t)}; __attribute__((musttail)) return {pname(part_of(t))}(c);'
+                r = outside(t)
+                prefs.update(refs)
+                refs.clear()
+                return r
+            plabels = {t for t in labels if lo <= t < hi} | {lo}
+            body = list(decls) + [f'void {pname(k)}(Cpu *c) {{']
+            cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in sorted(plabels))
+            body.append(f'    switch (c->pc) {{ {cases} default: break; }}')
+            body.append('    __attribute__((musttail)) return rt_dispatch(c);')
+            last = self.emit_body(lo, hi, plabels, tables, jump, prefs, body)
+            if hi == end:
+                finish(last, lo, hi, jump, body, rname)
+            else:
+                if last not in ('b', 'br', 'ret', 'trap'):
+                    body.append('    ' + jump(hi))
+                if all_labels:
+                    body.append('L_dispatch:')
+                    cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in range(lo, hi, 4))
+                    body.append(f'    switch (c->pc) {{ {cases} default: break; }}')
+                    body.append(f'    __attribute__((musttail)) return {rname}(c);')
+                body.append('}')
+            prefs.update(refs)
+            refs.clear()
+            self._parts.append((body, prefs))
+        self._refs = set()
+        return out
+
+    def emit_body(self, lo, hi, labels, tables, jump, refs, out):
+        batch = []
+
+        def flush():
+            if batch:
+                out.append('    ' + emit_asm_batch(batch))
+                batch.clear()
+
         last = None
-        for a in range(entry, end, 4):
+        for a in range(lo, hi, 4):
             ins = self.lift(a)
             if a in labels:
                 flush()
@@ -446,7 +527,7 @@ class Module:
                     out.append(f'    c->pc = {ins.target}; goto L_dispatch;')
                     continue
                 if jt:
-                    cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in jt)
+                    cases = ' '.join(f'case {hx(t)}: {jump(t)}' for t in jt)
                     out.append(f'    switch ({ins.target}) {{ {cases} default: break; }}')
                     out.append(f'    c->pc = {ins.target}; goto L_dispatch;')
                     continue
@@ -455,16 +536,7 @@ class Module:
                 out.append('    return;')
             last = k
         flush()
-        if last not in ('b', 'br', 'ret', 'trap'):
-            out.append('    ' + jump(end) if end < self.hi else f'    rt_udf(c, {hx(end)});')
-        if all_labels:
-            out.append('L_dispatch:')
-            cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in range(entry, end, 4))
-            out.append(f'    switch (c->pc) {{ {cases} default: break; }}')
-            out.append('    __attribute__((musttail)) return rt_dispatch(c);')
-        out.append('}')
-        self._refs = refs
-        return out
+        return last
 
 
 from patches import PATCHES
@@ -597,12 +669,16 @@ def main():
     BIG = 0x4000  # bytes of guest code (4096 instructions)
     big = sorted((a for a in order if entries[a][0] - a >= BIG), key=lambda a: a - entries[a][0])
     seq = big + [a for a in order if entries[a][0] - a < BIG]
-    while ci < len(seq) or pending:
+    parts = []  # the parts of a long function (emit_function), each written as a function of its own
+    while ci < len(seq) or pending or parts:
         body, refs, size, fns = [], set(), 0, []
-        while (pending or ci < len(seq)) and len(fns) < args.chunk and size < args.chunk_bytes:
+        while (pending or parts or ci < len(seq)) and len(fns) < args.chunk and size < args.chunk_bytes:
             if pending:
                 a, lines, r = pending
                 pending = None
+            elif parts:
+                lines, r = parts.pop(0)
+                a = None
             else:
                 a = seq[ci]
                 ci += 1
@@ -610,6 +686,7 @@ def main():
                 lines = m.emit_function(a, end, labels, tables, hle)
                 r = getattr(m, '_refs', set())
                 m._refs = set()
+                parts += m._parts
             n = sum(len(l) + 1 for l in lines)
             if n > args.big_fn and fns:  # (a big function gets a file of its own: they compile in parallel)
                 pending = (a, lines, r)
