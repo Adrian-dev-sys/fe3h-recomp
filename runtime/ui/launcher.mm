@@ -271,6 +271,40 @@ static void find_game(const std::string &dir, int depth, std::string &exefs, std
     for (auto &s : sub) find_game(s, depth + 1, exefs, romfs, unusable);
 }
 
+// DLC: a "dlc" folder in the picked folder or a few levels below it, holding one folder per pack named by its
+// content id (16 hex digits) with that pack's extracted romfs/ in it (runtime/services/aoc.c)
+static bool is_pack_id(const std::string &n) {
+    if (n.size() != 16) return false;
+    for (char c : n) if (!isxdigit((unsigned char)c)) return false;
+    return true;
+}
+static void find_dlc(const std::string &dir, int depth, std::vector<std::string> &packs) {
+    if (depth > 3 || !packs.empty()) return;
+    DIR *d = opendir(dir.c_str());
+    if (!d) return;
+    std::vector<std::string> sub;
+    while (struct dirent *e = readdir(d)) {
+        std::string n = e->d_name;
+        if (n[0] == '.' || !is_dir(dir + "/" + n)) continue;
+        std::string low = n;
+        for (auto &ch : low) ch = (char)tolower((unsigned char)ch);
+        if (low == "dlc") {
+            if (DIR *p = opendir((dir + "/" + n).c_str())) {
+                while (struct dirent *f = readdir(p)) {
+                    std::string id = f->d_name;
+                    if (is_pack_id(id) && is_dir(dir + "/" + n + "/" + id + "/romfs")) packs.push_back(dir + "/" + n + "/" + id);
+                }
+                closedir(p);
+            }
+        } else if (n != ROMFS_MARKER && low != "romfs" && low != "exefs") {
+            sub.push_back(dir + "/" + n);
+        }
+    }
+    closedir(d);
+    std::sort(sub.begin(), sub.end());
+    for (auto &s : sub) find_dlc(s, depth + 1, packs);
+}
+
 static bool build_id_ok(const std::string &main_path) {  // (the right game: main.npdm next to main)
     std::string npdm = main_path.substr(0, main_path.size() - 4) + "main.npdm";
     return npdm_program_id(npdm) == FE3H_PROGRAM_ID;
@@ -337,7 +371,11 @@ static void *extract_thread(void *) {
         rt_remove_game_files(g_root.c_str());  // (an earlier or interrupted setup's; removes the folder too)
         mkdir(g_root.c_str(), 0755);
         unsigned long long rbytes = romfs_dir_bytes(romfs.c_str());
-        g_total = 2 * rbytes;
+        std::vector<std::string> packs;  // (DLC beside the game files: copied too)
+        find_dlc(src, 0, packs);
+        unsigned long long dbytes = 0;
+        for (auto &pk : packs) dbytes += romfs_dir_bytes((pk + "/romfs").c_str());
+        g_total = 2 * rbytes + dbytes;
         set_job("Copying the game files...");
         if (!romfs_copy_tree(exefs.c_str(), (g_root + "/exefs").c_str(), NULL) ||
             !romfs_copy_tree(romfs.c_str(), (g_root + "/romfs").c_str(), setup_progress)) {
@@ -345,6 +383,20 @@ static void *extract_thread(void *) {
             goto done;
         }
         g_phase_base = rbytes, g_done = rbytes;
+        if (!packs.empty()) {
+            set_job("Copying the DLC...");
+            mkdir((g_root + "/dlc").c_str(), 0755);
+            for (auto &pk : packs) {
+                std::string id = pk.substr(pk.find_last_of("/\\") + 1);
+                mkdir((g_root + "/dlc/" + id).c_str(), 0755);
+                if (!romfs_copy_tree((pk + "/romfs").c_str(), (g_root + "/dlc/" + id + "/romfs").c_str(), NULL)) {
+                    set_failure(FAIL_COPY);
+                    goto done;
+                }
+                g_phase_base += romfs_dir_bytes((pk + "/romfs").c_str()), g_done = g_phase_base;
+            }
+            fprintf(stderr, "[launcher] %d DLC pack%s copied\n", (int)packs.size(), packs.size() == 1 ? "" : "s");
+        }
         set_job("Building the game data image...");
         char why[256] = "";
         if (!romfs_build((g_root + "/romfs").c_str(), (g_root + "/romfs.bin").c_str(), setup_progress, why, sizeof why)) {
@@ -791,6 +843,7 @@ static void reveal_folder(const std::string &dir) {
 
 static SDL_Window *g_launcher_win;
 static bool g_files_deleted;  // set here: the start screen goes back to setting the game files up
+static const bool kSystemFonts = false;
 static void prelaunch_tab(float sc) {
     const ImVec4 gold = THEME_GOLD;
     auto heading = [&](const char *t) {
@@ -873,7 +926,7 @@ static void prelaunch_tab(float sc) {
             if (DIR *d = opendir(dir.c_str())) {
                 while (struct dirent *e = readdir(d)) {
                     std::string n = e->d_name;
-                    if (n.size() == 16 && is_dir(dir + "/" + n)) packs.push_back({n, file_exists(dir + "/" + n + ".romfs.bin")});
+                    if (n.size() == 16 && is_dir(dir + "/" + n)) packs.push_back({n, file_exists(dir + "/" + n + "/romfs.bin")});
                 }
                 closedir(d);
             }
@@ -887,10 +940,14 @@ static void prelaunch_tab(float sc) {
                 ImGui::Text("    %s    %s", pk.first.c_str(), pk.second ? "ready" : "prepared the first time the game uses it");
         }
         ImGui::PushTextWrapPos(0);
-        ImGui::TextDisabled("Each pack is a folder named by its content id in the game files' dlc folder, holding its "
-                            "extracted romfs: dlc/010055D009F79001/romfs/... The game sees every pack there as owned.");
+        ImGui::TextDisabled("The setup copies DLC found in a dlc folder in your game files folder: one folder per pack, "
+                            "named by its content id, holding its extracted romfs (dlc/010055D009F79001/romfs/...). To "
+                            "add DLC later, put it in the dlc folder here (Show in Explorer) the same way. The game sees "
+                            "every pack there as owned.");
         ImGui::PopTextWrapPos();
     }
+    // (no "Game font" section: Three Houses has its own fonts and never asks for the console's shared ones, pl.c)
+    if (!kSystemFonts) return;
     ImGui::Spacing();
     ImGui::Spacing();
     heading("Game font");

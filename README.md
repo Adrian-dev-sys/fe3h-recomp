@@ -63,7 +63,8 @@ about 20 GB free for the game files and the build.
    a while (10-20 minutes on a fast PC, longer on a slower one).
 4. Click **Play**.
 
-**DLC:** put each DLC's extracted romfs in `extracted/dlc/<content id>/romfs` in the program's folder (see [DLC](#dlc)).
+**DLC:** if your game files folder has a `dlc` folder laid out as in [DLC](#dlc), the setup copies it too. To add
+DLC later, put it in `extracted/dlc` in the program's folder the same way.
 
 **Cheats:** put a `cheats.txt` next to `fe3hrecomp.exe` (see [Cheats](#cheats)). For cheats that patch the game's
 code, use **Settings > Game Files > Rebuild game code** on the start screen instead of `make gen-main`, then restart.
