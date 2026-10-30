@@ -10,7 +10,7 @@ built on [LAS Recomp](https://github.com/peiikai/LASRecomp) by Peiikai.
 >
 > I'm doing this casually, in my spare time, and I'm not planning to pour a ton of time, energy or resources into it.
 > Honestly, I doubt I'll finish a full playthrough before GTA VI comes out, and once that happens this will probably
-> fall by the wayside for a while. It's shared as-is: no support, no releases, no promises. Run it at your own
+> fall by the wayside for a while. It's shared as-is, and I can't promise any ongoing support. Run it at your own
 > discretion.
 
 > [!NOTE]
@@ -28,8 +28,9 @@ Link's Awakening*. This fork adds what *Three Houses* needs on top.
 
 ## Status
 
-Playable. Tested on Windows with an AMD Radeon RX 9070: the opening chapters, battles, the monastery, cutscenes, the
-calendar, and the start of Cindered Shadows. Longer playthroughs are ongoing. Other platforms LAS supports (macOS,
+Playable. Tested on Windows with an AMD Radeon RX 9070 and an RX 6800 XT: the opening chapters, battles (combat
+arts, gambits and their cut-ins), the monastery, cutscenes, the calendar, and the start of Cindered Shadows. It holds
+60 fps through the monastery and battles. Longer playthroughs are ongoing. Other platforms LAS supports (macOS,
 Linux) may build but haven't been tried with this game.
 
 Added for *Three Houses*:
@@ -40,6 +41,11 @@ Added for *Three Houses*:
   barriers that are safe inside branches, 32-lane compute subgroups, and buffer clears.
 - **System services:** an always-offline network service (the calendar crashed without it).
 - **DLC:** the Expansion Pass, Cindered Shadows and the bonus waves, from your own DLC files.
+- **Shaders:** what FE3H's GPU code uses that Link's Awakening never did: address arithmetic (LEA), atomics and
+  reductions on memory, subroutine calls, and image stores (the battle effects write into textures from compute
+  shaders).
+- **Smooth play:** shader translations are kept on disk, and every shader and pipeline met before is rebuilt at
+  launch, so areas and battle effects you've seen draw at once instead of popping in or stuttering.
 - **Cheats:** Atmosphere-format cheat codes from a `cheats.txt` of your own, switched on and off in the menu's Game
   tab, including the ones that patch the game's code (see [Cheats](#cheats) below).
 
@@ -49,6 +55,17 @@ switched off and out of the menus.
 
 The start screen shows your own picture if you put one in the game files folder as `extracted/background.png` (or
 `.jpg`); it isn't part of this repository, and `.gitignore` keeps it out.
+
+## Known issues
+
+- The first time you see an area or a battle effect on a PC, its shaders are built while it plays: some pop-in or
+  stutter, and once in a while an effect drawn incompletely (a cut-in as outlines). Only the first time.
+- A few very large battle-effect compute shaders (over 4,000 instructions) aren't built: GPU drivers took minutes on
+  them, if they finished at all. Some battle effects may be missing a layer. `LARECOMP_VK_BIG_CS=1` builds them anyway.
+- One texture format (BC3, written by a compute shader) can't be written to on PC GPUs; the log mentions it. No
+  visible effect found so far.
+- Experience multiplier cheats can overflow the EXP bar on the results screen for some classes (archers); the game
+  itself is fine.
 
 ## Installing a release (Windows)
 
@@ -60,7 +77,7 @@ about 20 GB free for the game files and the build.
 2. Run `fe3hrecomp.exe`. On the start screen, open **Settings > Game Files**, choose the folder holding your own
    extracted copy of the game (version 1.2.0, `exefs` and `romfs`), and click **Set up game files**.
 3. Wait. The setup copies the game files, then recompiles the game's code on your PC. That's a one-time job and takes
-   a while (10-20 minutes on a fast PC, longer on a slower one).
+   a while (about 6 minutes on a Ryzen 7 / 12 threads; longer with fewer cores).
 4. Click **Play**.
 
 **DLC:** if your game files folder has a `dlc` folder laid out as in [DLC](#dlc), the setup copies it too. To add
@@ -70,7 +87,8 @@ DLC later, put it in `extracted/dlc` in the program's folder the same way.
 code, use **Settings > Game Files > Rebuild game code** on the start screen instead of `make gen-main`, then restart.
 
 The first time you enter an area, its shaders are prepared and things may pop in for a moment; from then on they're
-ready from the start of each session.
+ready from the start of each session. Moving to another PC? Copy the `cache` folder along: the shaders are then
+ready there from the start too.
 
 ## Building and running (Windows)
 
@@ -84,8 +102,8 @@ Requirements: Windows 10+ x86-64, a CPU with AVX2 and a GPU with Vulkan 1.3.
    in LAS (its game-file setup builds `extracted/romfs.bin`).
 3. **Build**, from an MSYS2 UCRT64 shell:
    ```
-   make gen    # once: recompile the game code from extracted/exefs into generated/
-   make
+   make gen          # once: recompile the game code from extracted/exefs into generated/
+   make -j$(nproc)   # every core: after make gen, hundreds of files compile
    ```
 4. **Run:** `./build/fe3hrecomp.exe extracted --play > run.log 2>&1`
 
@@ -125,7 +143,34 @@ From the MSYS2 UCRT64 shell, once: `make deps-windows` (an LGPL build of FFmpeg:
 `tools/fetch_zig.sh` (the compiler players' PCs build the game with) and `make gen-helper` (the game code generator
 as a standalone program; needs the python.org Python 3.12 the setup script installs). Then `make dist` builds
 `build/dist/FE3H-Recomp-<version>-windows.zip` (the version is `FE3H_VERSION` in `runtime/ui/launcher.mm`). It holds
-no game code: each player's PC recompiles the game from their own files.
+no game code: each player's PC recompiles the game from their own files. `make dist` rebuilds the generator helper
+by itself when `tools/` changed. If `py` isn't on the MSYS2 shell's PATH, give the Python for the helper as
+`GEN_PY=/c/Users/<you>/AppData/Local/Programs/Python/Python312/python.exe`.
+
+## Hurdles along the way
+
+Some of what it took to get from Link's Awakening's recompiler to a playable *Three Houses*, in case it helps anyone
+doing the same for another game:
+
+- **Lighting was missing.** FE3H culls its lights in compute shaders that count lights per screen tile with subgroup
+  operations. The translator returned 0 for lane IDs and masks, so no tile had any lights; and a barrier inside the
+  shader's branch state machine ran before every wave had added its own lights. Fixed in the shader translator.
+- **Audio routing.** Music, voices and effects go through the audio renderer's splitters and an I3DL2 reverb that
+  LA never used; until those were implemented, sounds didn't reach the right mixes.
+- **Stutter.** Each new shader was translated, compiled to SPIR-V and built by the driver in the middle of play.
+  Three layers fixed it: translations cached on disk, draws waiting a few milliseconds a frame for a shader still
+  building instead of skipping it, and a prewarm that rebuilds everything seen in earlier sessions at launch.
+- **Battle effects.** Combat art and gambit cut-ins are drawn by compute shaders writing into images, with
+  subroutine calls and memory reductions the translator didn't know yet. Some are enormous (9,000-11,000
+  instructions); building them stalled the driver for minutes and held up every other shader behind them, so the
+  effects never appeared. Large ones now build on threads of their own, and the largest are skipped.
+- **Cheats.** Many Switch cheats patch the game's code, which a recompiled game no longer runs. Their patched
+  instructions are compiled in beside the originals and picked at run time. One popular "always critical" cheat
+  turned out to zero unit stats (stranding units unable to move); it was replaced with a one-instruction code patch
+  on the crit roll.
+- **Setup time.** A few of the game's functions are huge (one is 4 MB of C). A compiler can't split one function
+  across cores, so the first setup spent 15 minutes compiling a single file. The generator now writes very long
+  functions as parts that compile in parallel: setup went from about 20 minutes to 6.
 
 ## Rules for this repository
 
