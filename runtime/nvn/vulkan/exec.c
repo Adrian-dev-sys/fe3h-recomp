@@ -607,6 +607,7 @@ static Job *ljobs_head, *ljobs_tail;  // low priority (prewarm, below): taken wh
 static _Atomic int jobs_queued, jobs_running, nworkers;  // (high-priority jobs; the stats line and wait_built)
 static Job *heavy_head, *heavy_tail;  // builds of very large shaders: their own thread (heavy_worker), so a driver
 static pthread_cond_t heavy_cond = PTHREAD_COND_INITIALIZER;  // compile taking minutes can't hold up the others
+static _Atomic uint64_t heavy_since;  // when the heavy thread's current build started (0: idle)
 static pthread_mutex_t jobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
@@ -654,7 +655,9 @@ static void *heavy_worker(void *a) {
         heavy_head = j->next;
         if (!heavy_head) heavy_tail = NULL;
         pthread_mutex_unlock(&jobs_lock);
+        atomic_store(&heavy_since, SDL_GetTicksNS());
         j->fn(j->arg);
+        atomic_store(&heavy_since, 0);
         free(j);
     }
     return NULL;
@@ -867,6 +870,12 @@ const char *renderer_stats(void) {
             size_t n = strlen(stats_text);
             snprintf(stats_text + n, sizeof stats_text - n, ", xlat %llu cached / %llu new %.0fms", (unsigned long long)hit,
                      (unsigned long long)miss, ns / 1e6);
+        }
+        uint64_t hs = atomic_load(&heavy_since);
+        static uint64_t hs_logged;
+        if (hs && hs != hs_logged && SDL_GetTicksNS() - hs > 10000000000ull) {
+            hs_logged = hs;
+            LOG("[shader] a large compute shader has been building for over 10 s\n");
         }
         int q = atomic_load(&jobs_queued);
         if (q) {
@@ -3140,8 +3149,19 @@ static CsProg *compute_program(NvnProgram *np, uint32_t bufmask) {
         if (!cp->local[i]) cp->local[i] = 1;
     }
     save_glsl(cp->si->msl, ss->code_addr, "cs");
-    // (very large ones - thousands of instructions, a subroutine-call state machine - on their own thread: a driver
-    // compile of minutes held up every other build, and new things went undrawn for the rest of the session)
+    // Very large ones (battle shaders of ~9,000 instructions with subroutine calls, as a branch state machine): the
+    // driver's compile of them never finished, and held every other build behind it - no new shader was ready for
+    // the rest of the session (the combat art cut-ins among them). Those aren't built (skipped as before they
+    // translated); LARECOMP_VK_BIG_CS=1 builds them anyway. Large ones on their own thread, the rest on the workers.
+    static int big = -1;
+    if (big < 0) big = getenv("LARECOMP_VK_BIG_CS") != NULL;
+    if (cp->si->num_insts > 4000 && !big) {
+        static int nlog;
+        if (nlog++ < 20) LOG("[compute] %llx: %u instructions, too large to build: skipped\n", (unsigned long long)ss->code_addr,
+                             cp->si->num_insts);
+        set_state(&cp->p.state, 2);
+        return cp;
+    }
     if (cp->si->num_insts > 2000) run_heavy_job(build_compute, cp);
     else run_job(build_compute, cp);
     return cp;
