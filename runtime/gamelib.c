@@ -74,10 +74,18 @@ static const GameLibTables *open_lib(const char *path) {
     return t;
 }
 
+static char g_path[1100];
+const char *gamelib_path(void) { return g_tables ? g_path : NULL; }
+
 bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
     static bool tried;
     if (!tried) {
         tried = true;
+        if (game_dir) {  // (a rebuild while the game ran renamed the one in use: runtime/gamebuild.c)
+            char old[1200];
+            snprintf(old, sizeof old, "%s/%s.old", game_dir, GAMELIB_NAME);
+            remove(old);
+        }
         snprintf(g_error, sizeof g_error, "the game code hasn't been built: set up the game files on the start screen");
         char c[3][1100];
         int n = candidates(game_dir, c);
@@ -90,6 +98,7 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
                 continue;
             }
             g_tables = open_lib(c[i]);
+            if (g_tables) snprintf(g_path, sizeof g_path, "%s", c[i]);
             if (g_tables) LOG("[gamelib] %s (%llu + %llu functions)\n", c[i], (unsigned long long)*g_tables->main_count,
                               (unsigned long long)*g_tables->sdk_count);
         }

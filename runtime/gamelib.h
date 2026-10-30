@@ -50,6 +50,8 @@ extern "C" {
 bool gamelib_load(const char *game_dir, char *why, size_t why_size);
 // The tables of the loaded library (NULL before gamelib_load succeeds).
 const GameLibTables *gamelib_tables(void);
+// The loaded library's file (NULL before gamelib_load succeeds); its cheat patches list is <path>.cheats
+const char *gamelib_path(void);
 // True when a library usable with this build is in one of those places (without loading it).
 bool gamelib_present(const char *game_dir);
 

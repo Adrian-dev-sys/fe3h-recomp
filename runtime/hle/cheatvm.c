@@ -102,7 +102,13 @@ static int op_len(uint32_t w) {  // words in the opcode starting with w (0: unkn
 static void load(void) {
     if (g_ncheats >= 0) return;
     g_ncheats = 0;
-    FILE *f = fopen(VARIANTS_FILE, "r");
+    // the cheat patches the game code was built with: next to the library a start-screen build made (gamebuild.c),
+    // else the source checkout's generated/ (make gen-main)
+    extern const char *gamelib_path(void);
+    char vf[1200] = "";
+    if (gamelib_path()) snprintf(vf, sizeof vf, "%s.cheats", gamelib_path());
+    FILE *f = vf[0] ? fopen(vf, "r") : NULL;
+    if (!f) f = fopen(VARIANTS_FILE, "r");
     if (f) {
         unsigned long long off;
         unsigned w;

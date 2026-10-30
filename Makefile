@@ -209,7 +209,7 @@ $(B)/rt/platform/windows_rc.o: runtime/platform/windows.rc docs/icon/icon.ico
 	@mkdir -p $(dir $@)
 	$(WINDRES) -I docs/icon -O coff $< -o $@
 
-VERSION  := $(shell sed -n 's/^\#define LARECOMP_VERSION "\(.*\)"/\1/p' runtime/ui/launcher.mm)
+VERSION  := $(shell sed -n 's/^\#define FE3H_VERSION "\(.*\)"/\1/p' runtime/ui/launcher.mm)
 
 # macOS: build/LAS Recomp.app, runs on macOS $(APP_MIN)+: the game rebuilt for that in build/mac15 against build/deps
 # (`make deps`: SDL3, LGPL FFmpeg, keystone, Python, from pinned sources), the generator helper when built
@@ -227,8 +227,8 @@ app:
 dmg: app
 	tools/make_dmg.sh
 
-# Windows: build/dist/LAS Recomp-<version>-windows.zip, top folder "LAS Recomp/": the exe, the seed generator
-# helper (make rando-helper), what the start screen builds the game code with on the player's machine (make gen-helper,
+# Windows: build/dist/FE3H-Recomp-<version>-windows.zip, top folder "FE3H Recomp/": the exe, what the start screen
+# builds the game code with on the player's machine (make gen-helper,
 # tools/fetch_zig.sh slimmed by tools/zig_slim.sh: its runtime built ahead of time, gamelib-src/, the exe's import library)
 # and the DLLs they load (runs without MSYS2). No game code. The exe is a release build in $(WIN_B):
 # linked against the LGPL FFmpeg from `make deps-windows` (MSYS2's is a GPLv3 build) and without a console window
@@ -236,13 +236,12 @@ dmg: app
 # with build/deps-win/bin first (the FFmpeg DLL names are the same as MSYS2's GPL ones). vulkan-1.dll is left
 # out: every Vulkan driver installs the loader in System32. Saves, seeds and game files go next to the exe at run time.
 # Needs: Windows 10+ x64, a Vulkan 1.3 driver, an AVX2 CPU (GENARCH x86-64-v3; checked at startup).
-DIST     := build/dist/LAS Recomp
+DIST     := build/dist/FE3H Recomp
 WIN_B    := build/win-release
 deps-windows:
 	tools/build_deps_windows.sh
 dist:
 	@[ -f build/deps-win/lib/libavcodec.dll.a ] || { echo "make deps-windows first (LGPL FFmpeg)"; exit 1; }
-	@[ -d build/helper/rando-gen ] || { echo "make rando-helper first (the seed generator)"; exit 1; }
 	@[ -d build/helper/lasgen ] || { echo "make gen-helper first (the game code generator)"; exit 1; }
 	@[ -x build/zig/zig.exe ] || { echo "tools/fetch_zig.sh first (the compiler)"; exit 1; }
 	$(MAKE) B=$(WIN_B) DEPS=$(CURDIR)/build/deps-win RELEASE=1 $(WIN_B)/fe3hrecomp.exe
@@ -260,13 +259,12 @@ dist:
 	cp third_party/fonts/EBGaramond/EBGaramond12-Regular.ttf "$(DIST)/"  # (menu and start screen font, OFL)
 	cp third_party/fonts/EBGaramond/OFL.txt "$(DIST)/EBGaramond-OFL.txt"
 	cp README.md LICENSE "$(DIST)/"  # (licenses and source links of the bundled components: README "License")
-	cp -R build/helper/rando-gen "$(DIST)/"
 	PATH="$(CURDIR)/build/deps-win/bin:$$PATH" ldd $(WIN_B)/fe3hrecomp.exe | awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $$3}' | sort -u | \
 	    xargs -I{} cp -u {} "$(DIST)/"
 	! ls "$(DIST)" | grep -iE 'x264|x265|xvid|postproc'  # (no GPL codec libraries in the release)
-	cd build/dist && if command -v zip >/dev/null; then zip -qr "LAS Recomp-$(VERSION)-windows.zip" "LAS Recomp"; \
-	    else /c/Windows/System32/tar.exe -a -cf "LAS Recomp-$(VERSION)-windows.zip" "LAS Recomp"; fi
-	@echo "build/dist/LAS Recomp-$(VERSION)-windows.zip"
+	cd build/dist && if command -v zip >/dev/null; then zip -qr "FE3H-Recomp-$(VERSION)-windows.zip" "FE3H Recomp"; \
+	    else /c/Windows/System32/tar.exe -a -cf "FE3H-Recomp-$(VERSION)-windows.zip" "FE3H Recomp"; fi
+	@echo "build/dist/FE3H-Recomp-$(VERSION)-windows.zip"
 
 # Seed generator as a standalone helper, so players need no Python: build/helper/rando-gen/ (rando-gen[.exe] +
 # _internal/), frozen by PyInstaller from tools/rando/rando_gen.spec in its own venv (build/rando-venv). Ship the
@@ -294,15 +292,20 @@ rando-helper: build/rando-venv/.ok
 
 # The game code generator, the same way (tools/lasgen.spec): build/helper/lasgen/, shipped as lasgen/ next to the exe or
 # in Contents/Resources. The start screen's setup runs it on the player's own game files (runtime/gamebuild.c).
-gen-helper: build/rando-venv/.ok build/rando-venv/.gen-ok
+# (FE3H: its own Python environment, build/gen-venv - the randomizer's requirements aren't needed. Windows: a
+# python.org CPython 3.12, GEN_PY="py -3.12" by default, as for the randomizer helper)
+GEN_PY  ?= $(RANDO_PY)
+GEN_VPY := $(subst rando-venv,gen-venv,$(RANDO_VPY))
+gen-helper: build/gen-venv/.ok
 	$(if $(filter windows,$(PLATFORM)),USERPROFILE="$$(cygpath -w ~ 2>/dev/null || echo $$HOME)") \
-	$(RANDO_VPY) -m PyInstaller --noconfirm --clean --log-level WARN --distpath build/helper --workpath build/pyinstaller \
+	$(GEN_VPY) -m PyInstaller --noconfirm --clean --log-level WARN --distpath build/helper --workpath build/pyinstaller \
 	    tools/lasgen.spec
-	$(if $(filter windows,$(PLATFORM)),$(RANDO_VPY) tools/pe_no_cfg.py build/helper/lasgen/lasgen.exe)
+	$(if $(filter windows,$(PLATFORM)),$(GEN_VPY) tools/pe_no_cfg.py build/helper/lasgen/lasgen.exe)
 	@du -sh build/helper/lasgen
 
-build/rando-venv/.gen-ok: build/rando-venv/.ok
-	$(RANDO_VPY) -m pip install -q capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5
+build/gen-venv/.ok:
+	$(GEN_PY) -m venv build/gen-venv
+	$(GEN_VPY) -m pip install -q capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5 pyinstaller==6.22.3
 	touch $@
 
 build/rando-venv/.ok: third_party/LAS-Randomizer/requirements.txt

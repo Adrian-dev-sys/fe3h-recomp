@@ -40,6 +40,7 @@ extern "C" void difficulty_draw(float scale);  // difficulty.mm
 void controls_bindings_draw(float scale);  // controls_ui.mm
 #include "../input_bind.h"
 #include "../paths.h"
+#include "../gamebuild.h"
 }
 
 // ------------------------------------------------------------------ state shared with the main thread
@@ -584,9 +585,9 @@ static void tab_game(void) {
     int nc = cheatvm_count();
     opt_section("Cheats");
     if (nc == 0)
-        opt_action("No cheats", "", "Put Atmosphere-format cheats in cheats.txt in the project folder (a [name] line, "
-                   "then its codes), then restart. Cheats that patch the game's code also need `make gen-main` and "
-                   "`make`.");
+        opt_action("No cheats", "", "Put Atmosphere-format cheats in cheats.txt next to " RT_APP_NAME " (a [name] line, "
+                   "then its codes), then restart. Cheats that patch the game's code also need the game code rebuilt "
+                   "(Settings > Game Files > Rebuild game code; in a source checkout: `make gen-main` and `make`).");
     for (int i = 0; i < nc; i++) {
         CheatInfo ci;
         if (!cheatvm_info(i, &ci) || ci.master) continue;
@@ -594,8 +595,11 @@ static void tab_game(void) {
         std::string d = ci.desc && *ci.desc ? ci.desc : "From cheats.txt (no description: add # lines under its name).";
         if (ci.excludes && *ci.excludes) d += std::string("\n\nOnly one at a time: switching this on turns off ") + ci.excludes + ".";
         if (ci.unsupported) d += "\n\nThis cheat uses an opcode the cheat engine doesn't support, so it can't run.";
-        else if (ci.needs_gen) d += "\n\nIt patches the game's code, and that patch isn't built in yet: run `make gen-main` "
-                                    "and then `make`, and restart.";
+        else if (ci.needs_gen) d += gamebuild_available()
+            ? "\n\nIt patches the game's code, and that patch isn't built in yet: Quit to Start Screen, then Settings > "
+              "Game Files > Rebuild game code, and restart."
+            : "\n\nIt patches the game's code, and that patch isn't built in yet: run `make gen-main` and then `make`, "
+              "and restart.";
         if (ci.unsupported || ci.needs_gen) opt_disable_next();
         if (opt_toggle(ci.name, &on, false, d.c_str())) { cheatvm_set(i, on); settings_save(); }
     }

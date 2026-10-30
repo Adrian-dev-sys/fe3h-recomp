@@ -89,6 +89,8 @@ static void save_png(id<MTLTexture> tex, const char *path) {
 // The release tag this build is (also names the release files; Makefile / tools/bundle_macos.sh / make_dmg.sh read
 // it): beta_<n> until 1.0, then v<major>.<minor>.<patch>.
 #define LARECOMP_VERSION "beta_4"
+// This fork's own release version (the Makefile's release file names, the start screen's corner)
+#define FE3H_VERSION "0.1.0"
 
 // ------------------------------------------------------------------ update check
 // The start screen asks GitHub for the project's releases once per launch (a background curl, which macOS and
@@ -355,7 +357,9 @@ static void *extract_thread(void *) {
 check:
     {
         std::string why = check_game_files(g_root);
-        if (why.empty()) set_job("Game files ready.");
+        if (why.empty() && g_copy_skipped && gamelib_tables())  // (rebuilt while one was in use: used from the next start)
+            set_job("Game code rebuilt. Restart " RT_APP_NAME " to use it.");
+        else if (why.empty()) set_job("Game files ready.");
         else set_failure(why.find("version") != std::string::npos ? FAIL_VERSION : FAIL_MISSING);
     }
 done:
@@ -833,6 +837,29 @@ static void prelaunch_tab(float sc) {
             ImGui::IsKeyPressed(ImGuiKey_Escape, false))
             ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
+    }
+    if (gamebuild_available()) {  // (code-patching cheats added to cheats.txt: compiled in by a new build)
+        pthread_mutex_lock(&g_lock);
+        bool busy = g_busy;
+        std::string job = g_job;
+        pthread_mutex_unlock(&g_lock);
+        ImGui::SameLine();
+        if (busy) ImGui::BeginDisabled();
+        if (ImGui::Button("Rebuild game code")) {
+            pthread_mutex_lock(&g_lock);
+            g_src.clear();
+            g_busy = true;
+            pthread_mutex_unlock(&g_lock);
+            pthread_t t;
+            pthread_create(&t, NULL, extract_thread, NULL);
+            pthread_detach(t);
+        }
+        if (busy) ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Recompiles the game from the game files already set up, with the code-patching cheats now in\n"
+                              "cheats.txt (the Game tab marks the ones that need it). Takes as long as the first setup.");
+        if (busy) ImGui::TextColored(gold, "%s %.0f%%", job.c_str(), extract_progress() * 100);
+        else if (!job.empty()) ImGui::TextUnformatted(job.c_str());
     }
     ImGui::Spacing();
     ImGui::Spacing();
@@ -1501,7 +1528,7 @@ extern "C" void launcher_run(const char *root) {
                     dl->AddText(font, size, p, col, t);
                     if (bold) dl->AddText(font, size, ImVec2(p.x + 0.7f * s, p.y), col, t);
                 };
-                std::string ver = RT_APP_NAME;  // (LAS's version tag stays in LARECOMP_VERSION for its build scripts)
+                std::string ver = RT_APP_NAME " " FE3H_VERSION;  // (LAS's tag stays in LARECOMP_VERSION)
                 float vs = fs * 1.4f, y = ImGui::GetWindowPos().y + ds.y - 134 * s;
                 ImVec2 vsz = font->CalcTextSizeA(vs, FLT_MAX, 0, ver.c_str());
                 text(ImVec2(right - vsz.x, y), vs, IM_COL32(255, 255, 255, 255), ver.c_str(), false);

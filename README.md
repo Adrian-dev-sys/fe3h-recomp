@@ -50,7 +50,26 @@ switched off and out of the menus.
 The start screen shows your own picture if you put one in the game files folder as `extracted/background.png` (or
 `.jpg`); it isn't part of this repository, and `.gitignore` keeps it out.
 
-Known gaps: no packaged release.
+## Installing a release (Windows)
+
+Requirements: Windows 10 or 11 (64-bit), a CPU with AVX2 (most from 2015 on), a GPU with Vulkan 1.3 drivers, and
+about 20 GB free for the game files and the build.
+
+1. Download `FE3H-Recomp-<version>-windows.zip` from [Releases](../../releases) and unzip it anywhere you can write
+   to (not Program Files). Everything it makes - saves, settings, caches, the game files - stays in that folder.
+2. Run `fe3hrecomp.exe`. On the start screen, open **Settings > Game Files**, choose the folder holding your own
+   extracted copy of the game (version 1.2.0, `exefs` and `romfs`), and click **Set up game files**.
+3. Wait. The setup copies the game files, then recompiles the game's code on your PC. That's a one-time job and takes
+   a while (10-20 minutes on a fast PC, longer on a slower one).
+4. Click **Play**.
+
+**DLC:** put each DLC's extracted romfs in `extracted/dlc/<content id>/romfs` in the program's folder (see [DLC](#dlc)).
+
+**Cheats:** put a `cheats.txt` next to `fe3hrecomp.exe` (see [Cheats](#cheats)). For cheats that patch the game's
+code, use **Settings > Game Files > Rebuild game code** on the start screen instead of `make gen-main`, then restart.
+
+The first time you enter an area, its shaders are prepared and things may pop in for a moment; from then on they're
+ready from the start of each session.
 
 ## Building and running (Windows)
 
@@ -98,6 +117,14 @@ that patch the same instruction (Exp x2 / x4 / x8, say) exclude each other: swit
 - Saves are in `save/`, settings in `fe3hrecomp.ini` (an older `larecomp.ini` is renamed to it once).
 - `run.log` is the first place to look when something goes wrong. `LARECOMP_*` environment variables turn on extra
   logging for specific systems (audio, textures, shaders); they're documented where they're read in `runtime/`.
+
+### Making a release package
+
+From the MSYS2 UCRT64 shell, once: `make deps-windows` (an LGPL build of FFmpeg: releases can't ship MSYS2's GPL one),
+`tools/fetch_zig.sh` (the compiler players' PCs build the game with) and `make gen-helper` (the game code generator
+as a standalone program; needs the python.org Python 3.12 the setup script installs). Then `make dist` builds
+`build/dist/FE3H-Recomp-<version>-windows.zip` (the version is `FE3H_VERSION` in `runtime/ui/launcher.mm`). It holds
+no game code: each player's PC recompiles the game from their own files.
 
 ## Rules for this repository
 

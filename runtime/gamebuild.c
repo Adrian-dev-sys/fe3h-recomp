@@ -152,9 +152,13 @@ static bool find_tools(Tools *t) {
     return true;
 }
 
-bool gamebuild_available(void) {
-    Tools t;
-    return find_tools(&t);
+bool gamebuild_available(void) {  // (asked by the menus every frame: looked up once)
+    static int have = -1;
+    if (have < 0) {
+        Tools t;
+        have = find_tools(&t);
+    }
+    return have;
 }
 
 static void compiler(Args *a, const Tools *t) {
@@ -274,7 +278,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
     if (!registered) registered = true, atexit(end_all);
     Tools t;
     if (!find_tools(&t)) {
-        snprintf(why, why_size, "the game code builder is missing from this copy of LAS Recomp");
+        snprintf(why, why_size, "the game code builder is missing from this copy of " RT_APP_NAME);
         return false;
     }
     char work[1100], lib[1100], tmp[1100];
@@ -282,6 +286,12 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
     snprintf(lib, sizeof lib, "%s" SEP "%s", game_dir, GAMELIB_NAME);
     snprintf(tmp, sizeof tmp, "%s" SEP "%s.tmp", work, GAMELIB_NAME);
     rt_remove_game_file(game_dir, ".gamebuild");
+    if (gamelib_tables()) {  // (this process runs the current one: Windows can't delete it, but can rename it - gone
+        char old[1200];      // at the next start, gamelib.c; the new one is used from the next start)
+        snprintf(old, sizeof old, "%s.old", lib);
+        remove(old);
+        rename(lib, old);
+    }
     rt_remove_game_file(game_dir, GAMELIB_NAME);
     rt_remove_game_file(game_dir, GAMELIB_NAME ".id");
     mkdir(work, 0755);
@@ -300,10 +310,21 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         t.cc, t.zig ? " cc" : "", o->jobs);
 
     // 1. the generator, both modules at once; their finished files are compiled while it goes on
-    Gen gens[2] = {{.name = "main"}, {.name = "sdk"}};
-    static const char *const base[2] = {"0x7000000000", "0x7004000000"};
+    // (FE3H: subsdk0 too - glslc, runtime/gamelib.h)
+    enum { NGEN = 3 };
+    Gen gens[NGEN] = {{.name = "main"}, {.name = "sdk"}, {.name = "subsdk0"}};
+    static const char *const base[NGEN] = {"0x7000000000", "0x7004000000", "0x7005000000"};
     bool ok = true;
-    for (int i = 0; i < 2 && ok; i++) {
+    {   // the cheats' code patches are compiled in (tools/cheats.py): the player's cheats.txt in the data folder
+        char cheats[1100];
+        snprintf(cheats, sizeof cheats, "%s" SEP "cheats.txt", rt_data_root());
+#ifdef _WIN32
+        _putenv_s("LARECOMP_CHEATS", cheats);
+#else
+        setenv("LARECOMP_CHEATS", cheats, 1);
+#endif
+    }
+    for (int i = 0; i < NGEN && ok; i++) {
         Gen *g = &gens[i];
         g->exit = -1;
         snprintf(g->log, sizeof g->log, "%s" SEP "gen_%s.log", work, g->name);
@@ -324,8 +345,8 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
     }
 
     Units units = {0};
-    int queued[2] = {0, 0};  // chunk files of each module put in units so far
-    bool tables[2] = {false, false};
+    int queued[NGEN] = {0};  // chunk files of each module put in units so far
+    bool tables[NGEN] = {false};
     int next = 0, jobs = o->jobs < 1 ? 1 : o->jobs > 64 ? 64 : o->jobs;
     struct { PlatProc p; int unit; } run[64];
     int nrun = 0;
@@ -339,7 +360,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         bool gens_done = true;
         double gen_frac = 0;
         unsigned long long written = 0;
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < NGEN; i++) {
             Gen *g = &gens[i];
             if (g->exit < 0) {
                 read_gen_log(g);
@@ -370,7 +391,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
                 add_unit(&units, src, work, stem);
                 tables[i] = true;
             }
-            gen_frac += g->exit == 0 ? 0.5 : g->n ? 0.5 * (double)g->ci / (double)g->n : 0;
+            gen_frac += (g->exit == 0 ? 1.0 : g->n ? (double)g->ci / (double)g->n : 0) / NGEN;
         }
         if (!ok) break;
         for (int k = 0; k < units.n; k++) written += units.u[k].bytes;
@@ -413,7 +434,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         sleep_ms(50);
     }
     for (int k = 0; k < nrun; k++) stop(run[k].p);  // (a failure: the rest is of no use - the failure shows at once)
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < NGEN; i++)
         if (gens[i].p && gens[i].exit < 0) stop(gens[i].p);
 
     // 2. link
@@ -480,6 +501,19 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
             ok = false;
         }
         if (f) fclose(f);
+        // the cheat patches compiled in (the generator's list) next to it, for the cheat engine (runtime/hle/cheatvm.c)
+        char from[1200], to[1200];
+        snprintf(from, sizeof from, "%s" SEP "main" SEP "cheat_variants.txt", work);
+        snprintf(to, sizeof to, "%s.cheats", lib);
+        remove(to);
+        FILE *in = fopen(from, "rb"), *out = in ? fopen(to, "wb") : NULL;
+        if (in && out) {
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, n, out);
+        }
+        if (in) fclose(in);
+        if (out) fclose(out);
     }
     free(units.u);
     rt_remove_game_file(game_dir, ".gamebuild");  // the C, the objects, the logs
