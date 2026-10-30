@@ -607,7 +607,8 @@ static Job *ljobs_head, *ljobs_tail;  // low priority (prewarm, below): taken wh
 static _Atomic int jobs_queued, jobs_running, nworkers;  // (high-priority jobs; the stats line and wait_built)
 static Job *heavy_head, *heavy_tail;  // builds of very large shaders: their own thread (heavy_worker), so a driver
 static pthread_cond_t heavy_cond = PTHREAD_COND_INITIALIZER;  // compile taking minutes can't hold up the others
-static _Atomic uint64_t heavy_since;  // when the heavy thread's current build started (0: idle)
+#define NHEAVY 3                      // (one driver compile that never ends doesn't hold up the other large ones)
+static _Atomic uint64_t heavy_since[NHEAVY];  // when each heavy thread's current build started (0: idle)
 static pthread_mutex_t jobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
@@ -647,7 +648,7 @@ static void *worker(void *a) {
 }
 
 static void *heavy_worker(void *a) {
-    (void)a;
+    int slot = (int)(intptr_t)a;
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (!heavy_head) pthread_cond_wait(&heavy_cond, &jobs_lock);
@@ -655,9 +656,9 @@ static void *heavy_worker(void *a) {
         heavy_head = j->next;
         if (!heavy_head) heavy_tail = NULL;
         pthread_mutex_unlock(&jobs_lock);
-        atomic_store(&heavy_since, SDL_GetTicksNS());
+        atomic_store(&heavy_since[slot], SDL_GetTicksNS());
         j->fn(j->arg);
-        atomic_store(&heavy_since, 0);
+        atomic_store(&heavy_since[slot], 0);
         free(j);
     }
     return NULL;
@@ -710,8 +711,7 @@ static void start_workers(void) {
     if (n > 16) n = 16;
     for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, worker, NULL); }
     atomic_store(&nworkers, n);
-    pthread_t t;
-    pthread_create(&t, NULL, heavy_worker, NULL);
+    for (int i = 0; i < NHEAVY; i++) { pthread_t t; pthread_create(&t, NULL, heavy_worker, (void *)(intptr_t)i); }
 }
 static pthread_once_t workers_once = PTHREAD_ONCE_INIT;
 
@@ -871,11 +871,13 @@ const char *renderer_stats(void) {
             snprintf(stats_text + n, sizeof stats_text - n, ", xlat %llu cached / %llu new %.0fms", (unsigned long long)hit,
                      (unsigned long long)miss, ns / 1e6);
         }
-        uint64_t hs = atomic_load(&heavy_since);
-        static uint64_t hs_logged;
-        if (hs && hs != hs_logged && SDL_GetTicksNS() - hs > 10000000000ull) {
-            hs_logged = hs;
-            LOG("[shader] a large compute shader has been building for over 10 s\n");
+        for (int i = 0; i < NHEAVY; i++) {
+            uint64_t hs = atomic_load(&heavy_since[i]);
+            static uint64_t hs_logged[NHEAVY];
+            if (hs && hs != hs_logged[i] && SDL_GetTicksNS() - hs > 10000000000ull) {
+                hs_logged[i] = hs;
+                LOG("[shader] a large compute shader has been building for over 10 s\n");
+            }
         }
         int q = atomic_load(&jobs_queued);
         if (q) {
@@ -3162,7 +3164,11 @@ static CsProg *compute_program(NvnProgram *np, uint32_t bufmask) {
         set_state(&cp->p.state, 2);
         return cp;
     }
-    if (cp->si->num_insts > 2000) run_heavy_job(build_compute, cp);
+    if (cp->si->num_insts > 2000) {
+        LOG("[compute] %llx: %u instructions, building on a thread for large shaders\n", (unsigned long long)ss->code_addr,
+            cp->si->num_insts);
+        run_heavy_job(build_compute, cp);
+    }
     else run_job(build_compute, cp);
     return cp;
 }
