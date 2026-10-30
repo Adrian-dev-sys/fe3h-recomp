@@ -1,0 +1,55 @@
+name: Bug report
+description: Something doesn't work or looks wrong in FE3H Recomp
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        FE3H Recomp is a spare-time project, shared as-is: reports are read when there's time, and replies aren't
+        guaranteed. Questions ("will it run on my PC?", "how do I...") go in [Discussions](https://github.com/onerag90/fe3h-recomp/discussions) instead.
+
+        **Never attach or link game files, DLC, extracted or generated code, or game assets.** Requests for the
+        game are closed without reply. Screenshots and short clips are fine.
+  - type: input
+    id: version
+    attributes:
+      label: FE3H Recomp version
+      description: Shown in the corner of the start screen, or the commit if you built it yourself.
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: CPU, GPU and GPU driver version
+      placeholder: Ryzen 7 5800X, Radeon RX 6800 XT, driver 25.10.1
+    validations:
+      required: true
+  - type: checkboxes
+    id: dump
+    attributes:
+      label: Game files
+      options:
+        - label: I'm using my own dump of the game, version 1.2.0
+          required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead. Where in the game, if it matters.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        Drag `fe3hrecomp.log` from the program's folder into this box. It holds the session that just ended, so
+        attach it before starting the game again. It contains no game code.
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Settings you changed, cheats you had on, screenshots.

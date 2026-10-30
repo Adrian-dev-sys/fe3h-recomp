@@ -17,5 +17,5 @@ Screenshots and short clips of the game in bug reports are fine.
 
 ## Reporting a problem
 
-Include your hardware (CPU, GPU), the settings you changed, what you did and what happened, and the end of
-`run.log` from that session.
+Use the bug report form: it asks for your hardware, what happened, and `fe3hrecomp.log` from the program's folder
+(the session that just ended; attach it before playing again). Questions go in Discussions.

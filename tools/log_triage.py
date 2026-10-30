@@ -210,11 +210,9 @@ def summarise(r):
 def render(entries, total):
     """entries: newest first, (source description, parse result or error string)"""
     out = [MARKER,
-           "This is an automatic summary of the LAS Recomp log files attached to this issue. It only reads the logs, "
-           "so a person will still look at the details.",
+           "This is an automatic summary of the log files attached to this issue.",
            "",
-           "For a new report, please attach `lasrecomp.log` from LAS Recomp's data folder (it always holds the latest "
-           "run; `lasrecomp-backup-*.log` there are the earlier runs)."]
+           "For a new report, please attach `fe3hrecomp.log` from the program's folder (it holds the latest run)."]
     for k, (src, r) in enumerate(entries):
         out += ["", f"#### {'Newest log' if k == 0 else 'Earlier log'}: {src}"]
         out.append(summarise(r) if isinstance(r, dict) else f"- Could not read this log: {clean(r, 120)}")
@@ -274,7 +272,7 @@ def attachments(text):
     seen, out = set(), []
     for u in ATTACH_RE.findall(text or ""):
         name = urllib.parse.unquote(u.rsplit("/", 1)[1]).lower()
-        if name.startswith("lasrecomp") and name.endswith((".log", ".txt")) and u not in seen:
+        if name.startswith(("fe3hrecomp", "lasrecomp")) and name.endswith((".log", ".txt")) and u not in seen:
             seen.add(u)
             out.append(u)
     return out

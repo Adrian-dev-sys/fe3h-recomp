@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and help
+    url: https://github.com/onerag90/fe3h-recomp/discussions
+    about: Will it run on my PC, setup help, general questions.
+  - name: LAS Recomp (Link's Awakening)
+    url: https://github.com/peiikai/LASRecomp
+    about: Anything about LAS Recomp itself or Link's Awakening belongs upstream.
