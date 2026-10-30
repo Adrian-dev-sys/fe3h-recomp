@@ -242,7 +242,8 @@ deps-windows:
 	tools/build_deps_windows.sh
 dist:
 	@[ -f build/deps-win/lib/libavcodec.dll.a ] || { echo "make deps-windows first (LGPL FFmpeg)"; exit 1; }
-	@[ -d build/helper/lasgen ] || { echo "make gen-helper first (the game code generator)"; exit 1; }
+	@[ -f build/gen-venv/.ok ] || { echo "make gen-helper first (the game code generator)"; exit 1; }
+	$(MAKE) build/helper/lasgen/.built  # (again when tools/*.py changed: a release never ships an older generator)
 	@[ -x build/zig/zig.exe ] || { echo "tools/fetch_zig.sh first (the compiler)"; exit 1; }
 	$(MAKE) B=$(WIN_B) DEPS=$(CURDIR)/build/deps-win RELEASE=1 $(WIN_B)/fe3hrecomp.exe
 	! nm $(WIN_B)/fe3hrecomp.exe | grep ' f_70' >/dev/null  # (no game code inside)
@@ -296,12 +297,14 @@ rando-helper: build/rando-venv/.ok
 # python.org CPython 3.12, GEN_PY="py -3.12" by default, as for the randomizer helper)
 GEN_PY  ?= $(RANDO_PY)
 GEN_VPY := $(subst rando-venv,gen-venv,$(RANDO_VPY))
-gen-helper: build/gen-venv/.ok
+gen-helper: build/helper/lasgen/.built
+build/helper/lasgen/.built: build/gen-venv/.ok tools/lasgen.spec $(wildcard tools/*.py tools/rando/*.py tools/rando/*.json)
 	$(if $(filter windows,$(PLATFORM)),USERPROFILE="$$(cygpath -w ~ 2>/dev/null || echo $$HOME)") \
 	$(GEN_VPY) -m PyInstaller --noconfirm --clean --log-level WARN --distpath build/helper --workpath build/pyinstaller \
 	    tools/lasgen.spec
 	$(if $(filter windows,$(PLATFORM)),$(GEN_VPY) tools/pe_no_cfg.py build/helper/lasgen/lasgen.exe)
 	@du -sh build/helper/lasgen
+	touch $@
 
 build/gen-venv/.ok:
 	$(GEN_PY) -m venv build/gen-venv

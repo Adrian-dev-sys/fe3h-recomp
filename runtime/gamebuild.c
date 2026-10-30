@@ -348,7 +348,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
     int queued[NGEN] = {0};  // chunk files of each module put in units so far
     bool tables[NGEN] = {false};
     int next = 0, jobs = o->jobs < 1 ? 1 : o->jobs > 64 ? 64 : o->jobs;
-    struct { PlatProc p; int unit; } run[64];
+    struct { PlatProc p; int unit; unsigned long long t0; } run[64];
     int nrun = 0;
     unsigned long long done_bytes = 0;
     double shown = 0;
@@ -400,7 +400,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         while (nrun < jobs && next < units.n) {
             PlatProc p = start_compile(&t, &units.u[next]);
             if (!p) { snprintf(why, why_size, "the compiler didn't start"); ok = false; break; }
-            run[nrun].p = p, run[nrun].unit = next++;
+            run[nrun].p = p, run[nrun].unit = next++, run[nrun].t0 = plat_now_ns();
             nrun++;
         }
         for (int k = 0; k < nrun; k++) {
@@ -415,6 +415,8 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
                 ok = false;
             }
             done_bytes += u->bytes;
+            double took = (double)(plat_now_ns() - run[k].t0) / 1e9;
+            if (took > 60) LOG("[gamebuild] %s: %.0f s (%llu KB of C)\n", u->src, took, u->bytes / 1024);
             if (run[k].unit > 0) remove(u->src);  // (generated C, done with: not kept. Unit 0 is the shipped entry file)
             run[k--] = run[--nrun];
         }
@@ -439,6 +441,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
 
     // 2. link
     if (ok) {
+        LOG("[gamebuild] compiled in %.0f s\n", (double)(plat_now_ns() - t0) / 1e9);
         if (o->progress) o->progress(shown > 0.95 ? shown : 0.95, "Finishing...");
         char rsp[1100], log[1100];
         snprintf(rsp, sizeof rsp, "%s" SEP "link.rsp", work);
