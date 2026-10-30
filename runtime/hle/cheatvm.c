@@ -18,6 +18,7 @@
 
 #include "../hle.h"
 #include "cheatvm.h"
+#include "../gamebuild.h"
 
 #define MAX_CHEATS 128
 #define MAX_WORDS 1024
@@ -168,7 +169,8 @@ static void load(void) {
         for (int j = 0; j < i && ch->on && !ch->master; j++)  // (two that exclude each other were on: the first stays)
             if (g_cheats[j].on && conflict(&g_cheats[j], ch)) ch->on = false;
         LOG("[cheats] %s%s%s%s\n", ch->name, ch->on ? " (on)" : "", ch->bad ? " (unsupported opcode: not run)" : "",
-            ch->needs_gen ? " (its code patch isn't compiled in: make gen-main, then make)" : "");
+            !ch->needs_gen ? "" : gamebuild_available() ? " (its code patch isn't compiled in: Settings > Game Files > Rebuild game code)"
+                                                        : " (its code patch isn't compiled in: make gen-main, then make)");
     }
     for (int i = 0; i < g_ncheats; i++)
         for (int j = 0; j < g_ncheats; j++)

@@ -591,14 +591,20 @@ def main():
     nchunks = 0
     ci = 0
     pending = None  # (address, lines, refs) of a big function that starts the next file
-    while ci < len(order) or pending:
+    # The biggest functions first (by guest code size): a function of megabytes of C compiles for minutes on one
+    # core, and written last (by address) it was compiled alone at the end of the start screen's build. The table
+    # below keeps the address order; only the order the files are written in changes.
+    BIG = 0x4000  # bytes of guest code (4096 instructions)
+    big = sorted((a for a in order if entries[a][0] - a >= BIG), key=lambda a: a - entries[a][0])
+    seq = big + [a for a in order if entries[a][0] - a < BIG]
+    while ci < len(seq) or pending:
         body, refs, size, fns = [], set(), 0, []
-        while (pending or ci < len(order)) and len(fns) < args.chunk and size < args.chunk_bytes:
+        while (pending or ci < len(seq)) and len(fns) < args.chunk and size < args.chunk_bytes:
             if pending:
                 a, lines, r = pending
                 pending = None
             else:
-                a = order[ci]
+                a = seq[ci]
                 ci += 1
                 end, labels, tables = entries[a]
                 lines = m.emit_function(a, end, labels, tables, hle)
