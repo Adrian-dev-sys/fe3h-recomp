@@ -2033,10 +2033,12 @@ static Prog *warm_find(NvnProgram *np, const ShaderKey *vkey, const ShaderKey *f
 }
 
 // At the first draw: the recorded programs and pipelines, queued to be built
+static void warm_cs_start(void);
 static void warm_start(void) {
     static bool started;
     if (started || warm_off()) return;
     started = true;
+    warm_cs_start();
     FILE *f = fopen("cache/warm.bin", "rb");
     if (!f) return;
     uint32_t hdr[4] = {0};
@@ -3093,6 +3095,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
 // ================================================================== compute
 typedef struct { Prog p; ShaderInfo *si; VkPipeline pipe; uint32_t local[3]; } CsProg;
 
+static void warm_cs_record(const CsProg *cp);
 static void build_compute(void *arg) {
     CsProg *cp = arg;
     size_t n = 0;
@@ -3117,8 +3120,127 @@ static void build_compute(void *arg) {
     VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
     slow_build_log("compute shader", cp->p.code[0], cp->si->num_insts, t0, t_spirv);
     atomic_fetch_add(&stat_compiles, 1);
+    if (r == VK_SUCCESS) warm_cs_record(cp);
     set_state(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
     if (r != VK_SUCCESS) LOG("[compute] pipeline failed: %d\n", r);
+}
+
+// Compute shaders in the prewarm too (cache/warm_cs.bin): each one built is recorded by its translation's hash and
+// workgroup size, and built again at launch like the graphics pipelines above. Without it a battle effect's compute
+// shaders (1-3 s each in AMD's driver the first time) were built only when the effect first played, and it was drawn
+// without them that once (a combat art cut-in as outlines). Large ones on the large-shader threads, as in play.
+#define WARM_CS_MAGIC 0x43524157u  // "WARC"
+#define WARM_CS_VERSION 1
+#define WARM_CS 2048               // (table size; at most half used)
+typedef struct { uint64_t xh; uint32_t local[3], ninsts; } WarmCsRec;
+typedef struct { WarmCsRec r; CsProg *cp; _Atomic int taken; } WarmCs;
+static WarmCs warm_cs[WARM_CS];
+static int nwarm_cs;
+static FILE *warm_cs_file;
+
+static WarmCs *warm_cs_slot(uint64_t xh, const uint32_t local[3], bool add) {
+    uint32_t i = (uint32_t)pair_hash(xh, local[0] | (uint64_t)local[1] << 16 | (uint64_t)local[2] << 32) & (WARM_CS - 1);
+    while (warm_cs[i].r.xh && (warm_cs[i].r.xh != xh || memcmp(warm_cs[i].r.local, local, 12)))
+        i = (i + 1) & (WARM_CS - 1);
+    if (warm_cs[i].r.xh) return &warm_cs[i];
+    if (!add || nwarm_cs >= WARM_CS / 2) return NULL;
+    nwarm_cs++;
+    warm_cs[i].r.xh = xh;
+    memcpy(warm_cs[i].r.local, local, 12);
+    return &warm_cs[i];
+}
+
+static void warm_cs_record(const CsProg *cp) {
+    if (warm_off() || !cp->p.xh[0]) return;
+    pthread_mutex_lock(&warm_lock);
+    WarmCs *w = warm_cs_slot(cp->p.xh[0], cp->local, false);
+    if (!w && (w = warm_cs_slot(cp->p.xh[0], cp->local, true))) {  // (new: not in the file yet)
+        w->r.ninsts = cp->si->num_insts;
+        if (!warm_cs_file) {
+            mkdir("cache", 0755);
+            warm_cs_file = fopen("cache/warm_cs.bin", "ab");
+            if (warm_cs_file && (fseek(warm_cs_file, 0, SEEK_END), ftell(warm_cs_file)) == 0) {
+                uint32_t hdr[4] = {WARM_CS_MAGIC, WARM_CS_VERSION, (uint32_t)sizeof(WarmCsRec), 0};
+                fwrite(hdr, sizeof hdr, 1, warm_cs_file);
+            }
+        }
+        if (warm_cs_file) { fwrite(&w->r, sizeof w->r, 1, warm_cs_file); fflush(warm_cs_file); }
+    }
+    pthread_mutex_unlock(&warm_lock);
+}
+
+static void warm_cs_build(void *arg) {
+    WarmCs *w = arg;
+    if (atomic_exchange(&w->taken, 1)) return;  // (already built: the game needed it first, warm_cs_find)
+    CsProg *cp = w->cp;
+    cp->si = xlat_load(w->r.xh);
+    if (!cp->si || !cp->si->msl) {
+        if (!cp->si) cp->si = calloc(1, sizeof *cp->si);
+        set_state(&cp->p.state, 2);
+        return;
+    }
+    cp->p.vi = cp->si;
+    build_compute(cp);
+}
+
+static void warm_cs_queue(WarmCs *w, bool low) {
+    if (w->r.ninsts > 2000) run_heavy_job(warm_cs_build, w);
+    else run_job_at(warm_cs_build, w, low);
+}
+
+static void warm_cs_start(void) {
+    FILE *f = fopen("cache/warm_cs.bin", "rb");
+    if (!f) return;
+    uint32_t hdr[4] = {0};
+    if (fread(hdr, sizeof hdr, 1, f) != 1 || hdr[0] != WARM_CS_MAGIC || hdr[1] != WARM_CS_VERSION || hdr[2] != sizeof(WarmCsRec)) {
+        fclose(f);
+        remove("cache/warm_cs.bin");
+        return;
+    }
+    WarmCsRec r;
+    int ndead = 0;
+    pthread_mutex_lock(&warm_lock);
+    while (fread(&r, sizeof r, 1, f) == 1) {
+        char path[64];
+        struct stat sb;
+        snprintf(path, sizeof path, "cache/xlat/%016llx.bin", (unsigned long long)r.xh);
+        if (stat(path, &sb)) { ndead++; continue; }  // (an older translator's: built again when met)
+        if (warm_cs_slot(r.xh, r.local, false)) continue;
+        WarmCs *w = warm_cs_slot(r.xh, r.local, true);
+        if (!w) break;
+        w->r = r;
+        w->cp = calloc(1, sizeof *w->cp);
+        w->cp->p.warm = true;
+        w->cp->p.xh[0] = r.xh;
+        w->cp->p.code[0] = r.xh;  // (for the slow build log)
+        memcpy(w->cp->local, r.local, 12);
+    }
+    fclose(f);
+    if (ndead) {  // (the file without them: the live table, rewritten)
+        FILE *o = fopen("cache/warm_cs.bin.tmp", "wb");
+        bool ok = o && fwrite(hdr, sizeof hdr, 1, o) == 1;
+        for (int i = 0; ok && i < WARM_CS; i++)
+            if (warm_cs[i].cp) ok = fwrite(&warm_cs[i].r, sizeof warm_cs[i].r, 1, o) == 1;
+        if (o && fclose(o)) ok = false;
+        if (ok) { remove("cache/warm_cs.bin"); ok = !rename("cache/warm_cs.bin.tmp", "cache/warm_cs.bin"); }
+        if (!ok) remove("cache/warm_cs.bin.tmp");
+    }
+    pthread_mutex_unlock(&warm_lock);
+    if (!nwarm_cs) return;
+    LOG("[shader] prewarm: building %d compute shaders from earlier sessions\n", nwarm_cs);
+    for (int i = 0; i < WARM_CS; i++)
+        if (warm_cs[i].cp) warm_cs_queue(&warm_cs[i], true);
+}
+
+// The compute program the game binds, if it was prebuilt (by its translation's hash and workgroup size)
+static CsProg *warm_cs_find(uint64_t xh, const uint32_t local[3]) {
+    if (!nwarm_cs || !xh) return NULL;
+    pthread_mutex_lock(&warm_lock);
+    WarmCs *w = warm_cs_slot(xh, local, false);
+    pthread_mutex_unlock(&warm_lock);
+    if (!w || !w->cp) return NULL;
+    if (!atomic_load(&w->taken)) warm_cs_queue(w, false);  // (needed now: ahead of the rest of the prewarm)
+    return w->cp;
 }
 
 static struct CsEnt { uint64_t addr; uint32_t bufmask; CsProg *cp; } g_cs_tab[256];  // compute programs by code address
@@ -3138,7 +3260,7 @@ static CsProg *compute_program(NvnProgram *np, uint32_t bufmask) {
     k.glsl = 1;
     key_set_buf_mask(&k, bufmask);
     cp->si = translate_cached((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000,
-                              STAGE_COMPUTE, &k, NULL);
+                              STAGE_COMPUTE, &k, &cp->p.xh[0]);
     cp->p.vi = cp->si;
     cp->p.code[0] = ss->code_addr;
     if (!cp->si->msl) {
@@ -3149,6 +3271,14 @@ static CsProg *compute_program(NvnProgram *np, uint32_t bufmask) {
     for (int i = 0; i < 3; i++) {
         cp->local[i] = ss->control ? *(const uint32_t *)(ss->control + 0x748 + 4 * i) : 1;
         if (!cp->local[i]) cp->local[i] = 1;
+    }
+    CsProg *w = warm_cs_find(cp->p.xh[0], cp->local);
+    if (w) {  // (prebuilt at launch, or building)
+        if (n < 256) tab[n].cp = w;
+        free(cp->si->msl);
+        free(cp->si);
+        free(cp);
+        return w;
     }
     save_glsl(cp->si->msl, ss->code_addr, "cs");
     // Very large ones (battle shaders of ~9,000 instructions with subroutine calls, as a branch state machine): the
