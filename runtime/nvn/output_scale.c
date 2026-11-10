@@ -63,7 +63,7 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
     if (forced < 0) forced = getenv("LARECOMP_SCALE") ? atof(getenv("LARECOMP_SCALE")) : 0;
     if (wide_test < 0) wide_test = getenv("LARECOMP_WIDE_TEST") ? atof(getenv("LARECOMP_WIDE_TEST")) : 0;
     double shape = wide_test > 0 ? wide_test : (dw / dh) / (16.0 / 9.0);
-    bool reshape = reshape_allowed && fabs(shape - 1.0) > 0.005;
+    bool reshape = reshape_allowed && shape > 1.005;  // (FE3H: wider only; taller windows keep the 16:9 box)
     if (!reshape) shape = 1.0;
     // render height in units of the Switch's 1080 lines
     double h;

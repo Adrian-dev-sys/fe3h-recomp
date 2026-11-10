@@ -12,7 +12,98 @@
 
 static float g_wide = 1.0f;  // output aspect divided by 16:9 (1 = normal)
 
-void widescreen_set_factor(float f) { g_wide = f; }
+// FE3H: every camera reads its aspect from one 16:9 literal (main+0xcb801c, 19 loads); it becomes the window's aspect
+// (as Fl4sh9174's 21:9 emulator mod writes 21:9 there)
+#define FE3H_ASPECT_LITERAL (MAIN_BASE + 0xcb801cull)
+static void find_proj_tick(void);
+void widescreen_set_factor(float f) {
+    g_wide = f;
+    find_proj_tick();
+    static bool rw;
+    if (!rw) { extern int plat_protect(uint64_t, uint64_t, int); plat_protect(FE3H_ASPECT_LITERAL & ~0x3FFFull, 0x4000, 3); rw = true; }
+    float a = 16.0f / 9.0f * (f > 1.0f ? f : 1.0f);
+    memcpy((void *)(uintptr_t)FE3H_ASPECT_LITERAL, &a, 4);
+}
+
+// (RE) LARECOMP_FIND_PROJ=<frame>: find the main camera's projection in writable memory (its x / y scales, logged
+// by exec.c LARECOMP_LOG_PROJ) and the 16:9 floats; LARECOMP_FIND_PROJ_WATCH=1 watches the first projection hit
+float g_proj_lx, g_proj_ly;
+static void find_proj_tick(void) {
+    {   // LARECOMP_WATCH_EARLY=<hex lo>,<hex hi>: watch from the first frame (writers of a field set once)
+        static int armed;
+        const char *e = armed ? NULL : getenv("LARECOMP_WATCH_EARLY");
+        armed = 1;
+        if (e) {
+            extern uint64_t g_watch_lo, g_watch_hi;
+            extern void watch_arm(void);
+            char *p;
+            g_watch_lo = strtoull(e, &p, 16);
+            g_watch_hi = *p == ',' ? strtoull(p + 1, NULL, 16) : g_watch_lo + 4;
+            watch_arm();
+        }
+    }
+    static long at = -2;
+    if (at == -2) at = getenv("LARECOMP_FIND_PROJ") ? atol(getenv("LARECOMP_FIND_PROJ")) : -1;
+    extern uint64_t renderer_present_count(void);
+    if (at < 0 || (long)renderer_present_count() != at) return;
+    at = -1;
+    extern int kernel_data_regions(uint64_t *addr, uint64_t *size, int max);
+    uint64_t ra[64], rs[64];
+    int nr = kernel_data_regions(ra, rs, 64), np = 0, na = 0;
+    float lx = g_proj_lx, ly = g_proj_ly, asp = 16.0f / 9.0f;
+    static bool na_heap_watched;
+    LOG("[findproj] x %.5f y %.5f\n", lx, ly);
+    for (int i = 0; i < nr; i++) {
+        const float *p = (const float *)(uintptr_t)ra[i];
+        uint64_t nw = rs[i] / 4;
+        for (uint64_t k = 0; k < nw; k++) {
+            float v = p[k];
+            if (na < 60 && v == asp) {
+                uint64_t a = ra[i] + k * 4;
+                static int nth = -1;  // LARECOMP_FIND_ASPECT_WATCH=<n>: the n-th heap hit's block (position .. aspect)
+                if (nth < 0) nth = ENV("LARECOMP_FIND_ASPECT_WATCH") ? atoi(getenv("LARECOMP_FIND_ASPECT_WATCH")) : 999;
+                if (!na_heap_watched && a >= HEAP_BASE && nth-- == 0) {
+                    extern uint64_t g_watch_lo, g_watch_hi;
+                    extern void watch_arm(void);
+                    g_watch_lo = a - 0x18, g_watch_hi = a + 0x400;  // (and the blocks after it on that page)
+                    watch_arm();
+                    na_heap_watched = true;
+                }
+                LOG("[findproj] 16:9 at %llx:", (unsigned long long)a);
+                for (int d = -6; d < 10 && k + d < nw; d++) if ((int64_t)k + d >= 0) LOG(" %g", p[k + d]);
+                LOG("\n");
+                na++;
+            }
+            if (np < 40 && lx > 0 && fabsf(v - lx) < 2e-4f * lx) {
+                bool y = false;  // y scale within the next 4x4 rows (column / row major)
+                for (int d = 1; d <= 6 && k + d < nw; d++) y |= fabsf(p[k + d] - ly) < 2e-3f * ly;
+                if (!y) continue;
+                uint64_t a = ra[i] + k * 4;
+                LOG("[findproj] proj at %llx:", (unsigned long long)a);
+                for (int d = 0; d < 16 && k + d < nw; d++) LOG(" %g", p[k + d]);
+                LOG("\n");
+                if (!np && ENV("LARECOMP_FIND_PROJ_WATCH")) {
+                    extern uint64_t g_watch_lo, g_watch_hi;
+                    extern void watch_arm(void);
+                    g_watch_lo = a, g_watch_hi = a + 4;
+                    watch_arm();
+                }
+                np++;
+            }
+        }
+    }
+    LOG("[findproj] %d projection hits, %d 16:9 floats\n", np, na);
+}
+
+// A camera's aspect as its projection / frustum code reads it (tools/patches.py FE3H_CAM_ASPECT_SITES): 16:9 cameras
+// take the window's shape; other shapes (shadow maps, square portrait renders) stay
+float rt_cam_aspect(float a) {
+    if (g_wide > 1.005f && fabsf(a - 16.0f / 9.0f) < 0.01f) return a * g_wide;
+    return a;
+}
+
+// The two calls to main+0xa32db0 the same mod removes for wide views (tools/patches.py FE3H_WIDE_SKIP_SITES)
+int rt_fe3h_wide_skip(void) { return g_wide > 1.005f && !ENV("LARECOMP_KEEP_A32DB0"); }
 float widescreen_factor(void) { return g_wide; }
 
 // Effects drawn as a mesh around the camera, sized to cover a 16:9 view: with the widened camera their outer edge
@@ -121,6 +212,8 @@ static bool level_is_interior(void) {
 }
 
 bool widescreen_frame_boxed(uint64_t frame) {
+    (void)level_is_interior;
+    if (1) return false;  // FE3H: the whole frame is wide (the room logic below reads Link's Awakening memory)
     static bool last;
     static uint64_t interior_until;  // keep boxing briefly after leaving: the first (dark) frames still show stale sides
     bool in = level_is_interior();

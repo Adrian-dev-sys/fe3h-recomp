@@ -27,7 +27,7 @@ static const char *settings_file(void) {
 }
 
 Settings g_settings = {
-    .aspect = ASPECT_UNLOCKED,
+    .aspect = ASPECT_ORIGINAL,
     .fullscreen = false,
     .volume = 1.0f,
     .reverb = true,
@@ -85,8 +85,8 @@ const char *settings_language_name(void) {
 
 static void fe3h_settings(void) {
     // Fire Emblem: Three Houses: Link's Awakening's options stay off whatever an older settings file says (their hooks
-    // patch that game's code and memory), and the game keeps its own 16:9 framing (no widescreen camera patch here).
-    g_settings.aspect = ASPECT_ORIGINAL, g_settings.aspect_asked = true;
+    // patch that game's code and memory). Aspect: the Video tab's choice (16:9 unless set; no first-run prompt).
+    g_settings.aspect_asked = true;
     g_settings.dpad_move = g_settings.move_360 = g_settings.blur_removal = g_settings.hide_hero_icon = false;
     g_settings.mirror_mode = g_settings.cheat_hearts = g_settings.cheat_ammo = g_settings.cheat_rupees = false;
     g_settings.cheat_hookshot = g_settings.no_buff_drops = g_settings.diff_ohko = g_settings.diff_hero = false;

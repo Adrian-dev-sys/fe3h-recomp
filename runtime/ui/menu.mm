@@ -440,7 +440,15 @@ extern "C" double output_scale_dynamic_factor(void);
 static void tab_display(void) {
     float scale = ImGui::GetFontSize() / 34;
     opt_begin("##video", scale);
-    opt_section("Display");  // (no aspect ratio choice: FE3H keeps its 16:9 framing, settings.c)
+    opt_section("Display");
+    {
+        static const char *asp[] = {"16:9", "Fill screen"};
+        int ai = g_settings.aspect == ASPECT_UNLOCKED ? 1 : 0;
+        if (opt_choice("Aspect ratio", &ai, asp, 2, 0,
+                       "16:9: the Switch's framing, with bars on wider screens. Fill screen: ultrawide - the 3D view "
+                       "widens to the window; menus and text stay 16:9 in the middle.", false))
+            g_settings.aspect = ai ? ASPECT_UNLOCKED : ASPECT_ORIGINAL;
+    }
     bool fs = g_settings.fullscreen;
     if (opt_toggle("Fullscreen", &fs, false, "Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.")) {
         g_settings.fullscreen = fs;

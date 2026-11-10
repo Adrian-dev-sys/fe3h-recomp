@@ -685,4 +685,46 @@ def _prompt_pos(gen, a):
 
 
 PATCHES[PROMPT_POS_SITE] = _prompt_pos
-PATCHES = {}
+PATCHES = {}  # (everything above is Link's Awakening's; FE3H's own below)
+
+# FE3H ultrawide (runtime/hle/widescreen.c): the cameras' aspect is a literal the runtime rewrites; these two calls to
+# main+0xa32db0 are skipped while the view is wider than 16:9 (Fl4sh9174's 21:9 emulator mod NOPs them)
+FE3H_WIDE_SKIP_SITES = (0x700055a6c4, 0x70005653f8)
+
+
+def _fe3h_wide_skip(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert (w >> 26) == 0x25 and a + ((w & 0x3ffffff) << 2) == 0x7000a32db0, hex(w)  # bl 0xa32db0
+    return ('{ extern int rt_fe3h_wide_skip(void); '
+            f'if (!rt_fe3h_wide_skip()) {{ c->x[30] = {a + 4:#x}ull; f_7000a32db0(c); }} }}'
+            f'  /* {a:#x}: bl 0xa32db0 (skipped when wide) */')
+
+
+for _a in FE3H_WIDE_SKIP_SITES:
+    PATCHES[_a] = _fe3h_wide_skip
+
+# The cameras' own aspect (camera params +0x13c: near +0x130, far +0x134, fovy +0x138) as their projection / frustum
+# builders read it next to tanf(fovy / 2) - main+0x98df50 builds the 3D projection, 0xaa41c0 the culling frustum.
+# Each read goes through rt_cam_aspect(): 16:9 becomes the window's aspect, other shapes stay.
+FE3H_CAM_ASPECT_SITES = (0x70004df17c, 0x700098dfa4, 0x7000a58abc, 0x7000a591e8, 0x7000a5a58c, 0x7000a5a8f4,
+                         0x7000a5acdc, 0x7000a5b02c, 0x7000a5ba44, 0x7000a8cfbc, 0x7000a8e17c, 0x7000a8ee44,
+                         0x7000a96bc4, 0x7000a96fa8, 0x7000a97a4c, 0x7000aa4244)
+
+
+# The engine camera's own projection (main+0xa32b50: near +0x140, far +0x144, fovy +0x148, aspect +0x14c; x scale =
+# y scale / aspect at 0xa32d28): its perspective path's aspect load - the main 3D view.
+FE3H_PROJ_ASPECT_SITES = (0x7000a32b74,)
+
+
+def _fe3h_cam_aspect(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    off = ((w >> 10) & 0xfff) * 4
+    assert (w & 0xffc00000) == 0xbd400000 and off in (0x13c, 0x14c), hex(w)  # ldr sT, [xN, #off]
+    rt, rn = w & 31, (w >> 5) & 31
+    return ('{ extern float rt_cam_aspect(float); float o_; '
+            f'memcpy(&o_, (const void *)(uintptr_t)(c->x[{rn}] + {off:#x}), 4); o_ = rt_cam_aspect(o_); '
+            f'c->v[{rt}] = 0; memcpy(&c->v[{rt}], &o_, 4); }}  /* {a:#x}: ldr s{rt}, [x{rn}, #{off:#x}] (camera aspect) */')
+
+
+for _a in FE3H_CAM_ASPECT_SITES + FE3H_PROJ_ASPECT_SITES:
+    PATCHES[_a] = _fe3h_cam_aspect

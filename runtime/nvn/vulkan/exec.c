@@ -3495,6 +3495,22 @@ static void draw_(CmdRec *r, bool indexed) {
             fkey.attr_kind[1] = (uint8_t)fminf(255.0f, lroundf(fminf(usx, usy) * 16));  // (scale x16: 1:1-ish lookups only)
         }
     }
+    if (getenv("LARECOMP_LOG_PROJ") && st.ubuf[0][0].addr && st.ubuf[0][0].size >= 64) {
+        // (debug) a 3D draw's view-projection (c3, 4x4): x scale / y scale = the camera's 1 / aspect
+        static uint64_t lastf = ~0ull;
+        uint64_t f = renderer_present_count();
+        const float *m = (const float *)(uintptr_t)st.ubuf[0][0].addr;
+        float lx = sqrtf(m[0] * m[0] + m[4] * m[4] + m[8] * m[8]), ly = sqrtf(m[1] * m[1] + m[5] * m[5] + m[9] * m[9]);
+        bool persp = fabsf(m[3]) + fabsf(m[7]) + fabsf(m[11]) > 0.01f && lx > 0.01f && ly > 0.01f;
+        extern float g_proj_lx, g_proj_ly;
+        if (persp && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->width == 1920) g_proj_lx = lx, g_proj_ly = ly;
+        if (persp && f / 60 != lastf / 60) {
+            lastf = f;
+            LOG("[proj] f%llu vs %llx c3 %llx: x/y %.4f (16:9 = 0.5625) rt %ux%u\n", (unsigned long long)f,
+                (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)st.ubuf[0][0].addr, lx / ly,
+                st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->width : 0, st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->height : 0);
+        }
+    }
     Prog *pr = get_program(st.program, &vkey, &fkey);
     if (!pr || !wait_built(&pr->state, &pr->waited_ns))
         SKIP(SK_PROG, "vs %llx fs %llx state %d\n", (unsigned long long)st.program->stages[0].code_addr,
@@ -3800,6 +3816,13 @@ static void draw_(CmdRec *r, bool indexed) {
         }
         bool composite = reads_scene || fade_fill || (fullscreen_fill && wide_frame == renderer_present_count());
         if (!composite) wide_frame = ~0ull;
+        {   // FE3H: only 2D UI is boxed - its vertex cbuf starts with the pixel -> clip scale (2 / w, -2 / h); the map's 3D
+            // overlays (unit rings, tile highlights) drawn into the same image keep the wide camera's place
+            const float *u = (const float *)(uintptr_t)st.ubuf[0][0].addr;
+            float w = (float)st.rt.color[0]->width, h = (float)st.rt.color[0]->height;
+            bool ui = u && st.ubuf[0][0].size >= 16 && fabsf(u[0] * w - 2) < 0.02f && fabsf(fabsf(u[1]) * h - 2) < 0.02f;
+            if (!ui) composite = true;
+        }
         if (!composite) {
             int pw, ph;
             pass_size(&pw, &ph);
