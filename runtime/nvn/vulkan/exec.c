@@ -1579,6 +1579,7 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     const uint8_t *vb = (const uint8_t *)vkey;
     for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
+    if (fkey->attr_kind[0]) { h ^= fkey->attr_kind[0]; h *= 0x100000001B3ull; h ^= fkey->attr_kind[1]; h *= 0x100000001B3ull; }
     if (key_buf_mask(fkey)) {  // (buffer textures: only keys that have them hash differently)
         uint32_t m = key_buf_mask(fkey);
         for (int i = 0; i < 4; i++) { h ^= (m >> (i * 8)) & 0xFF; h *= 0x100000001B3ull; }
@@ -2893,6 +2894,10 @@ static VkImageView image_view(int stage, const ShaderTexture *st_) {
     NvnTexEntry *e = image_entry(stage, st_);
     if (!e) return VK_NULL_HANDLE;
     TexBackend *b = vk_tex(e->tex, false);  // (its data uploaded first if the CPU wrote it)
+    if (b->scalable && (b->sx != 1 || b->sy != 1)) {  // (stores use guest texel coordinates: would cover a corner only)
+        static int nlog;
+        if (nlog++ < 10) LOG("[vk] image store to a scaled target %ux%u fmt %#x (x%.3f)\n", e->tex->width, e->tex->height, e->tex->format, b->sx);
+    }
     if (!b->storage_fmt || rt_kind(e->tex->format)) {  // (integer formats: the translator stores floats)
         static int nlog;
         if (nlog++ < 10) LOG("[vk] image %p (nvn fmt %#x flags %#x) isn't a storage image: compute store skipped\n", (void *)e->tex,
@@ -3479,6 +3484,17 @@ static void draw_(CmdRec *r, bool indexed) {
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
+    {   // blended, no depth write, into a scaled target (UI): sharp-bilinear 2D lookups, so atlas pieces magnified past
+        // 1:1 don't bleed in their neighbours (a line in the dialogue box at 2x; translate.c glsl_sample)
+        static int off = -1;
+        if (off < 0) off = getenv("LARECOMP_NO_UI_SHARP") != NULL;
+        float usx = 1, usy = 1;
+        if (!off && st.rt.ncolor && st.rt.color[0]) renderer_texture_scale(st.rt.color[0], &usx, &usy);
+        if ((usx != 1 || usy != 1) && (st.color_state[0] & 1) && !(st.ds[0] && st.ds[1])) {
+            fkey.attr_kind[0] = 1;
+            fkey.attr_kind[1] = (uint8_t)fminf(255.0f, lroundf(fminf(usx, usy) * 16));  // (scale x16: 1:1-ish lookups only)
+        }
+    }
     Prog *pr = get_program(st.program, &vkey, &fkey);
     if (!pr || !wait_built(&pr->state, &pr->waited_ns))
         SKIP(SK_PROG, "vs %llx fs %llx state %d\n", (unsigned long long)st.program->stages[0].code_addr,
@@ -4072,6 +4088,21 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             for (int k = 0; k < 16; k++) LOG(" %.4g", v[k]);
             LOG("\n");
         }
+        uint32_t sd = st.stream[0][0];
+        if (!indexed && st.vbuf[0].addr && sd >= 24 && r->x[2] <= 6) {  // (small non-indexed draws: each vertex's first 6 floats)
+            for (uint64_t k = 0; k < r->x[2]; k++) {
+                uint64_t off = (r->x[1] + k) * sd;
+                if (off + 24 > st.vbuf[0].size) break;
+                const float *q = (const float *)(uintptr_t)(st.vbuf[0].addr + off);
+                LOG("[draw]   v%llu: %.4f %.4f %.4f | %.6f %.6f\n", (unsigned long long)k, q[0], q[1], q[2], q[4], q[5]);
+            }
+        }
+        if (st.ubuf[0][0].addr) {  // vertex cbuf c3: the first 16 floats (transform)
+            const float *u = (const float *)(uintptr_t)st.ubuf[0][0].addr;
+            LOG("[draw]   vcb0:");
+            for (int k = 0; k < 16; k++) LOG(" %.6g", u[k]);
+            LOG("\n");
+        }
         for (int c = 0; c < 18; c++) {
             if (!((pr->fi->cbuf_mask >> c) & 1) || !st.ubuf[1][c].addr) continue;
             const float *u = (const float *)(uintptr_t)st.ubuf[1][c].addr;
@@ -4454,9 +4485,9 @@ static VkPipeline post_pipeline(const char *fs) {
 }
 
 // Post image `i` at w x h (RGBA8, kept until the size changes). 0, 1: SMAA edges / weights, 2: SMAA output,
-// 3, 4: FSR EASU / RCAS.
+// 3, 4: FSR EASU / RCAS, 5: supersampling resolve.
 static TexBackend *post_image(int i, uint32_t w, uint32_t h) {
-    static TexBackend img[5];
+    static TexBackend img[6];
     TexBackend *d = &img[i];
     if (d->image && (d->width != w || d->height != h)) {
         vk_views_forget(d);
@@ -4551,7 +4582,9 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
     if (ow > 16384) ow = 16384;
     if (oh > 16384) oh = 16384;
     bool fsr = g_settings.upscaler == UPSCALE_FSR1 && (ow > b->width + 1 || oh > b->height + 1);  // (an upscale only)
-    if (!smaa && !fsr) return v;
+    // larger than the window: average every source pixel (bilinear would skip most of them and keep the shimmer)
+    bool down = !fsr && ow && oh && (ow + 1 < b->width || oh + 1 < b->height) && !getenv("LARECOMP_NO_RESOLVE");
+    if (!smaa && !fsr && !down) return v;
     extern void vk_frame_suspend(void);
     extern void vk_frame_resume(void);
     vk_frame_suspend();
@@ -4579,13 +4612,22 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
         post_pass(cb, "rcas.frag", ri_, 1, r, pr, false);
         v = post_view(r);
     }
+    if (down) {
+        float iw = (float)b->width, ih = (float)b->height;
+        TexBackend *d = post_image(5, ow, oh);
+        float pd[8] = {iw / ow, ih / oh, 0, 0, iw, ih};
+        VkImageView di[3] = {v};
+        post_pass(cb, "downscale.frag", di, 1, d, pd, false);
+        v = post_view(d);
+    }
     vk_full_barrier(cb);
     vk_frame_resume();
     {
         static uint32_t piw, pih, pow_, poh;
         static int psm = -1, pfs = -1;
         if (b->width != piw || b->height != pih || ow != pow_ || oh != poh || smaa != psm || fsr != pfs)
-            LOG("[post] %ux%u%s%s -> %ux%u\n", b->width, b->height, smaa ? " smaa" : "", fsr ? " fsr1" : "", ow, oh);
+            LOG("[post] %ux%u%s%s%s -> %ux%u\n", b->width, b->height, smaa ? " smaa" : "", fsr ? " fsr1" : "",
+                down ? " resolve" : "", ow, oh);
         piw = b->width; pih = b->height; pow_ = ow; poh = oh; psm = smaa; pfs = fsr;
     }
     return v;

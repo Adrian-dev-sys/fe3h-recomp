@@ -532,6 +532,9 @@ void backend_present(NvnTexture *t) {  // (one thread at a time in the backend: 
 static void backend_present_locked(NvnTexture *t) {
     g_last_presented = t;
     TexBackend *b = vk_tex(t, true);
+    if (!b->presented && getenv("LARECOMP_LOG_SCALE"))  // (debug) the texture the game shows
+        LOG("[present] %ux%u fmt %#x flags %#x -> %ux%u scalable %d\n", t->width, t->height, t->format, t->flags, b->width,
+            b->height, b->scalable);
     b->presented = true;
     vk_end_pass();
     static const float black[4] = {0, 0, 0, 1};

@@ -637,6 +637,8 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
     const char *extra = NULL;  // separate compare argument (cube array shadow)
     if (!t->shadow) {
         if (layer) snprintf(P, sizeof P, "vec%d(%s, float(%s))", n + 1, xs, layer);
+        else if (type == TEXTYPE_2D && lod_kind == 0 && c->stage == STAGE_FRAGMENT && c->key && c->key->attr_kind[0] == 1)
+            snprintf(P, sizeof P, "ui_sharp(%s, vec2(tsize%d(0).xy))", xs, slot);  // (UI at a raised resolution)
         else snprintf(P, sizeof P, "%s", xs);
     } else if (type == TEXTYPE_CUBE_ARRAY) {
         snprintf(P, sizeof P, "vec4(%s, float(%s))", xs, layer ? layer : "0u");
@@ -2165,6 +2167,13 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         default: sp(&s, "ivec3 tsize%d(int l) { return ivec3(textureSize(t%d, l), 1); }\n", i, i);
         }
     }
+    // sharp bilinear: blends only within a pixel of a texel edge; for art drawn about 1:1 at 1x (texels per 1x pixel
+    // >= 0.75 - scale attr_kind[1] / 16), larger magnifications (soft effect textures) keep plain bilinear
+    if (stage == STAGE_FRAGMENT && key && key->attr_kind[0] == 1)
+        sp(&s, "vec2 ui_sharp(vec2 uv, vec2 sz) { vec2 t = uv * sz - 0.5f; vec2 i = floor(t); vec2 w = fwidth(t); "
+               "vec2 d = mix(vec2(1.0f), clamp(w, vec2(1e-5f), vec2(1.0f)), step(vec2(0.75f), w * %.4ff)); "
+               "return (i + clamp((t - i - 0.5f) / d + 0.5f, 0.0f, 1.0f) + 0.5f) / sz; }\n",
+           key->attr_kind[1] / 16.0f);
     if (c->buf_used) {
         sp(&s, "%s", glsl_bfetch_at);
         for (int i = 0; i < info->ntex && i < 64; i++)

@@ -173,7 +173,9 @@ uint64_t renderer_present_count(void);
 static bool tex_scalable(const NvnTexture *t) {
     if (getenv("LARECOMP_NO_SCALE")) return false;
     if (t->target != 1 || t->samples > 1 || !(t->flags & 8) || t->width < 32 || t->height < 16) return false;
-    if (t->flags & 4) return false;  // (NVN image textures: compute shaders store at their texel coordinates)
+    // NVN image textures: compute shaders store at their texel coordinates. FE3H sets the image flag on every texture,
+    // its render targets too (flags 0xc): those scale (a store to one is logged, exec.c image_view)
+    if ((t->flags & 4) && !(t->flags & 8)) return false;
     float a = (float)t->width / (float)t->height;
     return a > 1.74f && a < 1.81f;
 }
@@ -423,6 +425,9 @@ static TexBackend *tex_backend(NvnTexture *t) {
     vk_collect_dead();
     b = calloc(1, sizeof *b);
     b->scalable = tex_scalable(t);
+    if (getenv("LARECOMP_LOG_SCALE") && t->target == 1 && t->width >= 32)  // (debug) which targets take the output scale
+        LOG("[scale] %ux%u fmt %#x flags %#x samples %u levels %u: %s\n", t->width, t->height, t->format, t->flags, t->samples,
+            t->levels, b->scalable ? "scalable" : "fixed");
     create_image(t, b);
     t->backend = b;
     live_add(t, b);

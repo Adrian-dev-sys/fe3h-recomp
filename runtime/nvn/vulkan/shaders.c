@@ -410,6 +410,30 @@ static const char *builtin_src(const char *name, int *stage) {
                "  o = vec4((lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0), 1.0);\n"
                "}\n";
     }
+    // Supersampling resolve: each output pixel averages the source texels it covers (area weights, linear light).
+    // a.xy = in / out scale, b.xy = input size.
+    if (!strcmp(name, "downscale.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() {\n"
+               "  vec2 lo = floor(gl_FragCoord.xy) * pc.a.xy, hi = lo + pc.a.xy;\n"
+               "  ivec2 s = ivec2(floor(lo)), e = min(ivec2(ceil(hi)), s + 8);\n"
+               "  vec3 ac = vec3(0.0);\n"
+               "  float aw = 0.0;\n"
+               "  for (int y = s.y; y < e.y; y++) {\n"
+               "    float wy = min(hi.y, float(y + 1)) - max(lo.y, float(y));\n"
+               "    for (int x = s.x; x < e.x; x++) {\n"
+               "      float w = wy * (min(hi.x, float(x + 1)) - max(lo.x, float(x)));\n"
+               "      vec3 c = texelFetch(t, clamp(ivec2(x, y), ivec2(0), ivec2(pc.b.xy) - 1), 0).rgb;\n"
+               "      ac += pow(c, vec3(2.2)) * w; aw += w;\n"
+               "    }\n"
+               "  }\n"
+               "  o = vec4(pow(ac / max(aw, 1e-6), vec3(1.0 / 2.2)), 1.0);\n"
+               "}\n";
+    }
     if (!strcmp(name, "clear.vert")) {
         *stage = STAGE_VERTEX;
         return "#version 450\n"
