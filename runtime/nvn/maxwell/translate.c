@@ -2249,6 +2249,9 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
                 }
                 r++;
             }
+            // NaN never reaches a float target: one such texel (FE3H unit effects on NVIDIA) is spread by the bloom
+            // blurs into a black blob
+            if (kind == 0 && !dbg) sp(&s, "  c%d = mix(c%d, vec4(0.0f), isnan(c%d));\n", rt, rt, rt);
         }
         if (tint)
             sp(&s, "  if (ltint[0].w > 0.0f) { vec3 g = c0.rgb; float l = dot(g, vec3(0.299f, 0.587f, 0.114f));\n"

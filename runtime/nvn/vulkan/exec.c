@@ -1094,7 +1094,7 @@ static void vk_end_pass_at(int line) {
     if (prof && line < 4096) prof_end_line[line]++;
     vkCmdEndRendering(vk_cmd());
     in_pass = false;
-    if (g_debug_frame && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
+    if (g_debug_frame && !getenv("LARECOMP_NAN_SCAN") && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
         char path[256];
         static uint64_t debug_pass_frame = ~0ull;
         static int multi = -1;
@@ -3402,10 +3402,71 @@ static bool topology(uint32_t mode, VkPrimitiveTopology *t, uint8_t *cls) {
     }
 }
 
+// LARECOMP_NAN_SCAN=1 (with F9): after every draw of the debug frames, the float colour targets are read back and a
+// change in their NaN / Inf texel counts is logged (which draw first writes them). No pass PNGs in this mode.
+static int nan_scan_on = -1;
+static void nan_scan(void) {
+    static struct { VkImage img; uint32_t nan, inf; } seen[64];
+    static int nseen;
+    for (int i = 0; i < st.rt.ncolor && i < 8; i++) {
+        TexBackend *b = st.rt.color[i] ? st.rt.color[i]->backend : NULL;
+        if (!b || !b->image || b->samples > 1) continue;
+        VkFormat f = b->format;
+        uint32_t bpp = f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || f == VK_FORMAT_R32_SFLOAT ? 4 : f == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 0;
+        if (!bpp) continue;
+        vk_end_pass();
+        VkCommandBuffer cb = vk_cmd();
+        vk_full_barrier(cb);
+        uint32_t w = b->width, h = b->height;
+        VkSpan out = vk_readback((uint64_t)w * h * bpp);
+        VkBufferImageCopy c = {.bufferOffset = out.off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+        vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
+        renderer_flush();
+        uint32_t nan = 0, inf = 0, x0 = w, y0 = h, x1 = 0, y1 = 0;
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t x = 0; x < w; x++) {
+                const uint8_t *p = (const uint8_t *)out.ptr + ((uint64_t)y * w + x) * bpp;
+                int bad = 0;  // 1 inf, 2 nan
+                if (f == VK_FORMAT_R32_SFLOAT) {
+                    uint32_t v; memcpy(&v, p, 4);
+                    if ((v & 0x7F800000u) == 0x7F800000u) bad = (v & 0x7FFFFFu) ? 2 : 1;
+                } else if (bpp == 8) {
+                    for (int k = 0; k < 4; k++) {
+                        uint16_t v; memcpy(&v, p + k * 2, 2);
+                        if ((v & 0x7C00) == 0x7C00) { int t = (v & 0x3FF) ? 2 : 1; if (t > bad) bad = t; }
+                    }
+                } else {
+                    uint32_t v; memcpy(&v, p, 4);
+                    uint32_t ch[3] = {v & 0x7FF, (v >> 11) & 0x7FF, v >> 22 << 1};  // (blue: 5-bit mantissa, aligned to 6)
+                    for (int k = 0; k < 3; k++)
+                        if ((ch[k] & 0x7C0) == 0x7C0) { int t = (ch[k] & 0x3F) ? 2 : 1; if (t > bad) bad = t; }
+                }
+                if (!bad) continue;
+                if (bad == 2) nan++; else inf++;
+                if (x < x0) x0 = x;
+                if (x > x1) x1 = x;
+                if (y < y0) y0 = y;
+                if (y > y1) y1 = y;
+            }
+        int k = 0;
+        while (k < nseen && seen[k].img != b->image) k++;
+        if (k == nseen) { if (nseen == 64) continue; seen[nseen++].img = b->image; }
+        if (seen[k].nan == nan && seen[k].inf == inf) continue;
+        LOG("[nanscan] f%llu after fs=%llx: rt%d %ux%u vkfmt %d: nan %u (was %u) inf %u (was %u) bbox %u,%u..%u,%u\n",
+            (unsigned long long)renderer_present_count(), st.program ? (unsigned long long)st.program->stages[1].code_addr : 0ull, i, w, h,
+            (int)f, nan, seen[k].nan, inf, seen[k].inf, x0, y0, x1, y1);
+        seen[k].nan = nan; seen[k].inf = inf;
+    }
+}
+
 static void draw_(CmdRec *r, bool indexed);
 static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
     draw_(r, indexed);
+    if (g_debug_frame) {
+        if (nan_scan_on < 0) nan_scan_on = getenv("LARECOMP_NAN_SCAN") != NULL;
+        if (nan_scan_on) nan_scan();
+    }
     PROF_ADD(prof_draw);
 }
 static uint64_t prof_tp_;
