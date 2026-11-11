@@ -12,6 +12,7 @@
 #include "../../settings.h"
 #include "../../ui/menu.h"
 #include "vk.h"
+#include "dlss.h"
 #include "../output_scale.h"
 #include "../renderer.h"
 
@@ -33,9 +34,18 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
 static void create_instance(void) {
     Uint32 n_sdl = 0;
     const char *const *sdl_ext = SDL_Vulkan_GetInstanceExtensions(&n_sdl);
-    const char *ext[16];
+    const char *ext[32];
     uint32_t n_ext = 0;
     for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
+    if (dlss_preinit()) {  // (Streamline: the instance extensions DLSS needs)
+        const char *const *dx;
+        uint32_t nd = dlss_instance_exts(&dx);
+        for (uint32_t i = 0; i < nd && n_ext < 30; i++) {
+            bool dup = false;
+            for (uint32_t k = 0; k < n_ext; k++) dup |= !strcmp(ext[k], dx[i]);
+            if (!dup) ext[n_ext++] = dx[i];
+        }
+    }
     bool validate = getenv("LARECOMP_VK_VALIDATION") != NULL;
     if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
@@ -139,9 +149,18 @@ static void create_device(void) {
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[8];
+    const char *ext[32];
     uint32_t n_ext = 0;
     ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    bool dlss = false;
+    {   // DLSS (Streamline): its device extensions, only when the GPU has them all
+        const char *const *dx;
+        uint32_t nd = dlss_device_exts(&dx), ok = 0;  // (UINT32_MAX: Streamline not loaded)
+        for (uint32_t i = 0; nd != UINT32_MAX && i < nd; i++) ok += has_ext(ep, ne, dx[i]);
+        dlss = nd != UINT32_MAX && ok == nd;
+        if (nd != UINT32_MAX && !dlss) LOG("[vk] DLSS: the GPU lacks some of its device extensions\n");
+        for (uint32_t i = 0; dlss && i < nd && n_ext < 24; i++) ext[n_ext++] = dx[i];
+    }
     g_vk.custom_border = has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     if (g_vk.custom_border) ext[n_ext++] = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
     g_vk.divisor = has_ext(ep, ne, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
@@ -204,6 +223,7 @@ static void create_device(void) {
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
                                            .pNext = &f11};
     VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&ff : (void *)&f11};
+    if (dlss) dlss_merge_features(&f12, &f13);
     if (g_vk.bias_unorm) { dbc.pNext = f.pNext; f.pNext = &dbc; }
     VkPhysicalDeviceFeatures *b = &f.features, *h = &have.features;
     b->independentBlend = h->independentBlend;
@@ -233,6 +253,7 @@ static void create_device(void) {
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
+    if (dlss) dlss_device_created(g_vk.inst, g_vk.phys, g_vk.dev, g_vk.qfam);
     {   // keep 32-bit denormals in translated shaders where the GPU can (maxwell/shader.h maxwell_glsl_denorm_preserve)
         extern bool maxwell_glsl_denorm_preserve;
         VkPhysicalDeviceVulkan12Properties p12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
@@ -477,7 +498,8 @@ void vk_frame_end(const char *shot_path) {
     vk_submit_extra(cur_frame.acquired, done_sem[img], VK_NULL_HANDLE);
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &done_sem[img],
                            .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
-    VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
+    PFN_vkQueuePresentKHR present = dlss_present_proxy();  // (Streamline's own bookkeeping runs in its present)
+    VkResult r = present ? present(g_vk.queue, &pi) : vkQueuePresentKHR(g_vk.queue, &pi);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) recreate_swapchain();
     cur_frame.ok = false;
     if (shot_path) {
@@ -536,6 +558,8 @@ static void backend_present_locked(NvnTexture *t) {
         LOG("[present] %ux%u fmt %#x flags %#x -> %ux%u scalable %d\n", t->width, t->height, t->format, t->flags, b->width,
             b->height, b->scalable);
     b->presented = true;
+    extern void vk_dlaa_present(NvnTexture *t);
+    vk_dlaa_present(t);  // (a frame with nothing drawn over the scene: its DLAA now)
     vk_end_pass();
     static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = SDL_GetTicksNS();

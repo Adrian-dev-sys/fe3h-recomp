@@ -38,6 +38,7 @@ Settings g_settings = {
     .tracker = true,
     .chaos_letters = CHAOS_LETTERS_MAP,
     .diff_damage = 1.0f,
+    .dlaa_sharpen = 2,
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
 };
 
@@ -125,7 +126,8 @@ void settings_load(void) {
                                   (n >= 1 && n <= 4) ? n : n > 4 ? 4 : RES_MATCH;  // (5x-8x were removed)
         }
         else if (!strcmp(key, "upscaler")) g_settings.upscaler = !strcmp(val, "bilinear") ? UPSCALE_BILINEAR : UPSCALE_SHARP;  // (metalfx / fsr1: this OS's)
-        else if (!strcmp(key, "antialias")) g_settings.antialias = !strcmp(val, "off") ? AA_OFF : AA_SMAA;  // ("fxaa": SMAA now)
+        else if (!strcmp(key, "dlaa_sharpen")) g_settings.dlaa_sharpen = atoi(val) < 0 ? 0 : atoi(val) > 3 ? 3 : atoi(val);
+        else if (!strcmp(key, "antialias")) g_settings.antialias = !strcmp(val, "off") ? AA_OFF : !strcmp(val, "dlaa") ? AA_DLAA : AA_SMAA;  // ("fxaa": SMAA now)
         else if (!strcmp(key, "shader_wait")) g_settings.shader_wait = !strcmp(val, "off") ? SHADER_WAIT_OFF :
                                                                     !strcmp(val, "full") ? SHADER_WAIT_FULL : SHADER_WAIT_BALANCED;
         else if (!strcmp(key, "inv_keys")) g_settings.inv_keys = atoi(val) != 0;
@@ -179,7 +181,8 @@ void settings_save(void) {
     fprintf(f, "movie_audio = %d\n", g_settings.movie_audio);
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
     fprintf(f, "upscaler = %s\n", g_settings.upscaler == UPSCALE_METALFX ? "metalfx" : g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "bilinear");
-    fprintf(f, "antialias = %s\n", g_settings.antialias == AA_SMAA ? "smaa" : "off");
+    fprintf(f, "antialias = %s\n", g_settings.antialias == AA_DLAA ? "dlaa" : g_settings.antialias == AA_SMAA ? "smaa" : "off");
+    fprintf(f, "dlaa_sharpen = %d\n", g_settings.dlaa_sharpen);
     static const char *const waits[] = {"off", "balanced", "full"};
     fprintf(f, "shader_wait = %s\n", waits[g_settings.shader_wait % 3]);
     if (g_settings.res_mode == RES_DYNAMIC) fprintf(f, "resolution = dynamic\n");

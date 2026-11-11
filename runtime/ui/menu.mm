@@ -497,10 +497,17 @@ static void tab_display(void) {
         }
         if (opt_choice("Upscaler", &ui, ups, 2, 1, ud)) g_settings.upscaler = ui ? UPSCALE_SHARP : UPSCALE_BILINEAR;
     }
-    static const char *aa[] = {"Off", "SMAA"};
-    opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
+    static const char *aa[] = {"Off", "SMAA", "DLAA"};
+    opt_choice("Anti-aliasing", &g_settings.antialias, aa, 3, AA_OFF,
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
-               "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
+               "blends only along them, so textures stay sharp. Most useful at a lower internal resolution. DLAA "
+               "(NVIDIA RTX): steadies edges over several frames, so hair and outlines stop shimmering; without an "
+               "RTX GPU it falls back to SMAA.");
+    if (g_settings.antialias == AA_DLAA) {
+        static const char *sh[] = {"Off", "Low", "Medium", "High"};
+        opt_choice("DLAA sharpening", &g_settings.dlaa_sharpen, sh, 4, 2,
+                   "Sharpens the 3D scene after DLAA, which can look a little soft. Menus and text are not touched.");
+    }
     static const char *waits[] = {"Off", "Balanced", "Full"};
     opt_choice("Wait for shaders", &g_settings.shader_wait, waits, 3, SHADER_WAIT_BALANCED,
                "What happens when something appears whose shaders aren't ready yet. Shaders seen in earlier sessions "

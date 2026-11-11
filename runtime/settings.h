@@ -11,7 +11,7 @@ enum { UPSCALE_BILINEAR = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /
 #else
 #define UPSCALE_SHARP UPSCALE_FSR1
 #endif
-enum { AA_OFF = 0, AA_SMAA = 1 };
+enum { AA_OFF = 0, AA_SMAA = 1, AA_DLAA = 2 };  // (DLAA: NVIDIA RTX, Streamline; else SMAA)
 // Draws whose shaders are still being built: skipped (OFF: pop-in), or waited for up to 4 ms a frame (BALANCED) or
 // up to 50 ms a frame (FULL): runtime/nvn/vulkan/exec.c wait_built
 enum { SHADER_WAIT_OFF = 0, SHADER_WAIT_BALANCED = 1, SHADER_WAIT_FULL = 2 };
@@ -30,6 +30,7 @@ typedef struct {
     int res_mode;        // RES_MATCH, 1..4 / RES_X15 (N x the Switch's 1080p), RES_DYNAMIC, RES_Q75/50/25 (share of the display)
     int upscaler;        // UPSCALE_*: how a lower internal resolution reaches the window (MetalFX: macOS, FSR 1: Windows)
     int antialias;       // AA_*: anti-aliasing of the game image before it is scaled to the window
+    int dlaa_sharpen;    // 0 off, 1 low, 2 medium, 3 high: RCAS over DLAA's output (the 3D scene, before the UI)
     int shader_wait;     // SHADER_WAIT_*: draws wait for shaders still building (no pop-in) or are skipped
     float volume;        // master volume, 1 = 100%
     bool reverb;         // room reverb effect

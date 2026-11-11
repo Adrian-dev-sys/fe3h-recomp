@@ -14,6 +14,7 @@
 #include "../../kernel.h"
 #include "shaders.h"
 #include "vk.h"
+#include "dlss.h"
 #include "../renderer.h"
 #include "../../settings.h"
 
@@ -3557,6 +3558,232 @@ static bool ui_world_icons(CmdRec *r, bool indexed) {
     return true;
 }
 
+// ================================================================== DLAA (dlss.cpp)
+// The 3D scene (draws testing the G-buffer pass's depth) is jittered by a sub-pixel viewport shift; once the game has
+// composited it into the window image, the next draw there (HUD, menus) first runs DLAA over it with that depth, zero
+// motion vectors (DLSS takes the camera's motion from depth + clipToPrevClip) and the camera captured from the
+// G-buffer draws (their c3 starts with the view-projection). Characters' own motion is not in the vectors yet.
+static NvnTexture *g_main_depth;  // the G-buffer pass's depth
+static uint64_t g_dl_frame = ~0ull, g_scene_frame = ~0ull;
+static float g_cam[16], g_cam_prev[16], g_cam_cand[16], g_jit[2];
+static bool g_cam_ok, g_cam_prev_ok, g_dlaa_pending, g_dlaa_ran, g_dlaa_tried;  // (tried: once a frame)
+static int g_cam_hits;
+
+static bool dlaa_on(void) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_NO_DLAA") != NULL;
+    return !off && g_settings.antialias == AA_DLAA && dlss_available();
+}
+
+static float halton(int i, int b) {
+    float f = 1, r = 0;
+    for (; i > 0; i /= b) f /= b, r += f * (i % b);
+    return r;
+}
+
+static void m4_mul(float *o, const float *a, const float *b) {  // column-major: o = a * b
+    float t[16];
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++)
+            t[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    memcpy(o, t, 64);
+}
+
+static bool m4_inv(float *o, const float *m) {
+    float v[16];
+    v[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    v[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    v[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    v[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    v[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    v[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    v[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    v[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    v[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    v[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    v[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    v[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    v[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    v[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    v[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    v[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    float det = m[0] * v[0] + m[1] * v[4] + m[2] * v[8] + m[3] * v[12];
+    if (fabsf(det) < 1e-30f) return false;
+    for (int i = 0; i < 16; i++) o[i] = v[i] / det;
+    return true;
+}
+
+// Per draw, first: a new frame's jitter, and the G-buffer pass's depth and camera.
+static void dlaa_track(void) {
+    uint64_t f = renderer_present_count();
+    if (f != g_dl_frame) {
+        static int nwarn;  // (why a 3D frame got no DLAA: no camera found, or no composite seen)
+        if (dlaa_on() && g_scene_frame == g_dl_frame && !g_dlaa_ran && (nwarn++ < 5 || nwarn % 600 == 0))
+            LOG("[dlss] frame %llu: 3D scene without DLAA (camera %s, composite %s)\n", (unsigned long long)g_dl_frame,
+                g_cam_ok ? "found" : "not found", g_dlaa_pending ? "pending" : "not seen");
+        g_dl_frame = f;
+        g_cam_prev_ok = g_cam_ok && g_dlaa_ran;
+        if (g_cam_ok) memcpy(g_cam_prev, g_cam, 64);
+        g_cam_ok = false, g_cam_hits = 0, g_dlaa_pending = false, g_dlaa_ran = false, g_dlaa_tried = false;
+        int i = (int)(f % 16) + 1;
+        g_jit[0] = halton(i, 2) - 0.5f, g_jit[1] = halton(i, 3) - 0.5f;
+    }
+    if (st.rt.ncolor != 4 || !st.rt.depth) return;  // (the G-buffer: albedo, normals, material, extra)
+    g_main_depth = st.rt.depth;
+    g_scene_frame = f;
+    const float *m = (const float *)(uintptr_t)st.ubuf[0][0].addr;
+    if (g_cam_ok || !m || st.ubuf[0][0].size < 64) return;
+    extern float widescreen_factor(void);
+    float lx = sqrtf(m[0] * m[0] + m[4] * m[4] + m[8] * m[8]), ly = sqrtf(m[1] * m[1] + m[5] * m[5] + m[9] * m[9]);
+    float lw = sqrtf(m[3] * m[3] + m[7] * m[7] + m[11] * m[11]);
+    if (ly < 1e-3f || fabsf(lw - 1) > 0.02f || fabsf(lx / ly - 0.5625f / fmaxf(widescreen_factor(), 1.0f)) > 0.005f) return;
+    if (g_cam_hits && !memcmp(m, g_cam_cand, 64)) {  // (two draws agree: the camera, not one object's matrix)
+        memcpy(g_cam, m, 64);
+        g_cam_ok = true;
+    } else memcpy(g_cam_cand, m, 64), g_cam_hits = 1;
+}
+
+// A depth-tested draw on the G-buffer pass's depth (scene geometry, its effects): shifted by this frame's jitter.
+static bool dlaa_jittered(void) {
+    return dlaa_on() && st.rt.depth && st.rt.depth == g_main_depth && st.ds[0] &&
+           !(st.rt.ncolor && st.rt.color[0] && renderer_texture_presented(st.rt.color[0]));
+}
+
+static TexBackend *dlaa_image(TexBackend *d, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage, bool zero) {
+    if (d->image && (d->width != w || d->height != h || d->format != fmt)) {
+        vk_views_forget(d);
+        vk_defer_image(d->image, d->mem);
+        d->image = VK_NULL_HANDLE, d->mem = VK_NULL_HANDLE;
+    }
+    if (!d->image) {
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = fmt,
+                                .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                                .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL));
+        d->format = fmt; d->width = w; d->height = h; d->depth = 1; d->layers = 1; d->levels = 1;
+        d->samples = 1; d->aspect = VK_IMAGE_ASPECT_COLOR_BIT; d->base_type = VK_IMAGE_VIEW_TYPE_2D;
+        VkCommandBuffer cb = vk_cmd();
+        vk_image_init_layout(cb, d->image, d->aspect);
+        if (zero) {
+            VkClearColorValue z = {{0}};
+            VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdClearColorImage(cb, d->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg);
+        }
+    }
+    return d;
+}
+
+// The camera for DLSS from the view-projection (column-major, VP = P * V with V rigid, P without off-centre terms).
+static void dlaa_camera(DlssConstants *k, const float *m) {
+    float r0[4] = {m[0], m[4], m[8], m[12]}, r1[4] = {m[1], m[5], m[9], m[13]}, r2[4] = {m[2], m[6], m[10], m[14]},
+          r3[4] = {m[3], m[7], m[11], m[15]};
+    float p00 = sqrtf(r0[0] * r0[0] + r0[1] * r0[1] + r0[2] * r0[2]), p11 = sqrtf(r1[0] * r1[0] + r1[1] * r1[1] + r1[2] * r1[2]);
+    float s = sqrtf(r3[0] * r3[0] + r3[1] * r3[1] + r3[2] * r3[2]);
+    float v0[4], v1[4], v2[4];
+    for (int i = 0; i < 4; i++) v0[i] = r0[i] / p00, v1[i] = r1[i] / p11, v2[i] = -r3[i] / s;  // (w = -z_view)
+    float p22 = r2[0] * v2[0] + r2[1] * v2[1] + r2[2] * v2[2], p23 = r2[3] - p22 * v2[3];
+    float P[16] = {0};
+    P[0] = p00, P[5] = p11, P[10] = p22, P[14] = p23, P[11] = -s;
+    memcpy(k->view_to_clip, P, 64);
+    m4_inv(k->clip_to_view, P);
+    for (int i = 0; i < 3; i++) {
+        k->cam_right[i] = v0[i], k->cam_up[i] = v1[i], k->cam_fwd[i] = -v2[i];
+        k->cam_pos[i] = -(v0[i] * v0[3] + v1[i] * v1[3] + v2[i] * v2[3]);
+    }
+    k->depth_inverted = true;  // (GEQUAL depth test: 1 = near)
+    k->zfar = fabsf(p22) > 1e-6f ? p23 / p22 : 1e6f;
+    k->znear = p23 / (p22 + 1);
+    if (!(k->znear > 0)) k->znear = 0.1f;
+    if (!(k->zfar > k->znear)) k->zfar = 1e6f;
+    k->fov = 2 * atanf(1 / p11);
+    k->aspect = p11 / p00;
+}
+
+static void post_pass(VkCommandBuffer cb, const char *fs, const VkImageView *srcs, int n, TexBackend *dst, const float pc[8],
+                      bool clear);
+
+// Over the window image the scene was just composited into, before the next draw there.
+static void dlaa_run(NvnTexture *tex) {
+    TexBackend *c = tex ? (TexBackend *)tex->backend : NULL, *d = g_main_depth ? (TexBackend *)g_main_depth->backend : NULL;
+    if (!c || !d || !c->image || !d->image || c->width != d->width || c->height != d->height || !g_cam_ok) return;
+    static TexBackend mv_img, out_img;
+    g_dlaa_tried = true;  // (one evaluation a frame: a second would feed DLSS the same frame twice)
+    static const VkComponentMapping id = {0};
+    vk_end_pass();
+    VkCommandBuffer cb = vk_cmd();
+    TexBackend *mv = dlaa_image(&mv_img, c->width, c->height, VK_FORMAT_R16G16_SFLOAT,
+                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, true);
+    TexBackend *o = dlaa_image(&out_img, c->width, c->height, c->format,
+                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, false);
+    DlssImage ic = {c->image, vk_image_view(c, VK_IMAGE_VIEW_TYPE_2D, c->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT),
+                    c->format, c->width, c->height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    DlssImage idp = {d->image, vk_image_view(d, VK_IMAGE_VIEW_TYPE_2D, d->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT),
+                     d->format, d->width, d->height, VK_IMAGE_USAGE_SAMPLED_BIT};
+    DlssImage im = {mv->image, vk_image_view(mv, VK_IMAGE_VIEW_TYPE_2D, mv->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT),
+                    mv->format, mv->width, mv->height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT};
+    DlssImage io = {o->image, vk_image_view(o, VK_IMAGE_VIEW_TYPE_2D, o->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT),
+                    o->format, o->width, o->height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+    DlssConstants k = {0};
+    for (int i = 0; i < 16; i++) k.identity[i] = (i % 5) == 0;
+    // the depth buffer's clip space: GL-style -1..1 games are drawn with z' = (z + w) / 2 (translate.c depth_minus_one)
+    float cur[16], prev[16], D[16];
+    memcpy(D, k.identity, 64);
+    if (nvn_depth_mode() == 0) D[10] = 0.5f, D[14] = 0.5f;  // (column-major: z row = 0.5 z + 0.5 w)
+    m4_mul(cur, D, g_cam);
+    m4_mul(prev, D, g_cam_prev);
+    dlaa_camera(&k, cur);
+    float inv_cur[16], inv_prev[16];
+    bool reset = !g_cam_prev_ok || !m4_inv(inv_cur, cur) || !m4_inv(inv_prev, prev);
+    if (!reset) {
+        m4_mul(k.clip_to_prev_clip, prev, inv_cur);
+        m4_mul(k.prev_clip_to_clip, cur, inv_prev);
+        // a cut (the view turned more than ~25 degrees): history from another shot would ghost
+        float fwd_dot = g_cam[3] * g_cam_prev[3] + g_cam[7] * g_cam_prev[7] + g_cam[11] * g_cam_prev[11];
+        if (fwd_dot < 0.9f) reset = true;
+    }
+    if (reset) memcpy(k.clip_to_prev_clip, k.identity, 64), memcpy(k.prev_clip_to_clip, k.identity, 64);
+    k.reset = reset;
+    static float sx = 2, sy = 2;  // (LARECOMP_DLSS_JSIGN="x y": the jitter's sign convention, for testing)
+    if (sx == 2) {
+        sx = sy = 1;  // (the offset the scene was shifted by, in y-down pixels: as UE's DLSS plugin passes it)
+        const char *e = getenv("LARECOMP_DLSS_JSIGN");
+        if (e) sscanf(e, "%f %f", &sx, &sy);
+    }
+    k.jitter[0] = sx * g_jit[0], k.jitter[1] = sy * g_jit[1];
+    static int nev, nreset;  // (every 600 evaluations: how often the history was dropped)
+    nreset += reset;
+    if (++nev % 600 == 0) LOG("[dlss] %d evaluations, %d resets in the last 600\n", nev, nreset), nreset = 0;
+    vk_full_barrier(cb);
+    if (dlss_evaluate(cb, &ic, &idp, &im, &io, &k)) {
+        vk_full_barrier(cb);
+        static const float stops[4] = {-1, 1.0f, 0.5f, 0.2f};  // (RCAS: exp2(-stops); 0.2 is AMD's default, fairly strong)
+        float sh = stops[g_settings.dlaa_sharpen & 3];
+        if (sh >= 0 && c->format == VK_FORMAT_R8G8B8A8_UNORM) {  // (the scene only: the UI is drawn after this)
+            float pr[8] = {exp2f(-sh), 0, 0, 0, (float)o->width, (float)o->height};
+            VkImageView in[3] = {io.view};
+            post_pass(cb, "rcas.frag", in, 1, c, pr, false);
+        } else {
+            VkImageCopy cp = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                              .extent = {c->width, c->height, 1}};
+            vkCmdCopyImage(cb, o->image, VK_IMAGE_LAYOUT_GENERAL, c->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        }
+        g_dlaa_ran = true;
+        static int n;
+        if (!n++) LOG("[dlss] first DLAA frame %ux%u (fov %.1f, near %.2f far %.0f)\n", c->width, c->height, k.fov * 57.2958f,
+                      k.znear, k.zfar);
+    }
+    vk_full_barrier(cb);
+    ss_forget();  // (Streamline bound its own pipelines and sets)
+    st.rt_dirty = true;  // (the next draw begins its pass again)
+}
+
+void vk_dlaa_present(NvnTexture *t) {  // (device.c, at present: the scene was the frame's last draw)
+    if (!g_dlaa_pending) return;
+    g_dlaa_pending = false;
+    dlaa_run(t);
+}
+
 static void draw_(CmdRec *r, bool indexed);
 static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
@@ -3571,6 +3798,11 @@ static uint64_t prof_tp_;
 static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tp_ = SDL_GetTicksNS();
     if (!st.program) SKIP(SK_NO_PROG, "draw mode %llu with no program bound\n", (unsigned long long)r->x[0]);
+    dlaa_track();
+    if (g_dlaa_pending && st.rt.ncolor && st.rt.color[0] && renderer_texture_presented(st.rt.color[0])) {
+        g_dlaa_pending = false;  // (the scene is in the window image: DLAA before the HUD goes on it)
+        dlaa_run(st.rt.color[0]);
+    }
     ShaderKey vkey = {0}, fkey = {0};
     vkey.glsl = fkey.glsl = 1;
     vkey.flip_y = fkey.flip_y = nvn_window_origin() == 0;
@@ -3904,6 +4136,8 @@ static void draw_(CmdRec *r, bool indexed) {
         if (fullscreen_quad && !reads_scene && !video && pr->fi->ntex == 1 && (tex_sc[1][0][0] != 1 || tex_sc[1][0][1] != 1)) reads_scene = true;
         static uint64_t wide_frame = ~0ull;
         if (reads_scene) wide_frame = renderer_present_count();
+        if (reads_scene && fullscreen_quad && !g_dlaa_tried && g_scene_frame == renderer_present_count() && dlaa_on())
+            g_dlaa_pending = true;  // (the first scene composite only: overlays reading depth come after it)
         bool fade_fill = false;
         if (fullscreen_fill && st.ubuf[1][0].addr && st.ubuf[1][0].size >= 12) {
             const float *c = (const float *)(uintptr_t)st.ubuf[1][0].addr;
@@ -3951,7 +4185,9 @@ static void draw_(CmdRec *r, bool indexed) {
         float k = widescreen_effect_stretch(g_cur_fs_hash);
         float vx = vp[0] * vp_sx + vp_ox, vw = vp[2] * vp_sx;
         if (k > 1.0f) { vx -= vw * (k - 1) / 2; vw *= k; }
-        set_viewport(vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, zn, zf);
+        float jx = 0, jy = 0;
+        if (dlaa_jittered()) jx = g_jit[0], jy = g_jit[1];  // (DLAA: the scene a sub-pixel off each frame)
+        set_viewport(vx + jx, vp[1] * vp_sy + vp_oy + jy, vw, vp[3] * vp_sy, zn, zf);
         if (g_debug_frame) {
             VkRect2D sr = scissor_rect();
             if (vkey.rt_kind[0]) LOG("[draw]   vs box x%.4f\n", (vkey.rt_kind[1] | vkey.rt_kind[2] << 8) / 65535.0);
@@ -4723,7 +4959,7 @@ static void post_pass(VkCommandBuffer cb, const char *fs, const VkImageView *src
 // size in the window (its crop is drawn into the viewport).
 static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, double oh_d) {
     VkImageView v = raw_view(b);
-    bool smaa = g_settings.antialias == AA_SMAA;
+    bool smaa = g_settings.antialias == AA_SMAA || (g_settings.antialias == AA_DLAA && !dlss_available());
     uint32_t ow = (uint32_t)lround(ow_d), oh = (uint32_t)lround(oh_d);
     if (ow > 16384) ow = 16384;
     if (oh > 16384) oh = 16384;
