@@ -85,6 +85,8 @@ typedef struct TexBackend {
     uint64_t touched_frame, frame_cleared;
     uint32_t level_gen;
     float sx, sy;
+    float fixed_scale;  // (FE3H's character shadow map: a fixed scale of its own, textures.c)
+    float scale_mul;    // (its half-resolution shadow mask: twice the render scale; 0 = 1)
     void *pending_rgba;  // host-produced pixels (video) waiting to be uploaded on the render thread
     uint32_t pending_w, pending_h, pending_stride;
     uint8_t astc_bw, astc_bh;  // ASTC without GPU support: decoded to RGBA8 on upload (runtime/nvn/astc.c)
@@ -104,6 +106,7 @@ VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uin
                           uint32_t nly, VkComponentMapping sw, VkImageAspectFlags aspect);
 VkImageView vk_dummy_view(int textype);
 VkSampler vk_sampler(NvnSamplerDesc *d);
+VkSampler vk_sampler_bias(NvnSamplerDesc *d, float bias);
 VkSampler vk_default_sampler(bool linear);
 void vk_image_init_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect);
 // Destruction once every submission that may use the object has completed.

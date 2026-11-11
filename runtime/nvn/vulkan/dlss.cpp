@@ -324,7 +324,7 @@ static sl::Resource res(const DlssImage *im) {
 
 static void mat(sl::float4x4 &d, const float *m) { memcpy(&d, m, 64); }
 
-extern "C" bool dlss_evaluate(VkCommandBuffer cb, const DlssImage *color, const DlssImage *depth, const DlssImage *mvec,
+extern "C" bool dlss_evaluate(VkCommandBuffer cb, const DlssImage *color, const DlssImage *depth, const DlssImage *mvec, const DlssImage *bias,
                               const DlssImage *out, const DlssConstants *c, int fg_frames, uint32_t win_w, uint32_t win_h) {
     if (!g_ready) return false;
     sl::FrameToken *tok = frame_token();
@@ -376,14 +376,18 @@ extern "C" bool dlss_evaluate(VkCommandBuffer cb, const DlssImage *color, const 
 
     // frame generation reads depth and motion at present: copied now (the depth is drawn on before then)
     sl::ResourceLifecycle dm = fg ? sl::ResourceLifecycle::eOnlyValidNow : sl::ResourceLifecycle::eValidUntilEvaluate;
-    sl::Resource rc = res(color), rd = res(depth), rm = res(mvec), ro = res(out);
+    sl::Resource rc = res(color), rd = res(depth), rm = res(mvec), ro = res(out), rb = bias ? res(bias) : sl::Resource{};
     sl::ResourceTag tags[] = {
         sl::ResourceTag(&rc, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate),
         sl::ResourceTag(&rd, sl::kBufferTypeDepth, dm),
         sl::ResourceTag(&rm, sl::kBufferTypeMotionVectors, dm),
         sl::ResourceTag(&ro, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate),
+        sl::ResourceTag(&rb, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eValidUntilEvaluate),
     };
-    if (sl_.tag(*tok, vp, tags, 4, (sl::CommandBuffer *)cb) != sl::Result::eOk) { DLOG("[dlss] slSetTagForFrame failed\n"); return false; }
+    static int nfmt;
+    if (!nfmt++) DLOG("[dlss] tag formats: color %d depth %d mvec %d out %d bias %d\n", (int)color->format, (int)depth->format,
+                      (int)mvec->format, (int)out->format, bias ? (int)bias->format : -1);
+    if (sl_.tag(*tok, vp, tags, bias ? 5 : 4, (sl::CommandBuffer *)cb) != sl::Result::eOk) { DLOG("[dlss] slSetTagForFrame failed\n"); return false; }
     const sl::BaseStructure *inputs[] = {&vp};
     sl::Result r = sl_.eval(sl::kFeatureDLSS, *tok, inputs, 1, (sl::CommandBuffer *)cb);
     if (r != sl::Result::eOk) {

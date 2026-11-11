@@ -505,10 +505,19 @@ static void tab_display(void) {
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution. DLAA "
                "(NVIDIA RTX): steadies edges over several frames, so hair and outlines stop shimmering; without an "
                "RTX GPU it falls back to SMAA.");
-    if (g_settings.antialias == AA_DLAA) {
+    {
         static const char *sh[] = {"Off", "Low", "Medium", "High"};
-        opt_choice("DLAA sharpening", &g_settings.dlaa_sharpen, sh, 4, 2,
-                   "Sharpens the 3D scene after DLAA, which can look a little soft. Menus and text are not touched.");
+        opt_choice("Sharpening", &g_settings.dlaa_sharpen, sh, 4, 2,
+                   "Sharpens the image (AMD's RCAS). With DLAA: the 3D scene only, menus and text are not touched. With "
+                   "SMAA or no anti-aliasing: the final image, after it is scaled to the window.");
+        static const char *td[] = {"Normal", "High", "Very high", "Max"};
+        opt_choice("Texture detail", &g_settings.tex_detail, td, 4, 0,
+                   "How sharp the 3D scene's textures are at a distance (walls, floors, faces). The game blurs distant "
+                   "textures for the Switch; higher keeps more detail. Max always uses the full-size textures, as the "
+                   "community Level of Detail mod does - best with a higher internal resolution or DLAA, or it can "
+                   "shimmer.");
+    }
+    if (g_settings.antialias == AA_DLAA) {
         if (dlss_fg_available()) {
             static const char *fg[] = {"Off", "2x", "3x", "4x"};
             opt_choice("Frame generation", &g_settings.frame_gen, fg, 4, 0,

@@ -39,6 +39,8 @@ typedef struct {
     float lod_min, lod_max, lod_bias, max_aniso;
     float border[4];
     void *backend;
+    void *backend_bias;  // (the 3D scene's draws: the same with a negative mip bias, bias_val)
+    float bias_val;
 } NvnSamplerDesc;
 
 typedef struct {

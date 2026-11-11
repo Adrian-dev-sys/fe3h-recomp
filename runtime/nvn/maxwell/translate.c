@@ -588,7 +588,7 @@ static const char *RSC2(Ctx *c, int slot, const char *fmt, ...) {
     va_end(ap);
     if (c->stage == STAGE_VERTEX) { snprintf(o, 1024, "%s", inner); return o; }
     c->uses_rscale = true;
-    snprintf(o, 1024, "rsc(%s, rscale[%d])", inner, slot + 1);
+    snprintf(o, 1024, "%s(%s, rscale[%d])", c->stage == STAGE_FRAGMENT ? "rscf" : "rsc", inner, slot + 1);
     return o;
 }
 
@@ -2144,6 +2144,13 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (c->uses_rscale && stage != STAGE_VERTEX) {
         sp(&s, "layout(std140, set = %d, binding = 18) uniform RScale { vec4 rscale[%d]; };\n", set,
            key && key->flip_x ? 66 : 65);  // ([65]: mirror mode's render target width)
+        // Fragment texel fetches from a texture scaled like the render target: this pixel's own texel inside the guest
+        // texel (as Ryujinx) - FE3H's deferred lighting read its G-buffer on the 1080p grid at any internal resolution
+        if (stage == STAGE_FRAGMENT)
+            sp(&s, "uvec2 rscf(uvec2 c, vec4 s) { if (s.x == 1.0f && s.y == 1.0f) return c;\n"
+                   "  if (abs(s.x - rscale[0].x) < 1e-4f && abs(s.y - rscale[0].y) < 1e-4f)\n"
+                   "    return uvec2(max(vec2(c) * s.xy + mod(gl_FragCoord.xy - rscale[0].zw, s.xy), vec2(0.0f)));\n"
+                   "  return uvec2(floor((vec2(c) + 0.5f) * s.xy)); }\n");
         info->uses_rscale = true;
     }
     bool tint = stage == STAGE_FRAGMENT && !dbg && (c->omap_target & 0x7) == 0x7 && (!key || key->rt_kind[0] == 0);

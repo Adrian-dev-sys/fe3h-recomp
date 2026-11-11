@@ -1,6 +1,7 @@
 // Executes recorded NVN command lists with Vulkan (port of renderer.m; same structure, same behaviour).
 #include <SDL3/SDL_cpuinfo.h>
 #include <SDL3/SDL_timer.h>
+#include <ctype.h>
 #include <float.h>
 #include <math.h>
 #include <stdarg.h>
@@ -1076,6 +1077,13 @@ static uint32_t tex_wh[2][64][2];
 
 // ================================================================== render passes
 static VkFormat pass_color[8], pass_depth, pass_stencil;
+#define MV_FMT VK_FORMAT_R16G16_SFLOAT
+static TexBackend g_mv_img;      // (DLAA) object motion target, the G-buffer pass's color 4: see mv_prog
+static bool g_mv_pass;           // the current pass has it attached
+static uint64_t g_mv_clear_frame = ~0ull;
+static bool mv_enabled(void);
+static TexBackend *dlaa_image(TexBackend *d, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage, bool zero);
+static VkImageView post_view(TexBackend *d);
 static uint32_t pass_ncolor, pass_samples = 1, pass_w, pass_h;
 static int debug_pass_no;
 
@@ -1198,6 +1206,19 @@ static void begin_pass(void) {
         if (ew < minw) minw = ew;
         if (eh < minh) minh = eh;
         pass_samples = b->samples;
+    }
+    g_mv_pass = false;
+    if (st.rt.ncolor == 4 && w && st.rt.depth && pass_samples == 1 && mv_enabled()) {  // (DLAA: the G-buffer)
+        dlaa_image(&g_mv_img, minw, minh, MV_FMT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, true);
+        uint64_t f = renderer_present_count();
+        ca[4] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = post_view(&g_mv_img),
+                                            .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                                            .loadOp = g_mv_clear_frame != f ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD};
+        g_mv_clear_frame = f;
+        pass_color[4] = MV_FMT;
+        pass_ncolor = 5;
+        g_mv_pass = true;
     }
     pass_depth = pass_stencil = VK_FORMAT_UNDEFINED;
     bool has_d = false, has_s = false;
@@ -1445,6 +1466,8 @@ typedef struct {
     bool warm;          // prebuilt at launch (prewarm below)
     uint64_t waited_ns; // draws' time waiting for it to build (wait_built)
     _Atomic int state;  // 0 building, 1 ready, 2 failed
+    void *motion;       // (DLAA) its object-motion variant (a Prog), once asked for: mv_prog
+    bool is_motion;
 } Prog;
 
 static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, VkShaderStageFlags s1) {
@@ -1554,12 +1577,61 @@ static ShaderInfo *translate_cached(const uint8_t *blob, size_t max_size, int st
     return si;
 }
 
+// FE3H's character shadow mask (fs hash 991d1be5df7b0f7f, 304 instructions): replaced by the same maths in full
+// precision - the game reads depth on a 960 x 540 grid and weighs its PCF in half floats (blocky shading on faces at
+// high resolutions). c3: [0..3] light matrix, [4..7] second matrix (picked past plane [10]), [8] / [9] atlas
+// scale / offset, [11] texel size / map size, [12] PCF offsets, [13] fade, [14..17] inverse view-projection.
+// LARECOMP_NO_HQ_SHADOW_MASK=1 keeps the game's.
+static const char *k_hq_shadow_mask =
+    "#version 460\n"
+    "layout(std140, set = 1, binding = 3) uniform CB3 { vec4 C[32]; };\n"
+    "layout(std140, set = 1, binding = 18) uniform RScale { vec4 rscale[65]; };\n"
+    "layout(std140, set = 1, binding = 19) uniform Tint { vec4 ltint[2]; };\n"
+    "layout(set = 1, binding = 32) uniform sampler2D t0;\n"
+    "layout(set = 1, binding = 33) uniform sampler2D t1;\n"
+    "layout(location = 0) in vec4 v0;\n"
+    "layout(location = 0) out vec4 c0;\n"
+    "float tap(vec2 q, vec4 at, float z) { return textureLod(t1, at.xy * clamp(q, 0.0, 1.0) + at.zw, 0.0).x < z ? 1.0 : 0.0; }\n"
+    "float bil(vec2 q, vec4 at, float z) {\n"
+    "  vec2 f = q * C[11].zw - 0.5, i = floor(f), w = f - i, b = (i + 0.5) * C[11].xy, t = C[11].xy;\n"
+    "  return mix(mix(tap(b, at, z), tap(b + vec2(t.x, 0), at, z), w.x),\n"
+    "             mix(tap(b + vec2(0, t.y), at, z), tap(b + t, at, z), w.x), w.y);\n"
+    "}\n"
+    "void main() {\n"
+    "  vec2 g = (gl_FragCoord.xy - rscale[0].zw) / rscale[0].xy;\n"
+    "  ivec2 dp = clamp(ivec2(g * 2.0 * rscale[1].xy), ivec2(0), textureSize(t0, 0) - 1);\n"
+    "  float d = texelFetch(t0, dp, 0).x;\n"
+    "  vec4 P = v0.x * C[14] + v0.y * C[15] + (2.0 * d - 1.0) * C[16] + C[17];\n"
+    "  P /= P.w;\n"
+    "  vec4 L = P.x * C[0] + P.y * C[1] + P.z * C[2] + C[3];\n"
+    "  bool second = dot(L, C[10]) > 0.0;\n"
+    "  vec4 S = second ? P.x * C[4] + P.y * C[5] + P.z * C[6] + C[7] : L;\n"
+    "  vec4 at = second ? C[9] : C[8];\n"
+    "  vec2 uv = S.xy / S.w;\n"
+    "  float z = min(S.z / S.w, 1.0);\n"
+    "  vec2 o = uv + C[12].xy;\n"
+    "  float s = bil(o, at, z) + bil(o + vec2(C[12].z, 0), at, z) + bil(o + vec2(0, C[12].w), at, z) + bil(o + C[12].zw, at, z);\n"
+    "  float r = 1.0 - 0.25 * s * clamp(dot(L, C[13]), 0.0, 1.0);\n"
+    "  c0 = vec4(r);\n"
+    "  if (ltint[0].w > 0.0) { vec3 q = c0.rgb; float l = dot(q, vec3(0.299, 0.587, 0.114));\n"
+    "    c0.rgb = mix(q, ltint[0].rgb * pow(l, ltint[1].w) + ltint[1].rgb * l, ltint[0].w); }\n"
+    "}\n";
+static const char *hq_fs_override(const ShaderInfo *fi) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_NO_HQ_SHADOW_MASK") != NULL;
+    if (off || !fi || !fi->msl || fi->num_insts != 304 || fi->ntex != 2 || fi->cbuf_mask != (1u << 3)) return NULL;
+    if (!strstr(fi->msl, "cb3[16][3]") || !strstr(fi->msl, "cb3[11][3]") || !strstr(fi->msl, "cb3[10][3]")) return NULL;
+    return k_hq_shadow_mask;
+}
+
 static void compile_program(void *arg) {
     Prog *p = arg;
     size_t nv = 0, nf = 0;
     uint64_t t0 = SDL_GetTicksNS();
+    const char *fsrc = hq_fs_override(p->fi);
+    if (fsrc) LOG("[shader] character shadow mask: full-precision version\n");
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
-    uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
+    uint32_t *sf = sv ? vk_glsl_to_spirv(fsrc ? fsrc : p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
     if (!sv || !sf) { free(sv); free(sf); set_state(&p->state, 2); return; }
     p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
     p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
@@ -1615,6 +1687,8 @@ static uint32_t buffer_texture_mask(int stage, const ShaderInfo *si) {
 
 static Prog *warm_find(NvnProgram *np, const ShaderKey *vkey, const ShaderKey *fkey);
 static void warm_start(void);
+static Prog *mv_prog(Prog *p);
+static void mv_prepare(const Prog *p, const CmdRec *r);
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
     warm_start();
@@ -2473,6 +2547,26 @@ static VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size) {
     return (VkDescriptorBufferInfo){s.buf, s.off, size > max ? max : size};
 }
 
+// FE3H's character shadow map drawn at a fixed scale (textures.c vk_shadow_scale): its fragment shaders take its texel
+// size from a constant block - (1/1024, 1/1024, 1024, 1024) then the PCF offsets - scaled to match in the copy.
+static void shadow_cbuf_patch(ShaderInfo *si, void *p, uint64_t size) {
+    extern float vk_shadow_scale(void);
+    float S = vk_shadow_scale();
+    if (S <= 1 || !p) return;
+    bool any = false;
+    for (int i = 0; i < si->ntex && !any; i++) {
+        NvnTexture *t = shader_texture_object(1, &si->tex[i]);
+        any = t && t->backend && ((TexBackend *)t->backend)->fixed_scale > 1;
+    }
+    if (!any) return;
+    float *f = p;
+    for (uint64_t k = 0; k + 8 <= size / 4; k += 4) {
+        if (f[k] != 1.0f / 1024 || f[k + 1] != 1.0f / 1024 || f[k + 2] != 1024 || f[k + 3] != 1024) continue;
+        f[k] /= S, f[k + 1] /= S, f[k + 2] *= S, f[k + 3] *= S;
+        for (int j = 4; j < 8; j++) f[k + j] /= S;  // (PCF offsets, in texels of 1/1024)
+    }
+}
+
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
@@ -2518,7 +2612,16 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
     // within a command list nothing writes guest memory (no inline UpdateUniformBuffer: that writes through below
     // and drops the shared copies).
-    return ubo_span(guest_copy(r.addr, size), size);
+    VkSpan s = guest_copy(r.addr, size);
+    if (stage == 1) shadow_cbuf_patch(si, s.ptr, size);
+    // FE3H's final composite (fs 94ed752582273966): c3 [7].x and [8].xyz weigh its two blurred bloom layers
+    extern float g_bloom_scale;
+    if (stage == 1 && k == 3 && g_cur_fs_hash == 0x94ed752582273966ull && g_bloom_scale != 1 && size >= 0x90) {
+        s = vk_transient_copy((const void *)(uintptr_t)r.addr, size, 256);  // (own copy: scaled once)
+        float *f = s.ptr;
+        f[28] *= g_bloom_scale, f[32] *= g_bloom_scale, f[33] *= g_bloom_scale, f[34] *= g_bloom_scale;
+    }
+    return ubo_span(s, size);
 }
 
 // Global memory (shader LDG/STG, maxwell_gmem_base = HEAP_BASE): the guest heap imported as a GPU buffer
@@ -2961,6 +3064,8 @@ static VkImageView image_view(int stage, const ShaderTexture *st_) {
     return vk_image_view(b, vt, b->storage_fmt, lv, 1, 0, have3d ? 1 : nly, id, VK_IMAGE_ASPECT_COLOR_BIT);
 }
 
+static bool dlaa_jittered(void);
+static float scene_tex_bias(void);
 static bool tex_video[64];  // (this draw's fragment textures with uploaded content, movie frames: not scene buffers)
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
     if (stage == 1 && i < 64) tex_video[i] = false;
@@ -3003,7 +3108,8 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
                 }
         }
     }
-    if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc]);
+    if (h && st.spool && tsc < (uint32_t)st.spool->count)  // (DLAA: the jittered scene's textures one mip sharper, as NVIDIA advises)
+        smp = vk_sampler_bias(&((NvnSamplerDesc *)st.spool->entries)[tsc], stage == 1 ? scene_tex_bias() : 0);
     if (!view) view = vk_dummy_view(st_->type);
     if (!smp) smp = vk_default_sampler(true);
     *out = (VkDescriptorImageInfo){smp, view, VK_IMAGE_LAYOUT_GENERAL};
@@ -3017,6 +3123,7 @@ static float g_vs_rows[64][4];  // vertex stage rscale[1..]: the UI box's per-qu
 static int g_vs_nrows;
 static float g_vs_px[2];  // vertex rscale[65].zw: the boxed UI's pass size (2D vertices snap to its pixels)
 
+static bool mv_binding(const VkBindingInfo *b, int stage, ShaderInfo *si, VkDescriptorBufferInfo *out);
 static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
                                  const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii) {
     VkDescriptorSet ds = vk_alloc_set(layout);
@@ -3051,6 +3158,8 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             VkImageView v = ti < si->ntex ? image_view(stage, &si->tex[ti]) : VK_NULL_HANDLE;  // (checked before: images_ready)
             ii[n] = (VkDescriptorImageInfo){VK_NULL_HANDLE, v, VK_IMAGE_LAYOUT_GENERAL};
             w[n].pImageInfo = &ii[n];
+        } else if (p->is_motion && b->binding >= 40 && mv_binding(b, stage, si, &bi[n])) {
+            w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding < 17) {
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
             w[n].pBufferInfo = &bi[n];
@@ -3609,10 +3718,36 @@ static bool ui_world_icons(CmdRec *r, bool indexed) {
 // motion vectors (DLSS takes the camera's motion from depth + clipToPrevClip) and the camera captured from the
 // G-buffer draws (their c3 starts with the view-projection). Characters' own motion is not in the vectors yet.
 static NvnTexture *g_main_depth;  // the G-buffer pass's depth
+static NvnTexture *g_gbuf_mat;    // its material target (green: characters)
 static uint64_t g_dl_frame = ~0ull, g_scene_frame = ~0ull;
 static float g_cam[16], g_cam_prev[16], g_cam_cand[16], g_jit[2];
 static bool g_cam_ok, g_cam_prev_ok, g_dlaa_pending, g_dlaa_ran, g_dlaa_tried, g_dlaa_seen;  // (tried: once a frame)
 static int g_cam_hits;
+// (test, LARECOMP_JITTER_TEST + F10) the jitter's sign as passed to DLSS: 0 (+x +y), 1 (-x +y), 2 (+x -y), 3 (-x -y),
+// 4 no jitter
+static int g_jit_mode;
+static bool g_jit_mode_changed;
+float g_bloom_scale = 1;  // (the composite's bloom weight: LARECOMP_DLAA_TUNE + F10 cycles 1 / 0.5 / 0)
+float bloom_scale_cycle(void) {
+    g_bloom_scale = g_bloom_scale == 1 ? 0.5f : g_bloom_scale == 0.5f ? 0 : 1;
+    LOG("[post] bloom %.1f\n", g_bloom_scale);
+    return g_bloom_scale;
+}
+static float g_char_bias = -1;  // (DLAA's character mask strength; LARECOMP_DLAA_TUNE + F10 cycles it)
+float dlaa_char_bias_cycle(void) {
+    static const float v[4] = {0, 0.5f, 0.75f, 1.0f};
+    int i = 0;
+    while (i < 4 && v[i] != g_char_bias) i++;
+    g_char_bias = v[(i + 1) % 4];
+    LOG("[dlss] character bias %.2f\n", g_char_bias);
+    return g_char_bias;
+}
+int dlaa_jitter_cycle(void) {
+    g_jit_mode = (g_jit_mode + 1) % 5;
+    g_jit_mode_changed = true;
+    LOG("[dlss] jitter test mode %d\n", g_jit_mode);
+    return g_jit_mode;
+}
 
 static bool dlaa_on(void) {
     static int off = -1;
@@ -3672,9 +3807,11 @@ static void dlaa_track(void) {
         g_cam_ok = false, g_cam_hits = 0, g_dlaa_pending = false, g_dlaa_ran = false, g_dlaa_tried = false, g_dlaa_seen = false;
         int i = (int)(f % 16) + 1;
         g_jit[0] = halton(i, 2) - 0.5f, g_jit[1] = halton(i, 3) - 0.5f;
+        if (g_jit_mode == 4) g_jit[0] = g_jit[1] = 0;  // (test: no jitter)
     }
     if (st.rt.ncolor != 4 || !st.rt.depth) return;  // (the G-buffer: albedo, normals, material, extra)
     g_main_depth = st.rt.depth;
+    g_gbuf_mat = st.rt.color[2];
     g_scene_frame = f;
     const float *base = (const float *)(uintptr_t)st.ubuf[0][0].addr, *m = NULL;
     if (g_cam_ok || !base) return;
@@ -3697,6 +3834,21 @@ static void dlaa_track(void) {
 static bool dlaa_jittered(void) {
     return dlaa_on() && st.rt.depth && st.rt.depth == g_main_depth && st.ds[0] &&
            !(st.rt.ncolor && st.rt.color[0] && renderer_texture_presented(st.rt.color[0]));
+}
+
+// NVIDIA's texture mip bias for DLSS: log2(render / output width) - 1 (DLAA: -1). LARECOMP_DLAA_MIP_BIAS overrides.
+static float dlaa_mip_bias(void) {
+    static float b = 1;
+    if (b == 1) b = getenv("LARECOMP_DLAA_MIP_BIAS") ? (float)atof(getenv("LARECOMP_DLAA_MIP_BIAS")) : -1.0f;
+    return b;
+}
+// The 3D scene's draws (on the G-buffer pass's depth, depth-tested): Video tab "Texture detail" and DLAA's bias
+static float scene_tex_bias(void) {
+    if (!st.rt.depth || st.rt.depth != g_main_depth || !st.ds[0]) return 0;
+    if (st.rt.ncolor && st.rt.color[0] && renderer_texture_presented(st.rt.color[0])) return 0;
+    static const float td[4] = {0, -1, -2, -15};
+    float b = td[g_settings.tex_detail & 3];
+    return dlaa_jittered() ? fminf(b, dlaa_mip_bias()) : b;
 }
 
 static TexBackend *dlaa_image(TexBackend *d, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage, bool zero) {
@@ -3723,6 +3875,243 @@ static TexBackend *dlaa_image(TexBackend *d, uint32_t w, uint32_t h, VkFormat fm
     }
     return d;
 }
+
+// ================================================================== object motion vectors (DLAA)
+// Characters animate without motion vectors: DLSS blurred them or left them jagged. Their skinned G-buffer draws
+// (vertex shaders indexing their bones' cbuf) get a variant: the vertex shader runs twice - with last frame's cbufs
+// (bones, camera; kept per draw by its mesh) and this frame's - and the fragment shader writes the object's own motion
+// (minus the camera's, which DLSS adds from depth) into a 5th G-buffer attachment, DLSS's motion vectors.
+// LARECOMP_NO_OBJECT_MV=1 turns it off.
+static struct {                  // this draw's motion context (stage_set)
+    bool on, valid;
+    const void *prev[18];
+    uint32_t prev_len[18];
+    float u[20];                 // mat4 (last frame's view-projection * this frame's inverse) + flags
+} g_mvd;
+
+static int g_mv_off = -1;
+int mv_toggle(void) {  // (test: LARECOMP_DLAA_TUNE + F10)
+    g_mv_off = g_mv_off == 1 ? 0 : 1;
+    LOG("[dlss] object motion vectors %s\n", g_mv_off ? "off" : "on");
+    return !g_mv_off;
+}
+static bool mv_enabled(void) {
+    if (g_mv_off < 0) g_mv_off = getenv("LARECOMP_NO_OBJECT_MV") != NULL;
+    return !g_mv_off && dlaa_on();
+}
+
+static char *str_replace_tok(const char *s, const char *from, const char *to) {  // whole-identifier replace
+    size_t fl = strlen(from), tl = strlen(to), n = 0;
+    for (const char *p = strstr(s, from); p; p = strstr(p + fl, from)) n++;
+    char *o = malloc(strlen(s) + n * (tl + 1) + 1), *d = o;
+    const char *p = s;
+    for (const char *q; (q = strstr(p, from));) {
+        bool lb = q == s || !(isalnum((unsigned char)q[-1]) || q[-1] == '_');
+        bool rb = !(isalnum((unsigned char)q[fl]) || q[fl] == '_');
+        memcpy(d, p, (size_t)(q - p)); d += q - p;
+        if (lb && rb) { memcpy(d, to, tl); d += tl; } else { memcpy(d, from, fl); d += fl; }
+        p = q + fl;
+    }
+    strcpy(d, p);
+    return o;
+}
+
+// The vertex shader: main() as vs_prev() (cbufs 3+ from pcb*, outputs to dummies) and vs_cur(), both clip positions out
+static char *mv_vs_src(const char *src) {
+    const char *m = strstr(src, "void main() {");
+    if (!m) return NULL;
+    size_t hl = (size_t)(m - src);
+    char *hdr = malloc(hl + 4096), *h = hdr;
+    memcpy(h, src, hl); h += hl;
+    h += sprintf(h, "layout(location = 30) out vec4 o_mvc;\nlayout(location = 31) out vec4 o_mvp;\nvec4 g_pp; float g_pps;\n");
+    for (int k = 3; k < 18; k++) {  // last frame's copies of the cbufs, at binding 40 + k
+        char pat[64];
+        snprintf(pat, sizeof pat, "uniform CB%d { uvec4 cb%d[", k, k);
+        const char *q = strstr(src, pat);
+        if (!q || q > m) continue;
+        int nrow = atoi(q + strlen(pat));
+        h += sprintf(h, "layout(std140, set = 0, binding = %d) uniform PCB%d { uvec4 pcb%d[%d]; };\n", 40 + k, k, k, nrow);
+    }
+    for (int i = 0; i < 32; i++) {
+        char pat[48];
+        snprintf(pat, sizeof pat, "out vec4 v%d;", i);
+        const char *q = strstr(src, pat);
+        if (q && q < m) h += sprintf(h, "vec4 pv%d;\n", i);
+    }
+    *h = 0;
+    char *prev = strdup(m), *t;
+    for (int k = 3; k < 18; k++) {
+        char a[16], b[16];
+        snprintf(a, sizeof a, "cb%d", k), snprintf(b, sizeof b, "pcb%d", k);
+        t = str_replace_tok(prev, a, b); free(prev); prev = t;
+    }
+    for (int i = 0; i < 32; i++) {
+        char a[16], b[16];
+        snprintf(a, sizeof a, "v%d", i), snprintf(b, sizeof b, "pv%d", i);
+        t = str_replace_tok(prev, a, b); free(prev); prev = t;
+    }
+    t = str_replace_tok(prev, "gl_Position", "g_pp"); free(prev); prev = t;
+    t = str_replace_tok(prev, "gl_PointSize", "g_pps"); free(prev); prev = t;
+    t = str_replace_tok(prev, "main", "vs_prev"); free(prev); prev = t;
+    char *cur = str_replace_tok(m, "main", "vs_cur");
+    const char *tail = "void main() { vs_prev(); vec4 pp_ = g_pp; vs_cur(); o_mvc = gl_Position; o_mvp = pp_; }\n";
+    char *o = malloc(strlen(hdr) + strlen(prev) + strlen(cur) + strlen(tail) + 4);
+    sprintf(o, "%s%s\n%s\n%s", hdr, prev, cur, tail);
+    free(hdr); free(prev); free(cur);
+    return o;
+}
+
+// The fragment shader: main() as fs_main(), then the object's motion (UV units, to last frame) into color 4
+static char *mv_fs_src(const char *src) {
+    const char *m = strstr(src, "void main() {");
+    if (!m) return NULL;
+    static const char *decl =
+        "layout(location = 30) in vec4 i_mvc;\nlayout(location = 31) in vec4 i_mvp;\nlayout(location = 4) out vec4 o_mv;\n"
+        "layout(std140, set = 1, binding = 60) uniform MVU { mat4 mvM; vec4 mvP; };\n";
+    static const char *tail =
+        "void main() {\n  fs_main();\n  o_mv = vec4(0.0);\n"
+        "  if (mvP.x > 0.5 && i_mvp.w > 0.0 && i_mvc.w > 0.0) {\n"
+        "    vec4 g = i_mvc;\n"  // (undo the translator's epilogue: the game's own clip space)
+        "    if (mvP.y > 0.5) g.x = -g.x;\n    if (mvP.z > 0.5) g.y = -g.y;\n    if (mvP.w > 0.5) g.z = 2.0 * g.z - g.w;\n"
+        "    vec4 c = mvM * g;\n    if (mvP.y > 0.5) c.x = -c.x;\n    if (mvP.z > 0.5) c.y = -c.y;\n"
+        "    if (c.w > 0.0) { vec2 d = i_mvp.xy / i_mvp.w - c.xy / c.w; o_mv = vec4(0.5 * d.x, -0.5 * d.y, 0.0, 0.0); }\n"
+        "  }\n}\n";
+    char *body = str_replace_tok(m, "main", "fs_main");
+    size_t hl = (size_t)(m - src);
+    char *o = malloc(hl + strlen(decl) + strlen(body) + strlen(tail) + 4);
+    memcpy(o, src, hl);
+    sprintf(o + hl, "%s%s\n%s", decl, body, tail);
+    free(body);
+    return o;
+}
+
+static void mv_build(void *arg) {
+    Prog *pm = arg;
+    char *vs = mv_vs_src(pm->vi->msl), *fs = vs ? mv_fs_src(pm->fi->msl) : NULL;
+    size_t nv = 0, nf = 0;
+    uint32_t *sv = fs ? vk_glsl_to_spirv(vs, STAGE_VERTEX, "vs", &nv) : NULL;
+    uint32_t *sf = sv ? vk_glsl_to_spirv(fs, STAGE_FRAGMENT, "fs", &nf) : NULL;
+    if (getenv("LARECOMP_SAVE_MSL") && vs && fs) { save_glsl(vs, pm->code[0], "mv_vs"); save_glsl(fs, pm->code[1], "mv_fs"); }
+    free(vs); free(fs);
+    if (!sv || !sf) {
+        static int n;
+        if (n++ < 5) LOG("[dlss] motion variant of vs %llx failed to build\n", (unsigned long long)pm->code[0]);
+        free(sv); free(sf);
+        set_state(&pm->state, 2);
+        return;
+    }
+    pm->nbinds = vk_reflect(sv, nv, pm->binds, MAX_BIND);
+    pm->nbinds += vk_reflect(sf, nf, pm->binds + pm->nbinds, MAX_BIND - pm->nbinds);
+    pm->vs = vk_module(sv, nv);
+    pm->fs = vk_module(sf, nf);
+    free(sv); free(sf);
+    pm->layout = make_layout(pm, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
+    static int nok;
+    if (!nok++) LOG("[dlss] object motion vectors: first variant built (vs %llx)\n", (unsigned long long)pm->code[0]);
+    set_state(&pm->state, pm->vs && pm->fs ? 1 : 2);
+}
+
+// The motion variant of a skinned G-buffer program (queued on first use; NULL until built)
+static Prog *mv_prog(Prog *p) {
+    if (!p->motion) {
+        Prog *pm = calloc(1, sizeof *pm);
+        *pm = *p;
+        pm->xh[0] = pm->xh[1] = 0;  // (not recorded for the prewarm)
+        pm->motion = NULL;
+        pm->is_motion = true;
+        pm->waited_ns = 0;
+        atomic_store(&pm->state, 0);
+        p->motion = pm;
+        run_job(mv_build, pm);
+    }
+    Prog *pm = p->motion;
+    return atomic_load(&pm->state) == 1 ? pm : NULL;
+}
+
+// Last frame's vertex cbufs per draw (keyed by program and mesh): two generations
+#define MV_TAB 2048
+typedef struct { uint64_t key, frame; void *cur[18], *old[18]; uint32_t cur_len[18], old_len[18]; } MvEnt;
+static MvEnt *mv_tab;
+
+static int g_mv_stat[6];  // draws, no slot, no last frame, no camera, valid, cbuf size changed
+static uint64_t mv_key(const Prog *p, const CmdRec *r) {
+    uint64_t h = hmix(1469598103934665603ull, &st.program->stages[0].code_addr, 8);  // (warm programs: code[0] 0)
+    (void)p;
+    h = hmix(h, &st.vbuf[0].addr, 8);
+    h = hmix(h, &r->x[1], 8 * 4);  // (first index / vertex, count, instances, base vertex)
+    return h ? h : 1;
+}
+
+// Before a motion draw's descriptor sets: last frame's cbufs (if this mesh was drawn then), this frame's kept for next
+static void mv_prepare(const Prog *p, const CmdRec *r) {
+    if (!mv_tab) mv_tab = calloc(MV_TAB, sizeof *mv_tab);
+    uint64_t f = renderer_present_count(), key = mv_key(p, r);
+    uint32_t s = (uint32_t)(key ^ (key >> 29)) & (MV_TAB - 1);
+    MvEnt *e = NULL;
+    for (int i = 0; i < 16 && !e; i++, s = (s + 1) & (MV_TAB - 1))
+        if (mv_tab[s].key == key || !mv_tab[s].key || mv_tab[s].frame + 120 < f) e = &mv_tab[s];
+    memset(&g_mvd, 0, sizeof g_mvd);
+    g_mvd.on = true;
+    g_mv_stat[0]++;
+    if (!e) { g_mv_stat[1]++; return; }
+    if (e->key != key) {  // (new or stale slot)
+        for (int k = 0; k < 18; k++) { free(e->cur[k]); free(e->old[k]); }
+        memset(e, 0, sizeof *e);
+        e->key = key;
+    }
+    if (e->frame != f) {  // first draw of this mesh this frame: this frame's copies go to cur
+        bool recent = e->frame && e->frame + 3 >= f;
+        for (int k = 0; k < 18; k++) {
+            free(e->old[k]);
+            e->old[k] = recent ? e->cur[k] : NULL, e->old_len[k] = recent ? e->cur_len[k] : 0;
+            if (!recent) free(e->cur[k]);
+            e->cur[k] = NULL, e->cur_len[k] = 0;
+        }
+        e->frame = f;
+        for (int k = 3; k < 18; k++) {
+            if (!((p->vi->cbuf_mask >> k) & 1) || !st.ubuf[0][k - 3].addr) continue;
+            uint64_t len = st.ubuf[0][k - 3].size ? st.ubuf[0][k - 3].size : 256;
+            if (len > 0x10000) len = 0x10000;
+            e->cur[k] = malloc(len);
+            if (e->cur[k]) memcpy(e->cur[k], (const void *)(uintptr_t)st.ubuf[0][k - 3].addr, len), e->cur_len[k] = (uint32_t)len;
+        }
+    }
+    bool any = false, all = true;
+    for (int k = 3; k < 18; k++) {
+        if (!((p->vi->cbuf_mask >> k) & 1) || !st.ubuf[0][k - 3].addr) continue;
+        g_mvd.prev[k] = e->old[k], g_mvd.prev_len[k] = e->old_len[k];
+        any = true;
+        all &= e->old[k] != NULL;
+    }
+    float inv[16];
+    if (!any || !all) { g_mv_stat[2]++; return; }
+    if (!g_cam_ok || !g_cam_prev_ok || !m4_inv(inv, g_cam)) { g_mv_stat[3]++; return; }
+    g_mv_stat[4]++;
+    m4_mul(g_mvd.u, g_cam_prev, inv);
+    g_mvd.u[16] = 1;
+    g_mvd.u[17] = p->vkey.flip_x, g_mvd.u[18] = p->vkey.flip_y, g_mvd.u[19] = p->vkey.depth_minus_one;
+    g_mvd.valid = true;
+}
+
+// stage_set: the motion variant's extra uniform buffers (set 0 binding 40 + k: last frame's cbuf k; set 1 binding 60)
+static bool mv_binding(const VkBindingInfo *b, int stage, ShaderInfo *si, VkDescriptorBufferInfo *out) {
+    if (b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) return false;
+    if (b->binding == 60) {
+        float u[20];
+        memcpy(u, g_mvd.u, sizeof u);
+        if (!g_mvd.valid) u[16] = 0;
+        *out = ubo_span(vk_transient_copy(u, sizeof u, 256), sizeof u);
+        return true;
+    }
+    if (b->binding < 43 || b->binding >= 58) return false;
+    int k = (int)b->binding - 40;
+    VkDescriptorBufferInfo cur = cbuf_info(stage, si, k, 0, 0, 0);
+    if (g_mvd.valid && g_mvd.prev[k] && g_mvd.prev_len[k] >= cur.range)
+        *out = ubo_span(vk_transient_copy(g_mvd.prev[k], cur.range, 256), cur.range);
+    else { if (g_mvd.valid) g_mv_stat[5]++; g_mvd.valid = false, *out = cur; }
+    return true;
+}
+
 
 // The camera for DLSS from the view-projection (column-major, VP = P * V with V rigid, P without off-centre terms).
 static void dlaa_camera(DlssConstants *k, const float *m) {
@@ -3753,6 +4142,8 @@ static void dlaa_camera(DlssConstants *k, const float *m) {
 static void post_pass(VkCommandBuffer cb, const char *fs, const VkImageView *srcs, int n, TexBackend *dst, const float pc[8],
                       bool clear);
 
+static VkImageView post_view(TexBackend *d);
+
 // Over the window image the scene was just composited into, before the next draw there.
 static void dlaa_run(NvnTexture *tex) {
     TexBackend *c = tex ? (TexBackend *)tex->backend : NULL, *d = g_main_depth ? (TexBackend *)g_main_depth->backend : NULL;
@@ -3764,6 +4155,18 @@ static void dlaa_run(NvnTexture *tex) {
     VkCommandBuffer cb = vk_cmd();
     TexBackend *mv = dlaa_image(&mv_img, c->width, c->height, VK_FORMAT_R16G16_SFLOAT,
                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, true);
+    if (mv_enabled() && g_mv_img.image && g_mv_img.width == c->width && g_mv_img.height == c->height &&
+        g_mv_clear_frame == renderer_present_count()) mv = &g_mv_img;  // (characters' own motion: mv_prog)
+    if (g_debug_frame && mv == &g_mv_img) {  // (F9: build/dlaa_motion.png - red / green = x / y x 200, blue = non-zero)
+        static TexBackend viz;
+        TexBackend *vb = dlaa_image(&viz, mv->width, mv->height, VK_FORMAT_R8G8B8A8_UNORM,
+                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, false);
+        VkImageView src[1] = {post_view(mv)};
+        float pv[8] = {200.0f};
+        post_pass(cb, "mvviz.frag", src, 1, vb, pv, false);
+        vk_full_barrier(cb);
+        renderer_save_texture_tex(vb, "build/dlaa_motion.png");
+    }
     TexBackend *o = dlaa_image(&out_img, c->width, c->height, c->format,
                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, false);
     DlssImage ic = {c->image, vk_image_view(c, VK_IMAGE_VIEW_TYPE_2D, c->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT),
@@ -3800,17 +4203,46 @@ static void dlaa_run(NvnTexture *tex) {
         const char *e = getenv("LARECOMP_DLSS_JSIGN");
         if (e) sscanf(e, "%f %f", &sx, &sy);
     }
-    k.jitter[0] = sx * g_jit[0], k.jitter[1] = sy * g_jit[1];
+    float tx = g_jit_mode == 1 || g_jit_mode == 3 ? -1.0f : 1.0f, ty = g_jit_mode == 2 || g_jit_mode == 3 ? -1.0f : 1.0f;
+    k.jitter[0] = tx * sx * g_jit[0], k.jitter[1] = ty * sy * g_jit[1];
+    if (g_jit_mode_changed) k.reset = true, g_jit_mode_changed = false;
     static int nev, nreset;  // (every 600 evaluations: how often the history was dropped)
     nreset += reset;
     if (++nev % 600 == 0) {
         LOG("[dlss] %d evaluations, %d resets in the last 600\n", nev, nreset), nreset = 0;
+        LOG("[dlss] character motion: %d draws, %d no slot, %d no last frame, %d no camera, %d valid, %d size changed\n",
+            g_mv_stat[0], g_mv_stat[1], g_mv_stat[2], g_mv_stat[3], g_mv_stat[4], g_mv_stat[5]);
+        memset(g_mv_stat, 0, sizeof g_mv_stat);
         dlss_fg_state_log();
     }
     vk_full_barrier(cb);
     extern VkExtent2D vk_frame_extent(void);
     VkExtent2D win = vk_frame_extent();
-    if (dlss_evaluate(cb, &ic, &idp, &im, &io, &k, g_settings.frame_gen & 3, win.width, win.height)) {
+    // characters animate without motion vectors: DLSS blended their history into a soft face (half the detail of the
+    // game's image) - a mask from the G-buffer makes it favour their current frame. LARECOMP_DLAA_CHAR_BIAS=<0..1>.
+    if (g_char_bias < 0) g_char_bias = getenv("LARECOMP_DLAA_CHAR_BIAS") ? (float)atof(getenv("LARECOMP_DLAA_CHAR_BIAS")) : 0.0f;
+    float cbias = g_char_bias;
+    TexBackend *gm = g_gbuf_mat ? (TexBackend *)g_gbuf_mat->backend : NULL;
+    DlssImage ib, *pib = NULL;
+    if (cbias > 0 && gm && gm->image && gm->width == c->width && gm->height == c->height) {
+        static TexBackend bias_img;
+        TexBackend *bi = dlaa_image(&bias_img, c->width, c->height, VK_FORMAT_R8G8B8A8_UNORM,
+                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, false);
+        VkImageView src[1] = {vk_image_view(gm, VK_IMAGE_VIEW_TYPE_2D, gm->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT)};
+        float pb[8] = {cbias};
+        post_pass(cb, "charmask.frag", src, 1, bi, pb, false);
+        vk_full_barrier(cb);
+        static int nlog;
+        if (!nlog++) LOG("[dlss] character mask %ux%u from material target fmt %d, bias %.2f\n", bi->width, bi->height, gm->format, cbias);
+        if (g_debug_frame) {  // (F9: the mask and its source)
+            renderer_save_texture_tex(bi, "build/dlaa_charmask.png");
+            renderer_save_texture_tex(gm, "build/dlaa_material.png");
+        }
+        ib = (DlssImage){bi->image, post_view(bi), bi->format, bi->width, bi->height,
+                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+        pib = &ib;
+    }
+    if (dlss_evaluate(cb, &ic, &idp, &im, pib, &io, &k, g_settings.frame_gen & 3, win.width, win.height)) {
         vk_full_barrier(cb);
         static const float stops[4] = {-1, 1.0f, 0.5f, 0.2f};  // (RCAS: exp2(-stops); 0.2 is AMD's default, fairly strong)
         float sh = stops[g_settings.dlaa_sharpen & 3];
@@ -3909,6 +4341,10 @@ static void draw_(CmdRec *r, bool indexed) {
             pr = get_program(st.program, &vkey, &fkey);
             if (!pr || !wait_built(&pr->state, &pr->waited_ns)) SKIP(SK_PROG, "buffer-texture variant building\n");
         }
+    }
+    if (g_mv_pass && pr->vi->cbuf_dynamic && !pr->vi->uses_gmem && !pr->fi->uses_gmem && st.ds[0]) {  // (object motion)
+        Prog *pm = mv_prog(pr);
+        if (pm) { mv_prepare(pr, r); pr = pm; }
     }
     g_mirror_w = 0;
     {   // mirror mode (runtime/hle/mirror.c; as renderer.m): the scene's composite into the window image is mirrored
@@ -4013,6 +4449,10 @@ static void draw_(CmdRec *r, bool indexed) {
             k.blend_on |= (uint8_t)(1u << i);
             memcpy(k.blend[i], st.blend[i], 8);
         }
+    }
+    if (k.ncolor > 4) {  // (the motion target: written by motion variants only)
+        k.write_mask[4] = pr->is_motion ? 0x3 : 0;
+        k.blend_on &= 0xF;
     }
     k.a2c = st.ms[0xC] != 0;
     k.topo_class = cls;
@@ -4568,8 +5008,9 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         uint32_t tsc = (uint32_t)(h >> 20) & 0xFFF;
         if (h && st.spool && tsc < (uint32_t)st.spool->count) {
             const NvnSamplerDesc *d = &((const NvnSamplerDesc *)st.spool->entries)[tsc];
-            LOG("[draw]     sampler wrap %u %u %u filt %u/%u cmp %u/%u border %g %g %g %g\n", d->wrap[0], d->wrap[1], d->wrap[2],
-                d->min_filter, d->mag_filter, d->compare_mode, d->compare_func, d->border[0], d->border[1], d->border[2], d->border[3]);
+            LOG("[draw]     sampler wrap %u %u %u filt %u/%u cmp %u/%u border %g %g %g %g lod %g..%g bias %g aniso %g\n", d->wrap[0],
+                d->wrap[1], d->wrap[2], d->min_filter, d->mag_filter, d->compare_mode, d->compare_func, d->border[0], d->border[1],
+                d->border[2], d->border[3], d->lod_min, d->lod_max, d->lod_bias, d->max_aniso);
         }
     }
     // LARECOMP_DUMP_TEX=<fs hash>[,...] and/or min:<n> (any fragment shader sampling at least n textures): with F9, save
@@ -4894,8 +5335,8 @@ static VkPipelineLayout post_layout;
 static VkDescriptorSetLayout post_set_layout;
 
 static VkPipeline post_pipeline(const char *fs) {
-    static struct { const char *fs; VkPipeline p; } cache[8];
-    for (int i = 0; i < 8; i++) if (cache[i].p && cache[i].fs == fs) return cache[i].p;
+    static struct { const char *fs; VkPipeline p; } cache[16];
+    for (int i = 0; i < 16; i++) if (cache[i].p && cache[i].fs == fs) return cache[i].p;
     if (!post_layout) {
         VkDescriptorSetLayoutBinding b[3];
         for (uint32_t i = 0; i < 3; i++)
@@ -4935,14 +5376,14 @@ static VkPipeline post_pipeline(const char *fs) {
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = post_layout};
     VkPipeline p;
     VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
-    for (int i = 0; i < 8; i++) if (!cache[i].p) { cache[i].fs = fs; cache[i].p = p; break; }
+    for (int i = 0; i < 16; i++) if (!cache[i].p) { cache[i].fs = fs; cache[i].p = p; break; }
     return p;
 }
 
 // Post image `i` at w x h (RGBA8, kept until the size changes). 0, 1: SMAA edges / weights, 2: SMAA output,
 // 3, 4: FSR EASU / RCAS, 5: supersampling resolve.
 static TexBackend *post_image(int i, uint32_t w, uint32_t h) {
-    static TexBackend img[6];
+    static TexBackend img[8];  // (6: RCAS over the final image)
     TexBackend *d = &img[i];
     if (d->image && (d->width != w || d->height != h)) {
         vk_views_forget(d);
@@ -5039,7 +5480,9 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
     bool fsr = g_settings.upscaler == UPSCALE_FSR1 && (ow > b->width + 1 || oh > b->height + 1);  // (an upscale only)
     // larger than the window: average every source pixel (bilinear would skip most of them and keep the shimmer)
     bool down = !fsr && ow && oh && (ow + 1 < b->width || oh + 1 < b->height) && !getenv("LARECOMP_NO_RESOLVE");
-    if (!smaa && !fsr && !down) return v;
+    static const float stops[4] = {-1, 1.0f, 0.5f, 0.2f};  // (as DLAA's: exp2(-stops))
+    bool sharpen = !fsr && g_settings.antialias != AA_DLAA && stops[g_settings.dlaa_sharpen & 3] >= 0;
+    if (!smaa && !fsr && !down && !sharpen) return v;
     extern void vk_frame_suspend(void);
     extern void vk_frame_resume(void);
     vk_frame_suspend();
@@ -5074,6 +5517,14 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
         VkImageView di[3] = {v};
         post_pass(cb, "downscale.frag", di, 1, d, pd, false);
         v = post_view(d);
+    }
+    if (sharpen) {  // (SMAA / no AA: RCAS over the final image, at the window's size - as Ryujinx's FSR filter)
+        uint32_t sw = down ? ow : b->width, sh = down ? oh : b->height;
+        TexBackend *r = post_image(6, sw, sh);
+        float pr[8] = {exp2f(-stops[g_settings.dlaa_sharpen & 3]), 0, 0, 0, (float)sw, (float)sh};
+        VkImageView ri_[3] = {v};
+        post_pass(cb, "rcas.frag", ri_, 1, r, pr, false);
+        v = post_view(r);
     }
     vk_full_barrier(cb);
     vk_frame_resume();

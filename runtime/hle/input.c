@@ -155,6 +155,18 @@ void input_handle_event(const SDL_Event *e) {
             SDL_Window *w = SDL_GetWindowFromID(e->key.windowID);
             if (w) SDL_SetWindowTitle(w, t);
         }
+        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F10 && !e->key.repeat && getenv("LARECOMP_DLAA_TUNE")) {
+            extern int mv_toggle(void);  // (test: exec.c - characters' motion vectors on / off)
+            mv_toggle();
+        }
+        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F10 && !e->key.repeat && getenv("LARECOMP_BLOOM_TUNE")) {
+            extern float bloom_scale_cycle(void);  // (test: exec.c)
+            bloom_scale_cycle();
+        }
+        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F10 && !e->key.repeat && getenv("LARECOMP_JITTER_TEST")) {
+            extern int dlaa_jitter_cycle(void);  // (test: exec.c)
+            dlaa_jitter_cycle();
+        }
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F10 && !e->key.repeat && getenv("LARECOMP_DIFF_ICONS")) {
             extern void widescreen_diff_key(void);  // (RE: widescreen.c - snapshot, then compare after the 16:9 switch)
             widescreen_diff_key();

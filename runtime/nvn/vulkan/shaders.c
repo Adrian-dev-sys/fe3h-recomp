@@ -260,7 +260,7 @@ static const char *builtin_src(const char *name, int *stage) {
                "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
                "}\n";
     }
-    // SMAA 1x (third_party/smaa, runtime/nvn/smaa_data.c): the reference SMAA.hlsl in its GLSL mode, High preset,
+    // SMAA 1x (third_party/smaa, runtime/nvn/smaa_data.c): the reference SMAA.hlsl in its GLSL mode, Ultra preset,
     // with an entry point per pass. a = SMAA_RT_METRICS (1 / size, size). The vertex-stage offset helpers run per
     // pixel here. Luma edges (t0 = colour) -> blending weights (t0 = edges, t1 = area, t2 = search) -> neighbourhood
     // blending (t0 = colour, t1 = weights). Vulkan's texture origin is top-left, as SMAA expects (no flips).
@@ -276,7 +276,7 @@ static const char *builtin_src(const char *name, int *stage) {
                 "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
                 "#define SMAA_RT_METRICS pc.a\n"
                 "#define SMAA_GLSL_4\n"
-                "#define SMAA_PRESET_HIGH\n";
+                "#define SMAA_PRESET_ULTRA\n";  // (as Ryujinx's SMAA Ultra: lower-contrast edges too)
             static const char *mains[3] = {
                 "layout(set = 0, binding = 0) uniform sampler2D t0;\n"
                 "layout(location = 0) out vec4 o;\n"
@@ -381,6 +381,25 @@ static const char *builtin_src(const char *name, int *stage) {
                "  tapf(ac, aw, vec2(0.0, 2.0) - pp, dir, len2, lob, clp, nC);\n"
                "  o = vec4(min(mx, max(mn, ac / aw)), 1.0);\n"
                "}\n";
+    }
+    // (F9) the motion vectors made visible: x red, y green around grey, a.x = gain
+    if (!strcmp(name, "mvviz.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() { vec2 m = texelFetch(t, ivec2(gl_FragCoord.xy), 0).xy * pc.a.x;\n"
+               "  o = vec4(clamp(0.5 + m, 0.0, 1.0), any(notEqual(m, vec2(0.0))) ? 1.0 : 0.0, 1.0); }\n";
+    }
+    // DLAA's bias-current-colour mask from FE3H's G-buffer material target: green 1 on characters. a.x = the bias.
+    if (!strcmp(name, "charmask.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() { o = vec4(texelFetch(t, ivec2(gl_FragCoord.xy), 0).g > 0.5 ? pc.a.x : 0.0); }\n";
     }
     // FSR 1 RCAS: contrast-adaptive sharpening of the EASU output (same size). a.x = sharpness (exp2(-stops)),
     // b.xy = image size. The lobe is limited so the result stays inside the neighbours' range; noise is damped.

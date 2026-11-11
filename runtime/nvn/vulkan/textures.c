@@ -180,6 +180,25 @@ static bool tex_scalable(const NvnTexture *t) {
     return a > 1.74f && a < 1.81f;
 }
 
+// FE3H's character shadow map (1024 R32F + its depth, render targets): drawn at 4x - one texel was a ~6 px block on
+// close-up faces. Its shaders' texel-size constants follow (exec.c shadow_cbuf_patch). LARECOMP_SHADOW_SCALE=<n>, 1 off.
+float vk_shadow_scale(void) {
+    static float s = 0;
+    if (s == 0) s = getenv("LARECOMP_SHADOW_SCALE") ? (float)atof(getenv("LARECOMP_SHADOW_SCALE")) : 4.0f;
+    return s >= 1 && s <= 8 ? s : 1;
+}
+static float tex_fixed_scale(const NvnTexture *t) {
+    if (t->target != 1 || t->samples > 1 || (t->flags & 0xc) != 0xc || t->width != 1024 || t->height != 1024) return 0;
+    if (t->format != 0xa && t->format != 0x34) return 0;
+    return vk_shadow_scale() > 1 ? vk_shadow_scale() : 0;
+}
+
+// The character shadow mask (960 x 540 R8, a render target): full resolution (exec.c hq_fs_override fills it per pixel)
+static float tex_scale_mul(const NvnTexture *t) {
+    if (getenv("LARECOMP_NO_HQ_SHADOW_MASK") || vk_shadow_scale() <= 1) return 0;
+    return t->target == 1 && t->samples <= 1 && (t->flags & 0xc) == 0xc && t->width == 960 && t->height == 540 && t->format == 0x1 ? 2 : 0;
+}
+
 bool renderer_texture_first_write(NvnTexture *t) {
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
     uint64_t total_frames = renderer_present_count();
@@ -267,8 +286,9 @@ void vk_collect_dead(void) {
 
 static void create_image(NvnTexture *t, TexBackend *b) {
     VkFmt mf = fmt_of(t->format);
-    b->sx = b->scalable ? g_rs_x : 1;
-    b->sy = b->scalable ? g_rs_y : 1;
+    float mul = b->scale_mul ? b->scale_mul : 1;
+    b->sx = b->fixed_scale ? b->fixed_scale : b->scalable ? g_rs_x * mul : 1;
+    b->sy = b->fixed_scale ? b->fixed_scale : b->scalable ? g_rs_y * mul : 1;
     uint32_t tw = t->width ? t->width : 1, th = t->height ? t->height : 1;
     if (b->scalable) {
         tw = (uint32_t)lroundf(tw * b->sx); th = (uint32_t)lroundf(th * b->sy);
@@ -416,7 +436,8 @@ static void live_remove(TexBackend *b) {
 static TexBackend *tex_backend(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
-        if (b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y)) {  // output resolution changed: reallocate
+        float mul = b->scale_mul ? b->scale_mul : 1;
+        if (b->scalable && !b->fixed_scale && (b->sx != g_rs_x * mul || b->sy != g_rs_y * mul)) {  // output resolution changed: reallocate
             destroy_image(b);
             create_image(t, b);
         }
@@ -425,6 +446,9 @@ static TexBackend *tex_backend(NvnTexture *t) {
     vk_collect_dead();
     b = calloc(1, sizeof *b);
     b->scalable = tex_scalable(t);
+    b->fixed_scale = tex_fixed_scale(t);
+    if (b->fixed_scale) b->scalable = true;
+    if (b->scalable) b->scale_mul = tex_scale_mul(t);
     if (getenv("LARECOMP_LOG_SCALE") && t->target == 1 && t->width >= 32)  // (debug) which targets take the output scale
         LOG("[scale] %ux%u fmt %#x flags %#x samples %u levels %u: %s\n", t->width, t->height, t->format, t->flags, t->samples,
             t->levels, b->scalable ? "scalable" : "fixed");
@@ -813,8 +837,18 @@ static VkCompareOp compare_op(uint32_t f) {
     }
 }
 
+static VkSampler make_sampler(NvnSamplerDesc *d, float bias);
 VkSampler vk_sampler(NvnSamplerDesc *d) {
-    if (d->backend) return (VkSampler)d->backend;
+    if (!d->backend) d->backend = (void *)make_sampler(d, 0);
+    return (VkSampler)d->backend;
+}
+// Mipmapped samplers with an extra mip bias (one bias in use: DLAA's -1), others as vk_sampler
+VkSampler vk_sampler_bias(NvnSamplerDesc *d, float bias) {
+    if (bias == 0 || d->min_filter <= 1 || d->compare_mode) return vk_sampler(d);
+    if (!d->backend_bias || d->bias_val != bias) d->backend_bias = (void *)make_sampler(d, bias), d->bias_val = bias;  // (setting changed: the old one leaks)
+    return (VkSampler)d->backend_bias;
+}
+static VkSampler make_sampler(NvnSamplerDesc *d, float bias) {
     VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.magFilter = d->mag_filter == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     uint32_t mf = d->min_filter;
@@ -837,7 +871,7 @@ VkSampler vk_sampler(NvnSamplerDesc *d) {
     si.maxLod = d->lod_max > 1000 ? VK_LOD_CLAMP_NONE : d->lod_max;
     if (mf <= 1) si.maxLod = si.minLod + 0.25f;  // not mipmapped: stay on the base level
     if (si.maxLod < si.minLod) si.maxLod = si.minLod;
-    si.mipLodBias = d->lod_bias;
+    si.mipLodBias = d->lod_bias + bias;
     if (d->max_aniso > 1) { si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = fminf(d->max_aniso, 16); }
     static int force_af = -1;  // 16x for mipmapped linear textures (angled map floors blurred and crawled); LARECOMP_NO_FORCE_AF=1 off
     if (force_af < 0) force_af = getenv("LARECOMP_NO_FORCE_AF") == NULL;
@@ -866,7 +900,6 @@ VkSampler vk_sampler(NvnSamplerDesc *d) {
     }
     VkSampler s;
     VK_CHECK(vkCreateSampler(g_vk.dev, &si, NULL, &s));
-    d->backend = (void *)s;
     return s;
 }
 

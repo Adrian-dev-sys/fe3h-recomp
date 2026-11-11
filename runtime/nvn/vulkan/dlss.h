@@ -43,7 +43,8 @@ void dlss_present_begin(void);  // around each present (Reflex markers; a new fr
 void dlss_present_end(void);
 void dlss_fg_state_log(void);
 // fg_frames: frames generated per real frame (0 off) into a window of win_w x win_h
-bool dlss_evaluate(VkCommandBuffer cb, const DlssImage *color, const DlssImage *depth, const DlssImage *mvec,
+// bias: optional mask (1 = take the current frame over history: FE3H's characters, animated without motion vectors)
+bool dlss_evaluate(VkCommandBuffer cb, const DlssImage *color, const DlssImage *depth, const DlssImage *mvec, const DlssImage *bias,
                    const DlssImage *out, const DlssConstants *c, int fg_frames, uint32_t win_w, uint32_t win_h);
 
 #ifdef __cplusplus

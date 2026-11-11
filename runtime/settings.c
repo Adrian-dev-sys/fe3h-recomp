@@ -127,6 +127,7 @@ void settings_load(void) {
         }
         else if (!strcmp(key, "upscaler")) g_settings.upscaler = !strcmp(val, "bilinear") ? UPSCALE_BILINEAR : UPSCALE_SHARP;  // (metalfx / fsr1: this OS's)
         else if (!strcmp(key, "dlaa_sharpen")) g_settings.dlaa_sharpen = atoi(val) < 0 ? 0 : atoi(val) > 3 ? 3 : atoi(val);
+        else if (!strcmp(key, "texture_detail")) g_settings.tex_detail = atoi(val) < 0 ? 0 : atoi(val) > 3 ? 3 : atoi(val);
         else if (!strcmp(key, "frame_gen")) g_settings.frame_gen = atoi(val) < 0 ? 0 : atoi(val) > 3 ? 3 : atoi(val);
         else if (!strcmp(key, "antialias")) g_settings.antialias = !strcmp(val, "off") ? AA_OFF : !strcmp(val, "dlaa") ? AA_DLAA : AA_SMAA;  // ("fxaa": SMAA now)
         else if (!strcmp(key, "shader_wait")) g_settings.shader_wait = !strcmp(val, "off") ? SHADER_WAIT_OFF :
@@ -185,6 +186,7 @@ void settings_save(void) {
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_DLAA ? "dlaa" : g_settings.antialias == AA_SMAA ? "smaa" : "off");
     fprintf(f, "dlaa_sharpen = %d\n", g_settings.dlaa_sharpen);
     fprintf(f, "frame_gen = %d\n", g_settings.frame_gen);
+    fprintf(f, "texture_detail = %d\n", g_settings.tex_detail);
     static const char *const waits[] = {"off", "balanced", "full"};
     fprintf(f, "shader_wait = %s\n", waits[g_settings.shader_wait % 3]);
     if (g_settings.res_mode == RES_DYNAMIC) fprintf(f, "resolution = dynamic\n");
