@@ -3611,7 +3611,7 @@ static bool ui_world_icons(CmdRec *r, bool indexed) {
 static NvnTexture *g_main_depth;  // the G-buffer pass's depth
 static uint64_t g_dl_frame = ~0ull, g_scene_frame = ~0ull;
 static float g_cam[16], g_cam_prev[16], g_cam_cand[16], g_jit[2];
-static bool g_cam_ok, g_cam_prev_ok, g_dlaa_pending, g_dlaa_ran, g_dlaa_tried;  // (tried: once a frame)
+static bool g_cam_ok, g_cam_prev_ok, g_dlaa_pending, g_dlaa_ran, g_dlaa_tried, g_dlaa_seen;  // (tried: once a frame)
 static int g_cam_hits;
 
 static bool dlaa_on(void) {
@@ -3665,23 +3665,28 @@ static void dlaa_track(void) {
         static int nwarn;  // (why a 3D frame got no DLAA: no camera found, or no composite seen)
         if (dlaa_on() && g_scene_frame == g_dl_frame && !g_dlaa_ran && (nwarn++ < 5 || nwarn % 600 == 0))
             LOG("[dlss] frame %llu: 3D scene without DLAA (camera %s, composite %s)\n", (unsigned long long)g_dl_frame,
-                g_cam_ok ? "found" : "not found", g_dlaa_pending ? "pending" : "not seen");
+                g_cam_ok ? "found" : "not found", g_dlaa_seen ? "seen" : "not seen");
         g_dl_frame = f;
         g_cam_prev_ok = g_cam_ok && g_dlaa_ran;
         if (g_cam_ok) memcpy(g_cam_prev, g_cam, 64);
-        g_cam_ok = false, g_cam_hits = 0, g_dlaa_pending = false, g_dlaa_ran = false, g_dlaa_tried = false;
+        g_cam_ok = false, g_cam_hits = 0, g_dlaa_pending = false, g_dlaa_ran = false, g_dlaa_tried = false, g_dlaa_seen = false;
         int i = (int)(f % 16) + 1;
         g_jit[0] = halton(i, 2) - 0.5f, g_jit[1] = halton(i, 3) - 0.5f;
     }
     if (st.rt.ncolor != 4 || !st.rt.depth) return;  // (the G-buffer: albedo, normals, material, extra)
     g_main_depth = st.rt.depth;
     g_scene_frame = f;
-    const float *m = (const float *)(uintptr_t)st.ubuf[0][0].addr;
-    if (g_cam_ok || !m || st.ubuf[0][0].size < 64) return;
+    const float *base = (const float *)(uintptr_t)st.ubuf[0][0].addr, *m = NULL;
+    if (g_cam_ok || !base) return;
     extern float widescreen_factor(void);
-    float lx = sqrtf(m[0] * m[0] + m[4] * m[4] + m[8] * m[8]), ly = sqrtf(m[1] * m[1] + m[5] * m[5] + m[9] * m[9]);
-    float lw = sqrtf(m[3] * m[3] + m[7] * m[7] + m[11] * m[11]);
-    if (ly < 1e-3f || fabsf(lw - 1) > 0.02f || fabsf(lx / ly - 0.5625f / fmaxf(widescreen_factor(), 1.0f)) > 0.005f) return;
+    // the view-projection heads c3 (battles, maps), or follows a vector or two (the monastery's shaders: +16 / +32 bytes)
+    for (int off = 0; off <= 8 && !m && st.ubuf[0][0].size >= (off + 16) * 4u; off += 4) {
+        const float *c = base + off;
+        float lx = sqrtf(c[0] * c[0] + c[4] * c[4] + c[8] * c[8]), ly = sqrtf(c[1] * c[1] + c[5] * c[5] + c[9] * c[9]);
+        float lw = sqrtf(c[3] * c[3] + c[7] * c[7] + c[11] * c[11]);
+        if (ly >= 1e-3f && fabsf(lw - 1) <= 0.02f && fabsf(lx / ly - 0.5625f / fmaxf(widescreen_factor(), 1.0f)) <= 0.005f) m = c;
+    }
+    if (!m) return;
     if (g_cam_hits && !memcmp(m, g_cam_cand, 64)) {  // (two draws agree: the camera, not one object's matrix)
         memcpy(g_cam, m, 64);
         g_cam_ok = true;
@@ -4168,7 +4173,9 @@ static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tex += SDL_GetTicksNS() - prof_tx_;
     if (st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend && !renderer_texture_presented(st.rt.color[0])) {
         // a movie frame converted into a (widened) target stays 2D; any other draw into it makes it a scene buffer
-        bool conv = pr->fi->ntex > 0 && r->x[2] <= 6;
+        // (a plain copy: not blended or depth-tested - a monastery overlay quad over the scene reads only uploaded
+        // textures, and marked the scene buffer a movie: the scene boxed as 2D, no DLAA)
+        bool conv = pr->fi->ntex > 0 && r->x[2] <= 6 && !(st.color_state[0] & 1) && !st.ds[0];
         for (int i = 0; i < pr->fi->ntex && i < 64; i++) conv &= tex_video[i];
         ((TexBackend *)st.rt.color[0]->backend)->video = conv;
     }
@@ -4184,10 +4191,18 @@ static void draw_(CmdRec *r, bool indexed) {
                                st.viewport[0][2] >= st.rt.color[0]->width && st.viewport[0][3] >= st.rt.color[0]->height;
         bool fullscreen_fill = pr->fi->ntex == 0 && fullscreen_quad;
         if (fullscreen_quad && !reads_scene && !video && pr->fi->ntex == 1 && (tex_sc[1][0][0] != 1 || tex_sc[1][0][1] != 1)) reads_scene = true;
+        {   // after a 3D scene, the frame's first textured fullscreen quad here is its composite, whatever it reads (the
+            // monastery at some angles composites from smaller buffers only: boxed as UI, no DLAA)
+            static uint64_t first_pres = ~0ull;
+            uint64_t now_f = renderer_present_count();
+            bool first = first_pres != now_f;
+            first_pres = now_f;
+            if (first && fullscreen_quad && !video && pr->fi->ntex > 0 && g_scene_frame == now_f) reads_scene = true;
+        }
         static uint64_t wide_frame = ~0ull;
         if (reads_scene) wide_frame = renderer_present_count();
         if (reads_scene && fullscreen_quad && !g_dlaa_tried && g_scene_frame == renderer_present_count() && dlaa_on())
-            g_dlaa_pending = true;  // (the first scene composite only: overlays reading depth come after it)
+            g_dlaa_pending = g_dlaa_seen = true;  // (the first scene composite only: overlays reading depth come after it)
         bool fade_fill = false;
         if (fullscreen_fill && st.ubuf[1][0].addr && st.ubuf[1][0].size >= 12) {
             const float *c = (const float *)(uintptr_t)st.ubuf[1][0].addr;
