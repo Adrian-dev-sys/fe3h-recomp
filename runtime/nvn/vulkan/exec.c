@@ -2966,6 +2966,8 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
 // pre_ii: texture descriptors already resolved by the caller (draw: fragment textures, needed earlier for the
 // viewport decision), or NULL.
 static float g_mirror_w;  // mirror mode's composite: its render target width (rscale[65].x; 0 otherwise)
+static float g_vs_rows[64][4];  // vertex stage rscale[1..]: the UI box's per-quad centres (ui_world_icons)
+static int g_vs_nrows;
 
 static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
                                  const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii) {
@@ -2977,6 +2979,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     int sg = stage == 1 ? 1 : 0;
     float rs[66][4] = {{1, 1, 0, 0}};  // ([65]: mirror mode, renderer.m)
     if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
+    if (sg == 0 && g_vs_nrows) memcpy(rs[1], g_vs_rows, (size_t)g_vs_nrows * 16);
     rs[65][0] = g_mirror_w;
     for (int i = 0; i < p->nbinds; i++) {
         VkBindingInfo *b = &p->binds[i];
@@ -3464,6 +3467,61 @@ static void nan_scan(void) {
     }
 }
 
+static Pipe *pipe_get(const PipeKey *k) {  // the pipeline for k: found, or queued to build
+    uint64_t ph = hash_words(0xcbf29ce484222325ull, k, sizeof *k);
+    if (!ph) ph = 1;
+    uint32_t pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
+    while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph) pslot = (pslot + 1) & (PIPE_TAB - 1);
+    Pipe *pp = pipe_tab[pslot].pipe;
+    if (!pp) {
+        pp = calloc(1, sizeof *pp);
+        pp->k = *k;
+        pipe_tab[pslot].key = ph;
+        pipe_tab[pslot].pipe = pp;
+        run_job(build_pipeline, pp);
+    }
+    return pp;
+}
+
+// FE3H ultrawide: the map's unit icons are placed by the game with the widened camera; boxed like the HUD they'd sit
+// short of their units. Each UI layout draws with its own pixel -> clip cbuf; the icon layout is the one that masks
+// its portrait diamonds with depth writes (seen the frame before, by its order among the frame's layouts). Its quads
+// keep their place and only shrink around their own centres (g_vs_rows, the box variant's vertex shader).
+static bool ui_world_icons(CmdRec *r, bool indexed) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_NO_ICON_FIX") != NULL;
+    const float *u = (const float *)(uintptr_t)st.ubuf[0][0].addr;
+    float w = (float)st.rt.color[0]->width, h = (float)st.rt.color[0]->height;
+    if (off || !u || st.ubuf[0][0].size < 16 || fabsf(u[0] * w - 2) > 0.02f || fabsf(fabsf(u[1]) * h - 2) > 0.02f) return false;
+    static uint64_t frame = ~0ull, cbuf;
+    static int ord;
+    static uint32_t prev, cur, prev_big, big;  // (per layout: depth-masking / has something no icon is: menus)
+    uint64_t f = renderer_present_count();
+    if (f != frame) frame = f, prev = cur, prev_big = big, cur = big = 0, ord = -1, cbuf = 0;
+    if (st.ubuf[0][0].addr != cbuf) cbuf = st.ubuf[0][0].addr, ord++;
+    if (ord < 0 || ord >= 32) return false;
+    if (st.ds[0] && st.ds[1]) cur |= 1u << ord;  // (a depth-writing UI draw: the diamonds' masks)
+    // icons are separate small quads (6 vertices each, under 300 px); indexed batches (text) or big panels: a menu
+    int nq = (int)(r->x[2] / 6);
+    if (indexed || r->x[2] % 6 || nq > 64 || !st.vbuf[0].addr || st.stream[0][0] < 12) { big |= 1u << ord; return false; }
+    for (int q = 0; q < nq; q++) {
+        float sx = 0, x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+        for (int v = 0; v < 6; v++) {
+            uint64_t o = (r->x[1] + (uint64_t)q * 6 + v) * st.stream[0][0];
+            if (o + 8 > st.vbuf[0].size) { big |= 1u << ord; return false; }
+            const float *p = (const float *)(uintptr_t)(st.vbuf[0].addr + o);
+            sx += p[0];
+            x0 = fminf(x0, p[0]), x1 = fmaxf(x1, p[0]), y0 = fminf(y0, p[1]), y1 = fmaxf(y1, p[1]);
+        }
+        if (x1 - x0 > 300 || y1 - y0 > 300) big |= 1u << ord;
+        g_vs_rows[q][0] = sx / 6 * u[0] + u[2];  // (the quad's centre, clip x)
+    }
+    if (!(prev >> ord & 1) || (prev_big >> ord & 1) || (big >> ord & 1)) return false;
+    g_vs_nrows = nq;
+    if (g_debug_frame) LOG("[draw]   world icon: %d quads, layout %d\n", nq, ord);
+    return true;
+}
+
 static void draw_(CmdRec *r, bool indexed);
 static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
@@ -3503,7 +3561,14 @@ static void draw_(CmdRec *r, bool indexed) {
         float lx = sqrtf(m[0] * m[0] + m[4] * m[4] + m[8] * m[8]), ly = sqrtf(m[1] * m[1] + m[5] * m[5] + m[9] * m[9]);
         bool persp = fabsf(m[3]) + fabsf(m[7]) + fabsf(m[11]) > 0.01f && lx > 0.01f && ly > 0.01f;
         extern float g_proj_lx, g_proj_ly;
-        if (persp && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->width == 1920) g_proj_lx = lx, g_proj_ly = ly;
+        extern float widescreen_factor(void);  // (the main camera: the widened shape)
+        bool main_cam = fabsf(lx / ly - 0.5625f / fmaxf(widescreen_factor(), 1.0f)) < 0.005f &&
+                        fabsf(m[3]) < 1e-4f;  // (a 4x4 projection, not the 2D UI's scale + offset)
+        extern float g_proj_vp[16];
+        if (persp && main_cam && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->width == 1920) {
+            g_proj_lx = lx, g_proj_ly = ly;
+            memcpy(g_proj_vp, m, 64);
+        }
         if (persp && f / 60 != lastf / 60) {
             lastf = f;
             LOG("[proj] f%llu vs %llx c3 %llx: x/y %.4f (16:9 = 0.5625) rt %ux%u\n", (unsigned long long)f,
@@ -3630,18 +3695,7 @@ static void draw_(CmdRec *r, bool indexed) {
     k.a2c = st.ms[0xC] != 0;
     k.topo_class = cls;
     k.poly_fill = st.poly[2] != 1;
-    uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
-    if (!ph) ph = 1;
-    uint32_t pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
-    while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph) pslot = (pslot + 1) & (PIPE_TAB - 1);
-    Pipe *pp = pipe_tab[pslot].pipe;
-    if (!pp) {
-        pp = calloc(1, sizeof *pp);
-        pp->k = k;
-        pipe_tab[pslot].key = ph;
-        pipe_tab[pslot].pipe = pp;
-        run_job(build_pipeline, pp);
-    }
+    Pipe *pp = pipe_get(&k);
     if (!wait_built(&pp->state, &pp->waited_ns)) SKIP(SK_PIPE, "state %d\n", atomic_load(&pp->state));
     ss_enabled();
     if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
@@ -3816,12 +3870,24 @@ static void draw_(CmdRec *r, bool indexed) {
         }
         bool composite = reads_scene || fade_fill || (fullscreen_fill && wide_frame == renderer_present_count());
         if (!composite) wide_frame = ~0ull;
-        {   // FE3H: only 2D UI is boxed - its vertex cbuf starts with the pixel -> clip scale (2 / w, -2 / h); the map's 3D
-            // overlays (unit rings, tile highlights) drawn into the same image keep the wide camera's place
-            const float *u = (const float *)(uintptr_t)st.ubuf[0][0].addr;
-            float w = (float)st.rt.color[0]->width, h = (float)st.rt.color[0]->height;
-            bool ui = u && st.ubuf[0][0].size >= 16 && fabsf(u[0] * w - 2) < 0.02f && fabsf(fabsf(u[1]) * h - 2) < 0.02f;
-            if (!ui) composite = true;
+        bool full_vp = st.viewport[0][0] == 0 && st.viewport[0][2] >= st.rt.color[0]->width;
+        static int vs_box = -1;
+        if (vs_box < 0) vs_box = getenv("LARECOMP_NO_VS_BOX") == NULL;
+        if (!reads_scene && full_vp && vs_box && pass_sx > pass_sy) {  // (fills: their screen-edge vertices stay put)
+            // FE3H: boxed per vertex - 2D (w == 1) in the 16:9 box, 3D overlays (unit rings, tiles) keep the wide camera
+            uint16_t q = (uint16_t)lroundf(pass_sy / pass_sx * 65535);
+            vkey.rt_kind[0] = 1; vkey.rt_kind[1] = (uint8_t)q; vkey.rt_kind[2] = (uint8_t)(q >> 8);
+            pr = get_program(st.program, &vkey, &fkey);
+            if (!pr || !wait_built(&pr->state, &pr->waited_ns)) SKIP(SK_PROG, "vs box variant building\n");
+            k.prog = pr;  // (its pipeline: the one bound above has the plain vertex shader)
+            Pipe *bp = pipe_get(&k);
+            if (!wait_built(&bp->state, &bp->waited_ns)) SKIP(SK_PIPE, "vs box pipeline building\n");
+            if (ss_need(SS_PIPE, ss.pipe == bp->pipe)) { ss.pipe = bp->pipe; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, bp->pipe); }
+            float rs0[4] = {1, 1, 0, 0};
+            if (ui_world_icons(r, indexed)) rs0[2] = 1, rs0[3] = (float)r->x[1];  // (centres: g_vs_rows)
+            vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, rs0, NULL, 0, 0, 0, NULL);
+            g_vs_nrows = 0;
+            composite = true;  // (full-width viewport: nothing clipped at the box edges)
         }
         if (!composite) {
             int pw, ph;
@@ -3840,6 +3906,7 @@ static void draw_(CmdRec *r, bool indexed) {
         set_viewport(vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, zn, zf);
         if (g_debug_frame) {
             VkRect2D sr = scissor_rect();
+            if (vkey.rt_kind[0]) LOG("[draw]   vs box x%.4f\n", (vkey.rt_kind[1] | vkey.rt_kind[2] << 8) / 65535.0);
             LOG("[draw]   vp %.2f %.2f %.2f %.2f (stretch %.3f, fs hash %016llx) scissor %d %d %u %u | guest sc %d %d %d %d | pass %ux%u s %.4f %.4f\n",
                 vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, k, (unsigned long long)g_cur_fs_hash, sr.offset.x, sr.offset.y,
                 sr.extent.width, sr.extent.height, st.scissor[0][0], st.scissor[0][1], st.scissor[0][2], st.scissor[0][3], pass_w, pass_h,
@@ -4113,11 +4180,18 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         }
         uint32_t sd = st.stream[0][0];
         if (!indexed && st.vbuf[0].addr && sd >= 24 && r->x[2] <= 6) {  // (small non-indexed draws: each vertex's first 6 floats)
+            float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
             for (uint64_t k = 0; k < r->x[2]; k++) {
                 uint64_t off = (r->x[1] + k) * sd;
                 if (off + 24 > st.vbuf[0].size) break;
                 const float *q = (const float *)(uintptr_t)(st.vbuf[0].addr + off);
                 LOG("[draw]   v%llu: %.4f %.4f %.4f | %.6f %.6f\n", (unsigned long long)k, q[0], q[1], q[2], q[4], q[5]);
+                bx0 = fminf(bx0, q[0]); by0 = fminf(by0, q[1]); bx1 = fmaxf(bx1, q[0]); by1 = fmaxf(by1, q[1]);
+            }
+            const float *u = (const float *)(uintptr_t)st.ubuf[0][0].addr;  // (2D pixel quads: LARECOMP_FIND_ICONS)
+            if (u && st.ubuf[0][0].size >= 16 && fabsf(u[0] * 1920 - 2) < 0.02f && bx1 > bx0) {
+                extern void icon_scan_add(float x0, float y0, float x1, float y1, uint64_t vb, uint64_t vbsize);
+                icon_scan_add(bx0, by0, bx1, by1, st.vbuf[0].addr, st.vbuf[0].size);
             }
         }
         if (st.ubuf[0][0].addr) {  // vertex cbuf c3: the first 16 floats (transform)

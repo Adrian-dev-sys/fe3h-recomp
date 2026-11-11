@@ -39,7 +39,8 @@ enum { TEXTYPE_1D, TEXTYPE_2D, TEXTYPE_3D, TEXTYPE_CUBE, TEXTYPE_2D_ARRAY, TEXTY
 typedef struct {
     uint8_t attr_kind[32];  // vertex inputs: 0 float, 1 signed int, 2 unsigned int. (Fragment: [0] = 1: UI into a
                             // scaled target, 2D lookups sharp-bilinear - no bleed across atlas pieces, glsl_sample)
-    uint8_t rt_kind[8];     // fragment outputs: 0 float, 1 signed int, 2 unsigned int
+    uint8_t rt_kind[8];     // fragment outputs: 0 float, 1 signed int, 2 unsigned int. (Vertex: [0] = 1: box 2D
+                            // vertices, clip x *= [1..2] / 65535 - ultrawide UI)
     bool depth_minus_one;   // NVN depth mode [-1,1]: remap clip z
     bool flip_y;            // lower-left window origin
     bool flip_x;            // mirror the image left to right (mirror mode's scene composite). (In the padding

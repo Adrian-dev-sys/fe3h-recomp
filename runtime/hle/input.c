@@ -148,6 +148,24 @@ void input_handle_event(const SDL_Event *e) {
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP:
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F9 && !e->key.repeat) g_debug_frame_request = 1;
+        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F10 && !e->key.repeat && getenv("LARECOMP_LIT_TOGGLE")) {
+            extern int widescreen_lit_toggle(void);  // (RE: widescreen.c)
+            char t[64];
+            snprintf(t, sizeof t, "aspect literal kept 16:9: %s", widescreen_lit_toggle() ? "ON" : "off");
+            SDL_Window *w = SDL_GetWindowFromID(e->key.windowID);
+            if (w) SDL_SetWindowTitle(w, t);
+        }
+        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F10 && !e->key.repeat && getenv("LARECOMP_DIFF_ICONS")) {
+            extern void widescreen_diff_key(void);  // (RE: widescreen.c - snapshot, then compare after the 16:9 switch)
+            widescreen_diff_key();
+        }
+        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F10 && !e->key.repeat && getenv("LARECOMP_ASPECT_BISECT")) {
+            extern int widescreen_aspect_site_next(void);  // (RE: widescreen.c)
+            char t[64];
+            snprintf(t, sizeof t, "aspect site off: %d", widescreen_aspect_site_next());
+            SDL_Window *w = SDL_GetWindowFromID(e->key.windowID);
+            if (w) SDL_SetWindowTitle(w, t);
+        }
         if (e->key.scancode < SDL_SCANCODE_COUNT) keys_down[e->key.scancode] = e->type == SDL_EVENT_KEY_DOWN;
         recompute_keyboard();
         break;

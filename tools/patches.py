@@ -716,15 +716,21 @@ FE3H_CAM_ASPECT_SITES = (0x70004df17c, 0x700098dfa4, 0x7000a58abc, 0x7000a591e8,
 FE3H_PROJ_ASPECT_SITES = (0x7000a32b74,)
 
 
+# The 16:9 literal's own adrp + ldr loads (its value follows the window: widescreen.c)
+FE3H_LIT_ASPECT_SITES = (0x700038769c, 0x70004adeec, 0x7000559eb0, 0x7000a5f4e0)
+FE3H_ASPECT_SITES = FE3H_CAM_ASPECT_SITES + FE3H_PROJ_ASPECT_SITES + FE3H_LIT_ASPECT_SITES
+
+
 def _fe3h_cam_aspect(gen, a):
     w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
     off = ((w >> 10) & 0xfff) * 4
-    assert (w & 0xffc00000) == 0xbd400000 and off in (0x13c, 0x14c), hex(w)  # ldr sT, [xN, #off]
+    assert (w & 0xffc00000) == 0xbd400000, hex(w)  # ldr sT, [xN, #off]
     rt, rn = w & 31, (w >> 5) & 31
-    return ('{ extern float rt_cam_aspect(float); float o_; '
-            f'memcpy(&o_, (const void *)(uintptr_t)(c->x[{rn}] + {off:#x}), 4); o_ = rt_cam_aspect(o_); '
+    sid = FE3H_ASPECT_SITES.index(a)  # (site id: LARECOMP_ASPECT_BISECT's F10 un-widens one site at a time)
+    return ('{ extern float rt_cam_aspect_site(float, int); float o_; '
+            f'memcpy(&o_, (const void *)(uintptr_t)(c->x[{rn}] + {off:#x}), 4); o_ = rt_cam_aspect_site(o_, {sid}); '
             f'c->v[{rt}] = 0; memcpy(&c->v[{rt}], &o_, 4); }}  /* {a:#x}: ldr s{rt}, [x{rn}, #{off:#x}] (camera aspect) */')
 
 
-for _a in FE3H_CAM_ASPECT_SITES + FE3H_PROJ_ASPECT_SITES:
+for _a in FE3H_ASPECT_SITES:
     PATCHES[_a] = _fe3h_cam_aspect

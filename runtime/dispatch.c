@@ -283,7 +283,7 @@ void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) {
 // Debug data watchpoint: the page is protected; accesses in [lo, hi) are attributed to the host
 // function (f_<guest addr>) doing them, then the page is reopened until the next re-arm.
 uint64_t g_watch_lo, g_watch_hi;
-static uint64_t watch_page;
+static volatile uint64_t watch_page, watch_prev;  // (prev: a page the thread may still have closed once)
 static void *watch_thread(void *a) {
     (void)a;
     int r = plat_protect(watch_page, PLAT_PAGE, PLAT_PROT_NONE);
@@ -292,13 +292,91 @@ static void *watch_thread(void *a) {
     return NULL;
 }
 void watch_arm(void) {
-    if (!g_watch_lo || watch_page) return;
+    if (!g_watch_lo) return;
+    static uint64_t last_lo, last_hi;
+    if (watch_page && last_lo == g_watch_lo && last_hi == g_watch_hi) return;
+    last_lo = g_watch_lo, last_hi = g_watch_hi;
+    if (watch_page) {  // (re-arm on another range: the old page reopened)
+        uint64_t old = watch_page;
+        watch_page = g_watch_lo & ~(PLAT_PAGE - 1);
+        if (old != watch_page) { watch_prev = old; plat_protect(old, PLAT_PAGE, PLAT_PROT_RW); }
+        fprintf(stderr, "[watch] now %llx..%llx\n", (unsigned long long)g_watch_lo, (unsigned long long)g_watch_hi);
+        return;
+    }
     watch_page = g_watch_lo & ~(PLAT_PAGE - 1);
     pthread_t t;
     pthread_create(&t, NULL, watch_thread, NULL);
 }
 
+// (RE) many ranges at once (widescreen.c LARECOMP_DIFF_ICONS=vp): each access logged once per function and range,
+// with the guest call chain; watch_multi(0, ...) stops
+#define WMULTI 96
+static uint64_t wm_lo[WMULTI], wm_hi[WMULTI];
+static volatile int wm_n;
+static pthread_t wm_thread;
+static void *wm_loop(void *a) {
+    (void)a;
+    for (;;) {
+        int n = wm_n;
+        for (int i = 0; i < n; i++) plat_protect(wm_lo[i] & ~(uint64_t)(PLAT_PAGE - 1), PLAT_PAGE, PLAT_PROT_NONE);
+        usleep(200);
+    }
+    return NULL;
+}
+void watch_multi(int n, const uint64_t *lo, const uint64_t *hi) {
+    int old = wm_n;
+    wm_n = 0;
+    for (int i = 0; i < old; i++) plat_protect(wm_lo[i] & ~(uint64_t)(PLAT_PAGE - 1), PLAT_PAGE, PLAT_PROT_RW);
+    if (n > WMULTI) n = WMULTI;
+    for (int i = 0; i < n; i++) wm_lo[i] = lo[i], wm_hi[i] = hi[i];
+    wm_n = n;
+    static bool started;
+    if (n && !started) { started = true; pthread_create(&wm_thread, NULL, wm_loop, NULL); }
+    fprintf(stderr, "[watch] multi: %d ranges\n", n);
+}
+static bool wm_fault(uint64_t fa, uint64_t pc) {
+    uint64_t page = fa & ~(uint64_t)(PLAT_PAGE - 1);
+    bool ours = false;
+    for (int i = 0; i < WMULTI; i++) {  // (all slots: a page closed just before a stop still reopens)
+        if ((wm_lo[i] & ~(uint64_t)(PLAT_PAGE - 1)) != page || !wm_lo[i]) continue;
+        ours = true;
+        if (i >= wm_n || fa < wm_lo[i] || fa >= wm_hi[i]) continue;
+        static char seen[256][40];
+        static int nseen;
+        const char *nm = host_sym(pc, NULL);
+        if (!nm) nm = "?";
+        char key[40];
+        snprintf(key, sizeof key, "%.30s/%d", nm, i);
+        bool found = false;
+        for (int j = 0; j < nseen; j++) found |= !strcmp(seen[j], key);
+        if (found || nseen >= 256) continue;
+        snprintf(seen[nseen++], 40, "%s", key);
+        extern uint64_t renderer_present_count(void);
+        fprintf(stderr, "[wm] f%llu range %d (%llx) +%#llx by %s", (unsigned long long)renderer_present_count(), i,
+                (unsigned long long)wm_lo[i], (unsigned long long)(fa - wm_lo[i]), nm);
+        Cpu *c = kernel_current_cpu();
+        if (c) {
+            fprintf(stderr, " | x0 %llx x1 %llx | chain:", (unsigned long long)c->x[0], (unsigned long long)c->x[1]);
+            uint64_t lr = c->x[30], fp = c->x[29];
+            for (int k = 0; k < 8 && lr; k++) {
+                fprintf(stderr, " %llx", (unsigned long long)lr);
+                if (!fp || fp < 0x7000000000ull || fp >= 0x7800000000ull || (fp & 7)) break;
+                lr = ((const uint64_t *)(uintptr_t)fp)[1];
+                fp = ((const uint64_t *)(uintptr_t)fp)[0];
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+    if (ours) plat_protect(page, PLAT_PAGE, PLAT_PROT_RW);
+    return ours;
+}
+
 bool rt_fault_watch(uint64_t fa, uint64_t pc) {
+    if (wm_fault(fa, pc)) return true;
+    if (watch_prev && fa >= watch_prev && fa < watch_prev + PLAT_PAGE && (fa & ~(uint64_t)(PLAT_PAGE - 1)) != watch_page) {
+        plat_protect(watch_prev, PLAT_PAGE, PLAT_PROT_RW);
+        return true;
+    }
     if (!watch_page || fa < watch_page || fa >= watch_page + PLAT_PAGE) return false;
     if (fa >= g_watch_lo && fa < g_watch_hi) {
         static char seen[64][48];
@@ -306,7 +384,8 @@ bool rt_fault_watch(uint64_t fa, uint64_t pc) {
         const char *nm = host_sym(pc, NULL);
         if (!nm) nm = "?";
         char key[48];  // (each function + offset once)
-        snprintf(key, sizeof key, "%.36s+%llx", nm, (unsigned long long)(fa - g_watch_lo));
+        snprintf(key, sizeof key, "%.28s+%llx/%llx", nm, (unsigned long long)(fa - g_watch_lo),
+                 (unsigned long long)(g_watch_lo & 0xffffff));  // (per watched range: re-arms)
         bool found = false;
         for (int i = 0; i < nseen; i++) found |= !strcmp(seen[i], key);
         static int all = -1, nall;

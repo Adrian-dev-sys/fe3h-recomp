@@ -11,18 +11,30 @@
 #define BACKDROP_HASHES 0x71fe31bbf03c3515ull
 
 static float g_wide = 1.0f;  // output aspect divided by 16:9 (1 = normal)
+static int g_lit_keep;       // (RE: widescreen_lit_toggle)
 
 // FE3H: every camera reads its aspect from one 16:9 literal (main+0xcb801c, 19 loads); it becomes the window's aspect
 // (as Fl4sh9174's 21:9 emulator mod writes 21:9 there)
 #define FE3H_ASPECT_LITERAL (MAIN_BASE + 0xcb801cull)
 static void find_proj_tick(void);
+static void icon_scan_tick(void);
+static void vp_watch_tick(uint64_t f);
 void widescreen_set_factor(float f) {
     g_wide = f;
     find_proj_tick();
+    icon_scan_tick();
+    extern uint64_t renderer_present_count(void);
+    vp_watch_tick(renderer_present_count());
     static bool rw;
     if (!rw) { extern int plat_protect(uint64_t, uint64_t, int); plat_protect(FE3H_ASPECT_LITERAL & ~0x3FFFull, 0x4000, 3); rw = true; }
-    float a = 16.0f / 9.0f * (f > 1.0f ? f : 1.0f);
+    float a = 16.0f / 9.0f * (f > 1.0f && !g_lit_keep ? f : 1.0f);
     memcpy((void *)(uintptr_t)FE3H_ASPECT_LITERAL, &a, 4);
+}
+// (RE) LARECOMP_LIT_TOGGLE=1: F10 keeps the literal 16:9 (the patched camera reads still widen) or not
+int widescreen_lit_toggle(void) {
+    g_lit_keep = !g_lit_keep;
+    LOG("[aspect] literal kept 16:9: %d\n", g_lit_keep);
+    return g_lit_keep;
 }
 
 // (RE) LARECOMP_FIND_PROJ=<frame>: find the main camera's projection in writable memory (its x / y scales, logged
@@ -95,11 +107,268 @@ static void find_proj_tick(void) {
     LOG("[findproj] %d projection hits, %d 16:9 floats\n", np, na);
 }
 
+// (RE) LARECOMP_FIND_ICONS=1 with the F9 capture: the capture's small 2D quads (map unit icons among them) are looked
+// for in writable memory as float pairs (corner / centre, screen or centre-relative y-up); the best hit is watched
+#define ICON_MAX 128
+static float icon_q[ICON_MAX][4];
+static int icon_n, icon_nc, icon_phase, icon_watch_i;
+static uint64_t icon_frame;
+static uint64_t icon_vb[16][2];  // (the quads' vertex buffers: not searched)
+static int icon_nvb;
+void icon_scan_add(float x0, float y0, float x1, float y1, uint64_t vb, uint64_t vbsize) {
+    if (!ENV("LARECOMP_FIND_ICONS") || x1 - x0 > 400) return;
+    if (icon_phase == 3) icon_phase = 0, icon_nc = 0, icon_nvb = 0;  // (another F9: a new search)
+    if (icon_phase || icon_n >= ICON_MAX) return;
+    extern uint64_t renderer_present_count(void);
+    float *q = icon_q[icon_n++];
+    q[0] = x0, q[1] = y0, q[2] = x1, q[3] = y1;
+    icon_frame = renderer_present_count();
+    bool known = false;
+    for (int i = 0; i < icon_nvb; i++) known |= icon_vb[i][0] == vb;
+    if (!known && icon_nvb < 16) icon_vb[icon_nvb][0] = vb, icon_vb[icon_nvb++][1] = vbsize;
+}
+static bool icon_val(float v) { return isnormal(v) && fabsf(v) >= 1.0f && fabsf(v) < 5000.0f; }
+// convention matched (-1: none): form * 9 + x anchor * 3 + y anchor; forms screen, centred y-up, centred y-down;
+// anchors left / centre / right, top / centre / bottom
+static int icon_match(const float *q, float a, float b) {
+    float ax[3] = {q[0], (q[0] + q[2]) / 2, q[2]}, ay[3] = {q[1], (q[1] + q[3]) / 2, q[3]};
+    for (int fm = 0; fm < 3; fm++)
+        for (int xi = 0; xi < 3; xi++) {
+            float x = fm ? ax[xi] - 960 : ax[xi];
+            if (fabsf(a - x) >= 0.6f) continue;
+            for (int yi = 0; yi < 3; yi++) {
+                float y = fm == 0 ? ay[yi] : fm == 1 ? 540 - ay[yi] : ay[yi] - 540;
+                if (fabsf(b - y) < 0.6f) return fm * 9 + xi * 3 + yi;
+            }
+        }
+    return -1;
+}
+#define ICON_CAND 256
+static struct { uint64_t a; int q, conv; } icon_c[ICON_CAND];
+static void icon_scan_tick(void) {
+    extern uint64_t renderer_present_count(void);
+    uint64_t f = renderer_present_count();
+    static long at = -2;  // (test) LARECOMP_FIND_ICONS_AT=<frame>: start without F9
+    if (at == -2) at = ENV("LARECOMP_FIND_ICONS_AT") ? atol(getenv("LARECOMP_FIND_ICONS_AT")) : -1;
+    if (at >= 0 && (long)f == at) icon_n = 1, icon_frame = f - 6, icon_phase = 0;
+    static long dat = -2;  // (test) LARECOMP_DIFF_AT=<frame>: F10 at that frame
+    if (dat == -2) dat = ENV("LARECOMP_DIFF_AT") ? atol(getenv("LARECOMP_DIFF_AT")) : -1;
+    if (dat >= 0 && (long)f == dat) { void widescreen_diff_key(void); widescreen_diff_key(); }
+    if (!icon_n || f < icon_frame + 6) return;  // (after the capture's frames)
+    if (icon_phase == 0 && ENV("LARECOMP_FIND_ICONS")[0] == 'p') {  // =proj: the map camera's matrices; readers watched
+        extern int kernel_data_regions(uint64_t *addr, uint64_t *size, int max);
+        uint64_t ra[64], rs[64];
+        int nr = kernel_data_regions(ra, rs, 64);
+        float lx = g_proj_lx, ly = g_proj_ly;
+        LOG("[icons] projection x %.5f y %.5f\n", lx, ly);
+        for (int i = 0; i < nr && lx > 0; i++) {
+            if (ra[i] < HEAP_BASE) continue;
+            const float *p = (const float *)(uintptr_t)ra[i];
+            uint64_t nw = rs[i] / 4;
+            for (uint64_t k = 0; k + 8 < nw && icon_nc < ICON_CAND; k++) {
+                if (fabsf(p[k] - lx) > 2e-4f * lx || p[k + 1] != 0 || p[k + 2] != 0) continue;  // (a projection: zeros after x)
+                bool y = false;
+                for (int d = 1; d <= 6; d++) y |= fabsf(p[k + d] - ly) < 2e-3f * ly;
+                if (!y) continue;
+                LOG("[icons] cand %d: matrix at %llx:", icon_nc, (unsigned long long)(ra[i] + k * 4));
+                for (int d = 0; d < 16 && k + d < nw; d++) LOG(" %g", p[k + d]);
+                LOG("\n");
+                icon_c[icon_nc].a = ra[i] + k * 4, icon_c[icon_nc].q = 0, icon_c[icon_nc].conv = -1;
+                icon_nc++;
+            }
+        }
+        icon_phase = 2, icon_watch_i = 0, icon_frame = f;
+        LOG("[icons] %d matrices; watching each for 20 frames\n", icon_nc);
+    }
+    if (icon_phase == 0) {  // scan: map-area, icon-sized quads only; real-valued pairs
+        extern int kernel_data_regions(uint64_t *addr, uint64_t *size, int max);
+        uint64_t ra[64], rs[64];
+        int nr = kernel_data_regions(ra, rs, 64);
+        for (int i = 0; i < nr && icon_nc < ICON_CAND; i++) {
+            if (ra[i] < HEAP_BASE) continue;
+            const float *p = (const float *)(uintptr_t)ra[i];
+            uint64_t nw = rs[i] / 4;
+            for (uint64_t k = 0; k + 4 < nw && icon_nc < ICON_CAND; k++) {
+                if (!icon_val(p[k]) || !icon_val(p[k + 1]) || isnan(p[k + 3])) continue;  // (NaN: the UI vertex layout)
+                uint64_t ad = ra[i] + k * 4;
+                bool in_vb = false;
+                for (int v = 0; v < icon_nvb; v++) in_vb |= ad >= icon_vb[v][0] && ad < icon_vb[v][0] + icon_vb[v][1];
+                if (in_vb) continue;
+                for (int j = 0; j < icon_n; j++) {
+                    const float *q = icon_q[j];
+                    float cx = (q[0] + q[2]) / 2, cy = (q[1] + q[3]) / 2, w = q[2] - q[0];
+                    if (!(cx > 450 && cx < 1500 && cy > 120 && cy < 820 && w > 15 && w < 220)) continue;
+                    int m = icon_match(q, p[k], p[k + 1]);
+                    if (m < 0) continue;
+                    icon_c[icon_nc].a = ra[i] + k * 4, icon_c[icon_nc].q = j, icon_c[icon_nc].conv = m;
+                    icon_nc++;
+                    break;
+                }
+            }
+        }
+        LOG("[icons] %d candidates from %d quads\n", icon_nc, icon_n);
+        icon_phase = 1;
+        icon_frame = f;
+        return;
+    }
+    if (icon_phase == 1) {  // still there a few frames later (camera still): log them, keep one per 0x40 block
+        int n = 0;
+        for (int i = 0; i < icon_nc; i++) {
+            const float *p = (const float *)(uintptr_t)icon_c[i].a;
+            if (icon_match(icon_q[icon_c[i].q], p[0], p[1]) != icon_c[i].conv) continue;
+            bool dup = false;
+            for (int j = 0; j < n; j++) dup |= (icon_c[j].a >> 6) == (icon_c[i].a >> 6);
+            if (dup) continue;
+            const float *q = icon_q[icon_c[i].q];
+            LOG("[icons] cand %d: quad (%.0f,%.0f)-(%.0f,%.0f) conv %d at %llx:", n, q[0], q[1], q[2], q[3], icon_c[i].conv,
+                (unsigned long long)icon_c[i].a);
+            for (int d = -8; d < 12; d++) LOG(" %g", p[d]);
+            LOG("\n");
+            icon_c[n++] = icon_c[i];
+        }
+        icon_nc = n;
+        icon_phase = 2;
+        icon_watch_i = 0;
+        icon_frame = f;
+        LOG("[icons] %d stable candidates; watching each for 20 frames\n", n);
+    }
+    if (icon_phase == 2 && f >= icon_frame) {  // each stable candidate watched in turn: its writers' call chains
+        if (icon_watch_i >= icon_nc || icon_watch_i >= 48) { LOG("[icons] done\n"); icon_phase = 3; icon_n = 0; return; }
+        extern uint64_t g_watch_lo, g_watch_hi;
+        extern void watch_arm(void);
+        g_watch_lo = icon_c[icon_watch_i].a, g_watch_hi = g_watch_lo + (icon_c[icon_watch_i].conv < 0 ? 64 : 8);
+        LOG("[icons] watch cand %d at %llx\n", icon_watch_i, (unsigned long long)g_watch_lo);
+        watch_arm();
+        icon_watch_i++;
+        icon_frame = f + 60 - 6;  // (60 frames each: the tick waits icon_frame + 6)
+    }
+}
+
+// (RE) LARECOMP_DIFF_ICONS=1: F10 in the wide view snapshots the heap; switch to 16:9 (F1 menu, camera still), F10
+// again compares: floats whose x (centred, or screen-relative to 960) grew by the wide factor with y unchanged are
+// screen positions placed by the widened camera (the map icons). Each is then watched for its writer.
+#define DIFF_MAX 128
+static struct { uint64_t a, n; float *s; } diff_r[DIFF_MAX];
+static int diff_nr;
+static float diff_g;
+static void diff_free(void) {
+    for (int i = 0; i < diff_nr; i++) free(diff_r[i].s);
+    diff_nr = 0;
+}
+float g_proj_vp[16];  // (the main camera's last view-projection: exec.c LARECOMP_LOG_PROJ)
+static uint64_t g_vp_watch_stop;
+static void vp_watch_tick(uint64_t f) {
+    if (!g_vp_watch_stop || f < g_vp_watch_stop) return;
+    g_vp_watch_stop = 0;
+    extern void watch_multi(int n, const uint64_t *lo, const uint64_t *hi);
+    watch_multi(0, NULL, NULL);
+    LOG("[vp] done\n");
+}
+void widescreen_diff_key(void) {
+    extern int kernel_data_regions(uint64_t *addr, uint64_t *size, int max);
+    uint64_t ra[64], rs[64];
+    int nr = kernel_data_regions(ra, rs, 64);
+    if (ENV("LARECOMP_DIFF_ICONS")[0] == 'v') {  // =vp: copies of the main view-projection; each watched for readers
+        float vp[16];
+        memcpy(vp, g_proj_vp, 64);
+        icon_nc = 0;
+        for (int i = 0; i < nr; i++) {
+            if (ra[i] < HEAP_BASE || vp[0] == 0) continue;
+            const float *p = (const float *)(uintptr_t)ra[i];
+            uint64_t nw = rs[i] / 4;
+            for (uint64_t k = 0; k + 16 < nw && icon_nc < ICON_CAND; k++) {
+                if (p[k] != vp[0] || p[k + 1] != vp[1] || p[k + 5] != vp[5] || p[k + 6] != vp[6] || p[k + 10] != vp[10]) continue;
+                uint64_t ad = ra[i] + k * 4;
+                if ((ad & 0xff) == 0 || (ad & 0xff) == 0x10 || (ad & 0xff) == 0x20) continue;  // (GPU constant-buffer copies)
+                LOG("[vp] cand %d at %llx\n", icon_nc, (unsigned long long)ad);
+                icon_c[icon_nc].a = ad, icon_c[icon_nc].q = 0, icon_c[icon_nc++].conv = -1;
+            }
+        }
+        LOG("[vp] %d copies of %g %g %g %g; all watched for 900 frames (pan the camera)\n", icon_nc, vp[0], vp[1], vp[5], vp[6]);
+        uint64_t lo[96], hi[96];
+        int n = icon_nc < 96 ? icon_nc : 96;
+        for (int j = 0; j < n; j++) lo[j] = icon_c[j].a, hi[j] = icon_c[j].a + 64;
+        extern void watch_multi(int n, const uint64_t *lo, const uint64_t *hi);
+        extern uint64_t renderer_present_count(void);
+        watch_multi(n, lo, hi);
+        g_vp_watch_stop = renderer_present_count() + 900;
+        return;
+    }
+    if (!diff_nr) {  // snapshot
+        uint64_t tot = 0;
+        int fails = 0;
+        for (int i = 0; i < nr; i++) {  // (64 MB pieces: one huge allocation can fail)
+            if (ra[i] < HEAP_BASE) continue;
+            for (uint64_t o = 0; o < rs[i] && diff_nr < DIFF_MAX && tot < (6ull << 30); o += 64ull << 20) {
+                uint64_t n = rs[i] - o < (64ull << 20) ? rs[i] - o : 64ull << 20;
+                float *s = malloc(n);
+                if (!s) { fails++; continue; }
+                memcpy(s, (const void *)(uintptr_t)(ra[i] + o), n);
+                diff_r[diff_nr].a = ra[i] + o, diff_r[diff_nr].n = n / 4, diff_r[diff_nr++].s = s;
+                tot += n;
+            }
+        }
+        if (fails) LOG("[diff] %d pieces not allocated\n", fails);
+        diff_g = g_wide;
+        LOG("[diff] snapshot: %d regions, %llu MB, wide factor %.4f\n", diff_nr, (unsigned long long)(tot >> 20), diff_g);
+        return;
+    }
+    float r = diff_g / fmaxf(g_wide, 1.0f);  // (expected growth of x)
+    LOG("[diff] compare: wide factor %.4f -> %.4f, x growth %.4f\n", diff_g, g_wide, r);
+    int nm = 0;
+    icon_nc = 0;
+    for (int i = 0; i < diff_nr; i++) {
+        const float *s = diff_r[i].s, *p = (const float *)(uintptr_t)diff_r[i].a;
+        for (uint64_t k = 0; k + 1 < diff_r[i].n; k++) {
+            float a = s[k], b = p[k], ya = s[k + 1], yb = p[k + 1];
+            if (a == b || !isnormal(a) || !isnormal(b) || !isnormal(ya) || fabsf(ya) < 1 || fabsf(ya - yb) > 0.03f * fabsf(ya) + 0.05f) continue;
+            int conv = -1;
+            if (fabsf(a) >= 20 && fabsf(a) < 4000 && fabsf(b / a - r) < 0.01f * r) conv = 0;            // centred
+            else if (fabsf(a - 960) >= 20 && fabsf(a) < 4000 && fabsf((b - 960) / (a - 960) - r) < 0.01f * r) conv = 1;  // screen
+            if (conv < 0) continue;
+            uint64_t ad = diff_r[i].a + k * 4;
+            if (nm++ < 200) {
+                LOG("[diff] %llx conv %d: x %.2f -> %.2f y %.2f |", (unsigned long long)ad, conv, a, b, yb);
+                for (int d = -4; d < 8; d++) if ((int64_t)k + d >= 0 && k + d < diff_r[i].n) LOG(" %g", p[k + d]);
+                LOG("\n");
+            }
+            bool vtx = (k >= 1 && isnan(p[k - 1])) || (k + 3 < diff_r[i].n && isnan(p[k + 3]));  // (UI vertex buffers)
+            bool dup = vtx;
+            for (int j = 0; j < icon_nc; j++) dup |= (icon_c[j].a >> 8) == (ad >> 8);
+            if (!dup && icon_nc < ICON_CAND) icon_c[icon_nc].a = ad, icon_c[icon_nc].q = 0, icon_c[icon_nc++].conv = conv;
+        }
+    }
+    LOG("[diff] %d matches, %d blocks; all watched for 600 frames (pan the camera)\n", nm, icon_nc);
+    for (int j = 0; j < icon_nc; j++) LOG("[diff] watch list %d: %llx\n", j, (unsigned long long)icon_c[j].a);
+    diff_free();
+    uint64_t lo[96], hi[96];
+    int n = icon_nc < 96 ? icon_nc : 96;
+    for (int j = 0; j < n; j++) lo[j] = icon_c[j].a, hi[j] = icon_c[j].a + 8;
+    extern void watch_multi(int n, const uint64_t *lo, const uint64_t *hi);
+    extern uint64_t renderer_present_count(void);
+    watch_multi(n, lo, hi);
+    g_vp_watch_stop = renderer_present_count() + 600;
+}
+
 // A camera's aspect as its projection / frustum code reads it (tools/patches.py FE3H_CAM_ASPECT_SITES): 16:9 cameras
 // take the window's shape; other shapes (shadow maps, square portrait renders) stay
 float rt_cam_aspect(float a) {
     if (g_wide > 1.005f && fabsf(a - 16.0f / 9.0f) < 0.01f) return a * g_wide;
     return a;
+}
+
+// Per site (tools/patches.py FE3H_ASPECT_SITES). (RE) LARECOMP_ASPECT_BISECT=1: F10 un-widens one site at a time
+// (shown in the window title) - which camera places the map's unit icons?
+#define FE3H_ASPECT_NSITES 21
+static int g_aspect_skip = -1;
+float rt_cam_aspect_site(float a, int id) {
+    if (id == g_aspect_skip) return fabsf(a - 16.0f / 9.0f * g_wide) < 0.01f ? 16.0f / 9.0f : a;
+    return rt_cam_aspect(a);
+}
+int widescreen_aspect_site_next(void) {
+    g_aspect_skip = g_aspect_skip + 1 >= FE3H_ASPECT_NSITES ? -1 : g_aspect_skip + 1;
+    LOG("[aspect] un-widened site %d\n", g_aspect_skip);
+    return g_aspect_skip;
 }
 
 // The two calls to main+0xa32db0 the same mod removes for wide views (tools/patches.py FE3H_WIDE_SKIP_SITES)

@@ -2138,6 +2138,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         sp(&s, "uint gfind(uint g) { uint n = gmap[%d].x; for (uint i = 0u; i < n; i++) { uint o = g - gmap[i].x; "
                "if (g >= gmap[i].x && o < gmap[i].y) return gmap[i].z + (o >> 2); } return 0xFFFFFFFFu; }\n", GMAP_MAX);
     }
+    if (stage == STAGE_VERTEX && key && key->rt_kind[0] == 1)  // ultrawide UI box: [0].z = 1: per-quad centres in [1 + q].x
+        sp(&s, "layout(std140, set = %d, binding = 18) uniform RScale { vec4 rscale[65]; };\n", set);
     if (c->uses_rscale && stage != STAGE_VERTEX) {
         sp(&s, "layout(std140, set = %d, binding = 18) uniform RScale { vec4 rscale[%d]; };\n", set,
            key && key->flip_x ? 66 : 65);  // ([65]: mirror mode's render target width)
@@ -2235,6 +2237,13 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     }
     free(body.buf);
     if (stage == STAGE_VERTEX) {
+        if (key && key->rt_kind[0] == 1)  // ultrawide: 2D (w == 1) vertices go in the 16:9 box; 3D and screen edges (fills) stay.
+            // World-anchored icons (rscale[0].z = 1): each quad shrinks around its own centre (6 vertices a quad from [0].w)
+            sp(&s, "  if (abs(gl_Position.w - 1.0f) < 1e-5f && abs(abs(gl_Position.x) - 1.0f) > 1e-4f) {\n"
+                   "    float bc_ = 0.0f; int bq_ = (gl_VertexIndex - int(rscale[0].w)) / 6;\n"
+                   "    if (rscale[0].z > 0.5f && bq_ >= 0 && bq_ < 64) bc_ = rscale[1 + bq_].x;\n"
+                   "    gl_Position.x = bc_ + (gl_Position.x - bc_) * %.6ff;\n  }\n",
+               (key->rt_kind[1] | key->rt_kind[2] << 8) / 65535.0);
         if (key && key->flip_y) sp(&s, "  gl_Position.y = -gl_Position.y;\n");
         if (key && key->flip_x) sp(&s, "  gl_Position.x = -gl_Position.x;\n");
         if (key && key->depth_minus_one) sp(&s, "  gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5f;\n");
