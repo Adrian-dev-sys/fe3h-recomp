@@ -2089,7 +2089,8 @@ static const char glsl_prelude[] =
     " if (e == 31u) return uintBitsToFloat(s | 0x7F800000u | (m << 13));"
     " return uintBitsToFloat(s | ((e + 112u) << 23) | (m << 13)); }\n"
     "vec2 unpack_h2(uint v) { return vec2(h2f(v & 0xFFFFu), h2f(v >> 16)); }\n"
-    "vec2 hx(uint v, uint swz) { if (swz == 1u) return vec2(uintBitsToFloat(v)); vec2 h = unpack_h2(v); return swz == 2u ? h.xx : (swz == 3u ? h.yy : h); }\n"
+    // F32 operands of half ops: finite values saturate to the half range (FE3H's shadow mask: inf - floor(inf) = NaN wedges)
+    "vec2 hx(uint v, uint swz) { if (swz == 1u) { float f = uintBitsToFloat(v); return vec2(isinf(f) || isnan(f) ? f : clamp(f, -65504.0f, 65504.0f)); } vec2 h = unpack_h2(v); return swz == 2u ? h.xx : (swz == 3u ? h.yy : h); }\n"
     "uint hpack(vec2 r, uint merge, uint old) { if (merge == 1u) return floatBitsToUint(r.x); uint lo = packHalf2x16(vec2(r.x, 0.0f)), hi = packHalf2x16(vec2(r.y, 0.0f)); if (merge == 2u) return (old & 0xFFFF0000u) | lo; if (merge == 3u) return (old & 0xFFFFu) | (hi << 16); return lo | (hi << 16); }\n"
     "uint prmt(uint a, uint b, uint sel) { uint r = 0u; for (uint i = 0u; i < 4u; i++) { uint s = (sel >> (i * 4u)) & 7u; uint bt = s < 4u ? (a >> (s * 8u)) & 0xFFu : (b >> ((s - 4u) * 8u)) & 0xFFu; r |= bt << (i * 8u); } return r; }\n";
 

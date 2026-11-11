@@ -4546,14 +4546,14 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         if (st.ubuf[0][0].addr) {  // vertex cbuf c3: the first 16 floats (transform)
             const float *u = (const float *)(uintptr_t)st.ubuf[0][0].addr;
             LOG("[draw]   vcb0:");
-            for (int k = 0; k < 16; k++) LOG(" %.6g", u[k]);
+            for (int k = 0; k < 64 && k * 4 < (int)st.ubuf[0][0].size; k++) LOG(" %.6g", u[k]);
             LOG("\n");
         }
-        for (int c = 0; c < 18; c++) {
-            if (!((pr->fi->cbuf_mask >> c) & 1) || !st.ubuf[1][c].addr) continue;
-            const float *u = (const float *)(uintptr_t)st.ubuf[1][c].addr;
-            LOG("[draw]   fcb%d %llx size %u:", c, (unsigned long long)st.ubuf[1][c].addr, (unsigned)st.ubuf[1][c].size);
-            for (int k = 0; k < 96 && k * 4 < (int)st.ubuf[1][c].size; k++) LOG(" %.6g", u[k]);
+        for (int c = 3; c < 21; c++) {  // (cbuf_mask bits are cbuf indices; ubuf[] starts at c3)
+            if (!((pr->fi->cbuf_mask >> c) & 1) || !st.ubuf[1][c - 3].addr) continue;
+            const float *u = (const float *)(uintptr_t)st.ubuf[1][c - 3].addr;
+            LOG("[draw]   fcb%d %llx size %u:", c, (unsigned long long)st.ubuf[1][c - 3].addr, (unsigned)st.ubuf[1][c - 3].size);
+            for (int k = 0; k < 128 && k * 4 < (int)st.ubuf[1][c - 3].size; k++) LOG(" %.6g", u[k]);
             LOG("\n");
         }
     }
@@ -4563,6 +4563,14 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         if (!t) { LOG("[draw]   tex%d: none\n", i); continue; }
         LOG("[draw]   tex%d: %p %ux%u f%#x lv %u -> %ux%u scale %.4f %.4f%s\n", i, (void *)t, t->width, t->height, t->format,
             b ? b->levels : 0, b ? b->width : 0, b ? b->height : 0, b ? b->sx : 0, b ? b->sy : 0, b && b->scalable ? " scalable" : "");
+        int slot = ((int)pr->fi->tex[i].handle_offset - 0x20) / 8;  // its sampler: wrap / filter / compare / border
+        uint64_t h = slot >= 0 && slot < 32 ? st.tex[1][slot] : 0;
+        uint32_t tsc = (uint32_t)(h >> 20) & 0xFFF;
+        if (h && st.spool && tsc < (uint32_t)st.spool->count) {
+            const NvnSamplerDesc *d = &((const NvnSamplerDesc *)st.spool->entries)[tsc];
+            LOG("[draw]     sampler wrap %u %u %u filt %u/%u cmp %u/%u border %g %g %g %g\n", d->wrap[0], d->wrap[1], d->wrap[2],
+                d->min_filter, d->mag_filter, d->compare_mode, d->compare_func, d->border[0], d->border[1], d->border[2], d->border[3]);
+        }
     }
     // LARECOMP_DUMP_TEX=<fs hash>[,...] and/or min:<n> (any fragment shader sampling at least n textures): with F9, save
     // the textures the draw samples as build/tex_<hash>_<i>.png (depth as _d / _s; level 0, first layer, clamped to 0..1)
