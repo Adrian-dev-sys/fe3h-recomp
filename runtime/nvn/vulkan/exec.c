@@ -742,6 +742,36 @@ static void run_heavy_job(void (*fn)(void *), void *arg) {
     pthread_mutex_unlock(&jobs_lock);
 }
 
+// Huge compute shaders (over 4000 instructions, battle effects): a thread of their own each, so a compile of minutes
+// holds nothing else up. NVIDIA's driver takes ~160 s for the largest the first time, then has it in its own cache;
+// AMD's never finished, so elsewhere they're skipped (LARECOMP_VK_BIG_CS=1 / 0 to choose).
+static bool big_cs_ok(void) {
+    static int ok = -1;
+    if (ok < 0) {
+        const char *e = getenv("LARECOMP_VK_BIG_CS");
+        ok = e ? atoi(e) != 0 : g_vk.props.vendorID == 0x10DE;
+    }
+    return ok;
+}
+typedef struct { void (*fn)(void *); void *arg; } HugeJob;
+static void *huge_thread(void *a) {
+    HugeJob j = *(HugeJob *)a;
+    free(a);
+    j.fn(j.arg);
+    return NULL;
+}
+static void run_huge_job(void (*fn)(void *), void *arg) {
+    if (sync_shaders()) { fn(arg); return; }
+    HugeJob *j = malloc(sizeof *j);
+    j->fn = fn, j->arg = arg;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_t t;
+    if (pthread_create(&t, &at, huge_thread, j)) { free(j); run_heavy_job(fn, arg); }
+    pthread_attr_destroy(&at);
+}
+
 // Builds slower than a quarter second are logged (what, how long, where the time went)
 static void slow_build_log(const char *what, uint64_t code, uint32_t insts, uint64_t t0, uint64_t t_spirv) {
     uint64_t t1 = SDL_GetTicksNS();
@@ -1495,6 +1525,14 @@ static void xlat_store(uint64_t h, const ShaderInfo *si) {
     if (fclose(f) || !ok) { remove(tmp); return; }
     remove(path);
     if (rename(tmp, path)) remove(tmp);
+}
+
+// The disk cache's key for a translation, without translating (0: not cached)
+static uint64_t xlat_key(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_VK_NO_XLAT_CACHE") != NULL;
+    size_t n = off || maxwell_dbg_code ? 0 : maxwell_input_size(blob, max_size, stage);
+    return n ? xlat_hash(blob, n, stage, key) : 0;
 }
 
 // maxwell_translate through the disk cache (translate_lock taken here, around the translation only)
@@ -3112,7 +3150,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
 }
 
 // ================================================================== compute
-typedef struct { Prog p; ShaderInfo *si; VkPipeline pipe; uint32_t local[3]; } CsProg;
+typedef struct { Prog p; ShaderInfo *si; VkPipeline pipe; uint32_t local[3]; const uint8_t *blob; size_t cmax; ShaderKey key; } CsProg;
 
 static void warm_cs_record(const CsProg *cp);
 static void build_compute(void *arg) {
@@ -3203,7 +3241,8 @@ static void warm_cs_build(void *arg) {
 }
 
 static void warm_cs_queue(WarmCs *w, bool low) {
-    if (w->r.ninsts > 2000) run_heavy_job(warm_cs_build, w);
+    if (w->r.ninsts > 4000 && big_cs_ok()) run_huge_job(warm_cs_build, w);
+    else if (w->r.ninsts > 2000) run_heavy_job(warm_cs_build, w);
     else run_job_at(warm_cs_build, w, low);
 }
 
@@ -3262,6 +3301,38 @@ static CsProg *warm_cs_find(uint64_t xh, const uint32_t local[3]) {
     return w->cp;
 }
 
+// A new compute program's translation (worker), then its build: very large ones (battle shaders of ~9,000 instructions
+// with subroutine calls, as a branch state machine) on threads of their own where the driver finishes them (big_cs_ok),
+// else skipped; large ones on the large-shader thread, the rest right here.
+static void translate_compute(void *arg) {
+    CsProg *cp = arg;
+    maxwell_gmem_base = HEAP_BASE;
+    maxwell_gmem_size = HEAP_MAX;
+    uint64_t xh = 0;
+    cp->si = translate_cached(cp->blob, cp->cmax, STAGE_COMPUTE, &cp->key, &xh);
+    cp->p.vi = cp->si;
+    if (!cp->si->msl) {
+        LOG("[compute] translate failed: %s (code %llx)\n", cp->si->error, (unsigned long long)cp->p.code[0]);
+        set_state(&cp->p.state, 2);
+        return;
+    }
+    save_glsl(cp->si->msl, cp->p.code[0], "cs");
+    uint32_t ni = cp->si->num_insts;
+    if (ni > 4000 && !big_cs_ok()) {
+        static _Atomic int nlog;
+        if (atomic_fetch_add(&nlog, 1) < 20)
+            LOG("[compute] %llx: %u instructions, too large to build: skipped\n", (unsigned long long)cp->p.code[0], ni);
+        set_state(&cp->p.state, 2);
+    } else if (ni > 2000) {
+        LOG("[compute] %llx: %u instructions, building on a thread for %s shaders\n", (unsigned long long)cp->p.code[0], ni,
+            ni > 4000 ? "very large" : "large");
+        if (ni > 4000) run_huge_job(build_compute, cp);
+        else run_heavy_job(build_compute, cp);
+    } else {
+        build_compute(cp);
+    }
+}
+
 static struct CsEnt { uint64_t addr; uint32_t bufmask; CsProg *cp; } g_cs_tab[256];  // compute programs by code address
 
 // bufmask: texture slots bound to buffer textures (a variant reading them from the heap, see buffer_texture_mask)
@@ -3275,18 +3346,12 @@ static CsProg *compute_program(NvnProgram *np, uint32_t bufmask) {
     if (n < 256) { tab[n].addr = ss->code_addr; tab[n].bufmask = bufmask; tab[n].cp = cp; g_cs_n = n + 1; }
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
-    ShaderKey k = {0};
-    k.glsl = 1;
-    key_set_buf_mask(&k, bufmask);
-    cp->si = translate_cached((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000,
-                              STAGE_COMPUTE, &k, &cp->p.xh[0]);
-    cp->p.vi = cp->si;
+    cp->key.glsl = 1;
+    key_set_buf_mask(&cp->key, bufmask);
+    cp->blob = (const uint8_t *)(uintptr_t)ss->code_addr;
+    cp->cmax = ss->const_offset ? ss->const_offset : 0x10000;
     cp->p.code[0] = ss->code_addr;
-    if (!cp->si->msl) {
-        LOG("[compute] translate failed: %s (code %llx)\n", cp->si->error, (unsigned long long)ss->code_addr);
-        set_state(&cp->p.state, 2);
-        return cp;
-    }
+    cp->p.xh[0] = xlat_key(cp->blob, cp->cmax, STAGE_COMPUTE, &cp->key);
     for (int i = 0; i < 3; i++) {
         cp->local[i] = ss->control ? *(const uint32_t *)(ss->control + 0x748 + 4 * i) : 1;
         if (!cp->local[i]) cp->local[i] = 1;
@@ -3294,31 +3359,11 @@ static CsProg *compute_program(NvnProgram *np, uint32_t bufmask) {
     CsProg *w = warm_cs_find(cp->p.xh[0], cp->local);
     if (w) {  // (prebuilt at launch, or building)
         if (n < 256) tab[n].cp = w;
-        free(cp->si->msl);
-        free(cp->si);
         free(cp);
         return w;
     }
-    save_glsl(cp->si->msl, ss->code_addr, "cs");
-    // Very large ones (battle shaders of ~9,000 instructions with subroutine calls, as a branch state machine): the
-    // driver's compile of them never finished, and held every other build behind it - no new shader was ready for
-    // the rest of the session (the combat art cut-ins among them). Those aren't built (skipped as before they
-    // translated); LARECOMP_VK_BIG_CS=1 builds them anyway. Large ones on their own thread, the rest on the workers.
-    static int big = -1;
-    if (big < 0) big = getenv("LARECOMP_VK_BIG_CS") != NULL;
-    if (cp->si->num_insts > 4000 && !big) {
-        static int nlog;
-        if (nlog++ < 20) LOG("[compute] %llx: %u instructions, too large to build: skipped\n", (unsigned long long)ss->code_addr,
-                             cp->si->num_insts);
-        set_state(&cp->p.state, 2);
-        return cp;
-    }
-    if (cp->si->num_insts > 2000) {
-        LOG("[compute] %llx: %u instructions, building on a thread for large shaders\n", (unsigned long long)ss->code_addr,
-            cp->si->num_insts);
-        run_heavy_job(build_compute, cp);
-    }
-    else run_job(build_compute, cp);
+    // translated on a worker too (the battle's large ones took ~20 ms each on this thread: a hitch at the first attack)
+    run_job(translate_compute, cp);
     return cp;
 }
 
