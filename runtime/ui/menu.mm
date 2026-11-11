@@ -437,6 +437,8 @@ extern "C" void renderer_get_scale(float *sx, float *sy);
 extern "C" int input_pad_family(void);  // runtime/hle/input.c
 extern "C" double output_scale_dynamic_factor(void);
 
+extern "C" bool dlss_fg_available(void);  // (nvn/vulkan/dlss.cpp)
+
 static void tab_display(void) {
     float scale = ImGui::GetFontSize() / 34;
     opt_begin("##video", scale);
@@ -507,6 +509,13 @@ static void tab_display(void) {
         static const char *sh[] = {"Off", "Low", "Medium", "High"};
         opt_choice("DLAA sharpening", &g_settings.dlaa_sharpen, sh, 4, 2,
                    "Sharpens the 3D scene after DLAA, which can look a little soft. Menus and text are not touched.");
+        if (dlss_fg_available()) {
+            static const char *fg[] = {"Off", "2x", "3x", "4x"};
+            opt_choice("Frame generation", &g_settings.frame_gen, fg, 4, 0,
+                       "DLSS Frame Generation (RTX 40 / 50): draws extra frames between the game's 60, for 120 / 180 / "
+                       "240 fps on a fast enough display. The game itself still runs at 60. 3x and 4x need an RTX 50. "
+                       "Experimental: fast-moving characters and menus may smear.");
+        }
     }
     static const char *waits[] = {"Off", "Balanced", "Full"};
     opt_choice("Wait for shaders", &g_settings.shader_wait, waits, 3, SHADER_WAIT_BALANCED,

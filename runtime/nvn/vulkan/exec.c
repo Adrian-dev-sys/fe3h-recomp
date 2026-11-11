@@ -3753,9 +3753,14 @@ static void dlaa_run(NvnTexture *tex) {
     k.jitter[0] = sx * g_jit[0], k.jitter[1] = sy * g_jit[1];
     static int nev, nreset;  // (every 600 evaluations: how often the history was dropped)
     nreset += reset;
-    if (++nev % 600 == 0) LOG("[dlss] %d evaluations, %d resets in the last 600\n", nev, nreset), nreset = 0;
+    if (++nev % 600 == 0) {
+        LOG("[dlss] %d evaluations, %d resets in the last 600\n", nev, nreset), nreset = 0;
+        dlss_fg_state_log();
+    }
     vk_full_barrier(cb);
-    if (dlss_evaluate(cb, &ic, &idp, &im, &io, &k)) {
+    extern VkExtent2D vk_frame_extent(void);
+    VkExtent2D win = vk_frame_extent();
+    if (dlss_evaluate(cb, &ic, &idp, &im, &io, &k, g_settings.frame_gen & 3, win.width, win.height)) {
         vk_full_barrier(cb);
         static const float stops[4] = {-1, 1.0f, 0.5f, 0.2f};  // (RCAS: exp2(-stops); 0.2 is AMD's default, fairly strong)
         float sh = stops[g_settings.dlaa_sharpen & 3];

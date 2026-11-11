@@ -18,6 +18,10 @@
 
 VkG g_vk;
 static SDL_Window *window;
+// With DLSS frame generation the surface and swapchain go through Streamline's interposer (it made the instance and
+// surface, and presents the generated frames).
+#define SC(f) (dlss_instance_proc("vk" #f) ? (PFN_vk##f)dlss_instance_proc("vk" #f) : vk##f)
+static uint32_t qfam_count = 1;  // (queues in g_vk.qfam: Streamline's frame generation adds its own)
 static atomic_bool ui_ready;
 static VkDebugUtilsMessengerEXT messenger;
 
@@ -54,7 +58,9 @@ static void create_instance(void) {
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
                                .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
-    VkResult r = vkCreateInstance(&ci, NULL, &g_vk.inst);
+    // (with frame generation through Streamline's interposer: its surface hook needs the instance it made)
+    PFN_vkCreateInstance ci_fn = (PFN_vkCreateInstance)dlss_instance_proc("vkCreateInstance");
+    VkResult r = ci_fn ? ci_fn(&ci, NULL, &g_vk.inst) : vkCreateInstance(&ci, NULL, &g_vk.inst);
     if (r != VK_SUCCESS && validate) {
         LOG("[vk] validation layer unavailable (%d); continuing without\n", r);
         ci.enabledLayerCount = 0;
@@ -110,8 +116,11 @@ static void pick_device(void) {
     g_vk.qfam = UINT32_MAX;
     for (uint32_t i = 0; i < nq; i++) {
         VkBool32 present = VK_FALSE;
-        vkGetPhysicalDeviceSurfaceSupportKHR(g_vk.phys, i, g_vk.surface, &present);
-        if ((qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && (qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && present) { g_vk.qfam = i; break; }
+        SC(GetPhysicalDeviceSurfaceSupportKHR)(g_vk.phys, i, g_vk.surface, &present);
+        if ((qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && (qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && present) {
+            g_vk.qfam = i, qfam_count = qp[i].queueCount;
+            break;
+        }
     }
     free(qp);
     if (g_vk.qfam == UINT32_MAX) FATAL("no graphics+present queue\n");
@@ -246,14 +255,34 @@ static void create_device(void) {
     g_vk.storage_images = h->shaderStorageImageWriteWithoutFormat;
     if (!g_vk.storage_images) LOG("[vk] warning: no shaderStorageImageWriteWithoutFormat (compute image stores skipped)\n");
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
-    float prio = 1.0f;
-    VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
-                                  .queueCount = 1, .pQueuePriorities = &prio};
-    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
-                             .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
+    static const float prio[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+    uint32_t nqueue = 1 + (dlss ? dlss_extra_queues() : 0);  // (frame generation's queues follow ours)
+    if (nqueue > qfam_count || nqueue > 8) nqueue = 1;
+    VkDeviceQueueCreateInfo qi[2] = {{.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
+                                      .queueCount = nqueue, .pQueuePriorities = prio}};
+    uint32_t nqi = 1, offam = UINT32_MAX;
+    VkPhysicalDeviceOpticalFlowFeaturesNV off = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV,
+                                                 .opticalFlow = VK_TRUE};
+    if (dlss && nqueue > 1 && dlss_optical_flow_queues() && has_ext(ep, ne, VK_NV_OPTICAL_FLOW_EXTENSION_NAME)) {
+        // frame generation's optical flow queue: a family of its own
+        uint32_t nf = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(g_vk.phys, &nf, NULL);
+        VkQueueFamilyProperties fp[16];
+        if (nf > 16) nf = 16;
+        vkGetPhysicalDeviceQueueFamilyProperties(g_vk.phys, &nf, fp);
+        for (uint32_t i = 0; i < nf && offam == UINT32_MAX; i++)
+            if ((fp[i].queueFlags & VK_QUEUE_OPTICAL_FLOW_BIT_NV) && i != g_vk.qfam) offam = i;
+        if (offam != UINT32_MAX) {
+            qi[nqi++] = (VkDeviceQueueCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = offam,
+                                                  .queueCount = 1, .pQueuePriorities = prio};
+            off.pNext = f.pNext, f.pNext = &off;
+        }
+    }
+    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = nqi,
+                             .pQueueCreateInfos = qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
-    if (dlss) dlss_device_created(g_vk.inst, g_vk.phys, g_vk.dev, g_vk.qfam);
+    if (dlss) dlss_device_created(g_vk.inst, g_vk.phys, g_vk.dev, g_vk.qfam, nqueue, offam);
     {   // keep 32-bit denormals in translated shaders where the GPU can (maxwell/shader.h maxwell_glsl_denorm_preserve)
         extern bool maxwell_glsl_denorm_preserve;
         VkPhysicalDeviceVulkan12Properties p12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
@@ -327,26 +356,26 @@ static VkPresentModeKHR present_mode(void) {
     VkPresentModeKHR want = !e || !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
                           : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
     uint32_t n = 0;
-    vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, NULL);
+    SC(GetPhysicalDeviceSurfacePresentModesKHR)(g_vk.phys, g_vk.surface, &n, NULL);
     VkPresentModeKHR m[16];
     if (n > 16) n = 16;
-    vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, m);
+    SC(GetPhysicalDeviceSurfacePresentModesKHR)(g_vk.phys, g_vk.surface, &n, m);
     for (uint32_t i = 0; i < n; i++) if (m[i] == want) return want;
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
 static void create_swapchain(void) {
     VkSurfaceCapabilitiesKHR caps;
-    VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps));
+    VK_CHECK(SC(GetPhysicalDeviceSurfaceCapabilitiesKHR)(g_vk.phys, g_vk.surface, &caps));
     int w, h;
     SDL_GetWindowSizeInPixels(window, &w, &h);
     VkExtent2D ext = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent : (VkExtent2D){(uint32_t)w, (uint32_t)h};
     if (!ext.width || !ext.height) return;  // minimised
     uint32_t nf = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(g_vk.phys, g_vk.surface, &nf, NULL);
+    SC(GetPhysicalDeviceSurfaceFormatsKHR)(g_vk.phys, g_vk.surface, &nf, NULL);
     VkSurfaceFormatKHR fmts[64];
     if (nf > 64) nf = 64;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(g_vk.phys, g_vk.surface, &nf, fmts);
+    SC(GetPhysicalDeviceSurfaceFormatsKHR)(g_vk.phys, g_vk.surface, &nf, fmts);
     // scanout shows the bytes the game wrote (see the raw views in the present pass): a UNORM swapchain like Metal's
     VkSurfaceFormatKHR sf = fmts[0];
     for (uint32_t i = 0; i < nf; i++)
@@ -362,13 +391,18 @@ static void create_swapchain(void) {
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = present_mode(), .clipped = VK_TRUE,
         .oldSwapchain = old};
-    VK_CHECK(vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain));
+    VK_CHECK(SC(CreateSwapchainKHR)(g_vk.dev, &ci, NULL, &g_vk.swapchain));
     for (uint32_t i = 0; i < g_vk.sc_count; i++) vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
-    if (old) vkDestroySwapchainKHR(g_vk.dev, old, NULL);
+    if (old) SC(DestroySwapchainKHR)(g_vk.dev, old, NULL);
     g_vk.sc_format = sf.format;
     g_vk.sc_extent = ext;
-    g_vk.sc_count = 8;
-    vkGetSwapchainImagesKHR(g_vk.dev, g_vk.swapchain, &g_vk.sc_count, g_vk.sc_images);
+    g_vk.sc_count = 0;
+    SC(GetSwapchainImagesKHR)(g_vk.dev, g_vk.swapchain, &g_vk.sc_count, NULL);
+    if (g_vk.sc_count > 8) g_vk.sc_count = 8;
+    VkResult ir = SC(GetSwapchainImagesKHR)(g_vk.dev, g_vk.swapchain, &g_vk.sc_count, g_vk.sc_images);
+    if (ir != VK_SUCCESS && ir != VK_INCOMPLETE) FATAL("vkGetSwapchainImagesKHR: %d\n", ir);
+    for (uint32_t i = 0; i < g_vk.sc_count; i++)
+        if (!g_vk.sc_images[i]) FATAL("swapchain image %u of %u missing\n", i, g_vk.sc_count);
     for (uint32_t i = 0; i < g_vk.sc_count; i++) {
         VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_vk.sc_images[i],
                                     .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = sf.format,
@@ -426,10 +460,10 @@ bool vk_frame_begin(const float clear[4]) {
     slot = (slot + 1) % FRAMES;
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
     vk_wait_seq(slot_seq[slot]);
-    VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+    VkResult r = SC(AcquireNextImageKHR)(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
-        r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+        r = SC(AcquireNextImageKHR)(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
     }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LOG("[vk] acquire failed: %d\n", r); return false; }
     cur_frame.acquired = acquire_sem[slot];
@@ -499,7 +533,9 @@ void vk_frame_end(const char *shot_path) {
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &done_sem[img],
                            .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
     PFN_vkQueuePresentKHR present = dlss_present_proxy();  // (Streamline's own bookkeeping runs in its present)
+    dlss_present_begin();
     VkResult r = present ? present(g_vk.queue, &pi) : vkQueuePresentKHR(g_vk.queue, &pi);
+    dlss_present_end();
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) recreate_swapchain();
     cur_frame.ok = false;
     if (shot_path) {
@@ -737,7 +773,10 @@ void ui_window_init(void) {
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
     if (g_settings.fullscreen && !getenv("LARECOMP_WINDOW") && !getenv("LARECOMP_HIDDEN")) SDL_SetWindowFullscreen(window, true);
     create_instance();
-    if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
+    // (frame generation finds the window through a surface made by Streamline's interposer)
+    g_vk.surface = dlss_create_surface(g_vk.inst, SDL_GetPointerProperty(SDL_GetWindowProperties(window),
+                                                                         SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL));
+    if (!g_vk.surface && !SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
     pick_device();
     create_device();
     create_swapchain();

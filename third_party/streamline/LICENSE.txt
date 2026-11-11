@@ -1,5 +1,6 @@
 NVIDIA Streamline SDK headers (v2.14.16), used by runtime/nvn/vulkan/dlss.cpp. The runtime DLLs (sl.interposer.dll,
-sl.common.dll, sl.dlss.dll, nvngx_dlss.dll) are not part of this repository; they go beside the .exe.
+sl.common.dll, sl.dlss.dll, nvngx_dlss.dll; for frame generation also sl.dlss_g.dll, nvngx_dlssg.dll, sl.reflex.dll,
+sl.pcl.dll, NvLowLatencyVk.dll) are not part of this repository; they go beside the .exe.
 
 Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 
