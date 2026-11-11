@@ -734,3 +734,17 @@ def _fe3h_cam_aspect(gen, a):
 
 for _a in FE3H_ASPECT_SITES:
     PATCHES[_a] = _fe3h_cam_aspect
+
+# Frame limiter (main+0x5be430): the game logic's fixed 60 Hz tick spins on YieldThread until 1 / 59.94 s has passed;
+# rt_frame_spin (runtime/hle/framerate.c) sleeps on the host instead (a CPU core less).
+FE3H_FRAME_SPIN_SITE = 0x70005be4c0
+
+
+def _fe3h_frame_spin(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert (w >> 26) == 0x25, hex(w)  # bl YieldThread
+    return ('{ extern void rt_frame_spin(uint64_t, uint64_t); rt_frame_spin(c->x[8], c->x[23]); }'
+            f'  /* {a:#x}: bl YieldThread (frame limiter wait) */')
+
+
+PATCHES[FE3H_FRAME_SPIN_SITE] = _fe3h_frame_spin
