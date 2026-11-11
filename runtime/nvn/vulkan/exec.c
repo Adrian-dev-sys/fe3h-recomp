@@ -2976,6 +2976,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
 static float g_mirror_w;  // mirror mode's composite: its render target width (rscale[65].x; 0 otherwise)
 static float g_vs_rows[64][4];  // vertex stage rscale[1..]: the UI box's per-quad centres (ui_world_icons)
 static int g_vs_nrows;
+static float g_vs_px[2];  // vertex rscale[65].zw: the boxed UI's pass size (2D vertices snap to its pixels)
 
 static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
                                  const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii) {
@@ -2989,6 +2990,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
     if (sg == 0 && g_vs_nrows) memcpy(rs[1], g_vs_rows, (size_t)g_vs_nrows * 16);
     rs[65][0] = g_mirror_w;
+    if (sg == 0) rs[65][2] = g_vs_px[0], rs[65][3] = g_vs_px[1];
     for (int i = 0; i < p->nbinds; i++) {
         VkBindingInfo *b = &p->binds[i];
         if (b->set != set) continue;
@@ -3927,8 +3929,11 @@ static void draw_(CmdRec *r, bool indexed) {
             if (ui_world_icons(r, indexed)) rs0[2] = 1, rs0[3] = (float)r->x[1];  // (centres: g_vs_rows)
             else if (ui_camera_16x9()) rs0[1] = 2;  // (tilted menu plates, forecast, battle HUD: w != 1)
             else if (video || ui_edge_sprite(r, indexed)) rs0[0] = 2;  // (its screen-edge vertices are not a fill's)
+            int pw_, ph_;
+            pass_size(&pw_, &ph_);
+            g_vs_px[0] = (float)pw_, g_vs_px[1] = (float)ph_;
             vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, rs0, NULL, 0, 0, 0, NULL);
-            g_vs_nrows = 0;
+            g_vs_nrows = 0, g_vs_px[0] = g_vs_px[1] = 0;
             if (rs0[2] == 0) sc_box = q / 65535.0f;  // (world icons keep the wide scissor)
             composite = true;  // (full-width viewport: nothing clipped at the box edges)
         }
