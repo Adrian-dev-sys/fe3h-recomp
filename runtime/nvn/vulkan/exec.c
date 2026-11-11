@@ -1039,6 +1039,7 @@ uint64_t renderer_present_count(void);
 void renderer_save_texture_tex(TexBackend *b, const char *path);
 static float pass_sx = 1, pass_sy = 1;
 static float vp_sx = 1, vp_sy = 1, vp_ox = 0, vp_oy = 0;
+static float sc_box;  // (this draw's UI box factor, for its scissor; 0 = none)
 static float tex_sc[2][64][2];
 static uint32_t tex_wh[2][64][2];
 
@@ -1195,7 +1196,7 @@ static void begin_pass(void) {
     vkCmdBeginRendering(cb, &ri);
     ss_forget();  // (whatever ran between the passes may have set its own state)
     in_pass = true;
-    vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
+    vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0; sc_box = 0;
     stat_passes++;
 }
 
@@ -1221,6 +1222,10 @@ static VkRect2D scissor_rect(void) {
         if (x1 > 1e9) x1 = 1e9;
         if (y1 > 1e9) y1 = 1e9;
         x = (int)x0; y = (int)y0; sw = (int)(x1 - x0); sh = (int)(y1 - y0);
+    }
+    if (sc_box > 0 && (x > 0 || x + sw < w)) {  // ultrawide UI box: a partial scissor follows its boxed UI (minimap)
+        double c = w * 0.5, x0 = floor(c + (x - c) * sc_box), x1 = ceil(c + (x + sw - c) * sc_box);
+        x = (int)x0; sw = (int)(x1 - x0);
     }
     if (x < 0) { sw += x; x = 0; }
     if (y < 0) { sh += y; y = 0; }
@@ -1349,7 +1354,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
                   uint32_t smask) {
     begin_pass();
     VkCommandBuffer cb = vk_cmd();
-    vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
+    vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0; sc_box = 0;
     VkRect2D rect = scissor_rect();
     if (!rect.extent.width || !rect.extent.height) return;
     if (index >= 0 && (index >= (int)pass_ncolor || pass_color[index] == VK_FORMAT_UNDEFINED)) return;
@@ -3487,6 +3492,31 @@ static Pipe *pipe_get(const PipeKey *k) {  // the pipeline for k: found, or queu
 // short of their units. Each UI layout draws with its own pixel -> clip cbuf; the icon layout is the one that masks
 // its portrait diamonds with depth writes (seen the frame before, by its order among the frame's layouts). Its quads
 // keep their place and only shrink around their own centres (g_vs_rows, the box variant's vertex shader).
+// FE3H's UI perspective camera: vertex cbuf c3 starts with a pure 16:9 projection (the 3D cameras are widened or view-projection)
+static bool ui_camera_16x9(void) {
+    const float *u = (const float *)(uintptr_t)st.ubuf[0][0].addr;
+    if (!u || st.ubuf[0][0].size < 64 || u[5] <= 0) return false;
+    for (int i = 1; i < 16; i++)
+        if (i != 5 && i != 10 && i != 11 && i != 14 && u[i] != 0) return false;
+    return u[14] == -1 && u[15] == 0 && fabsf(u[0] / u[5] - 0.5625f) < 0.002f;
+}
+
+// A small 2D draw touching a screen edge without spanning the width (status L/R arrows): its edge vertices get boxed too
+static bool ui_edge_sprite(CmdRec *r, bool indexed) {
+    const float *u = (const float *)(uintptr_t)st.ubuf[0][0].addr;
+    float w = (float)st.rt.color[0]->width, h = (float)st.rt.color[0]->height;
+    if (indexed || !u || st.ubuf[0][0].size < 16 || fabsf(u[0] * w - 2) > 0.02f || fabsf(fabsf(u[1]) * h - 2) > 0.02f) return false;
+    if (r->x[2] == 0 || r->x[2] > 384 || !st.vbuf[0].addr || st.stream[0][0] < 8) return false;
+    float x0 = 1e9f, x1 = -1e9f;
+    for (uint64_t v = 0; v < r->x[2]; v++) {
+        uint64_t o = (r->x[1] + v) * st.stream[0][0];
+        if (o + 8 > st.vbuf[0].size) return false;
+        const float *p = (const float *)(uintptr_t)(st.vbuf[0].addr + o);
+        x0 = fminf(x0, p[0]), x1 = fmaxf(x1, p[0]);
+    }
+    return (x0 <= 0 || x1 >= w) && (x0 > 0 || x1 < w);
+}
+
 static bool ui_world_icons(CmdRec *r, bool indexed) {
     static int off = -1;
     if (off < 0) off = getenv("LARECOMP_NO_ICON_FIX") != NULL;
@@ -3799,7 +3829,7 @@ static void draw_(CmdRec *r, bool indexed) {
     // ---- textures first (their scales feed the widescreen decision and the rscale table), then the viewport
     float *vp = st.viewport[0];
     float zn = st.depth_range[0][0], zf = st.depth_range[0][1];
-    vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
+    vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0; sc_box = 0;
     {   // the Items page's cursor brackets while the cursor is on the companion card (runtime/hle/pets.c)
         extern bool pets_hide_item_cursor(void);
         extern bool texpatch_is_item_cursor(int id);
@@ -3885,8 +3915,11 @@ static void draw_(CmdRec *r, bool indexed) {
             if (ss_need(SS_PIPE, ss.pipe == bp->pipe)) { ss.pipe = bp->pipe; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, bp->pipe); }
             float rs0[4] = {1, 1, 0, 0};
             if (ui_world_icons(r, indexed)) rs0[2] = 1, rs0[3] = (float)r->x[1];  // (centres: g_vs_rows)
+            else if (ui_camera_16x9()) rs0[1] = 2;  // (tilted menu plates, forecast, battle HUD: w != 1)
+            else if (ui_edge_sprite(r, indexed)) rs0[0] = 2;  // (its screen-edge vertices are not a fill's)
             vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, rs0, NULL, 0, 0, 0, NULL);
             g_vs_nrows = 0;
+            if (rs0[2] == 0) sc_box = q / 65535.0f;  // (world icons keep the wide scissor)
             composite = true;  // (full-width viewport: nothing clipped at the box edges)
         }
         if (!composite) {
