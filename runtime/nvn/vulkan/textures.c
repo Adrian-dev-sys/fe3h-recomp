@@ -625,7 +625,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
 TexBackend *vk_tex(NvnTexture *t, bool for_render) {
     TexBackend *b = tex_backend(t);
     if (b->pending_rgba) upload_pending(b);
-    if (for_render) b->gpu_owned = true;
+    if (for_render) b->gpu_owned = true, b->video = false;
     else if (!b->gpu_owned) {
         extern uint64_t prof_up_ns;
         uint64_t t0 = prof_up_ns != ~0ull ? SDL_GetTicksNS() : 0;
@@ -650,6 +650,7 @@ void renderer_upload_rgba(NvnTexture *t, const void *rgba, uint32_t w, uint32_t 
     b->pending_rgba = copy;
     b->pending_w = w; b->pending_h = h; b->pending_stride = stride;
     b->gpu_owned = true;
+    b->video = true;
     pthread_mutex_unlock(&pending_lock);
 }
 

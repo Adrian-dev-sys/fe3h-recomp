@@ -81,6 +81,7 @@ typedef struct TexBackend {
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
     bool scalable, presented;
+    bool video;  // last filled by an upload (movie frames), not rendered: 2D, not a scene buffer
     uint64_t touched_frame, frame_cleared;
     uint32_t level_gen;
     float sx, sy;

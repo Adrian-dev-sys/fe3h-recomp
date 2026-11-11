@@ -2922,7 +2922,9 @@ static VkImageView image_view(int stage, const ShaderTexture *st_) {
     return vk_image_view(b, vt, b->storage_fmt, lv, 1, 0, have3d ? 1 : nly, id, VK_IMAGE_ASPECT_COLOR_BIT);
 }
 
+static bool tex_video[64];  // (this draw's fragment textures with uploaded content, movie frames: not scene buffers)
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
+    if (stage == 1 && i < 64) tex_video[i] = false;
     ShaderTexture *st_ = &si->tex[i];
     int slot = ((int)st_->handle_offset - 0x20) / 8;  // 64-bit handles from offset 0x20
     uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
@@ -2954,6 +2956,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
             }
             renderer_texture_scale(e->tex, &sc[0], &sc[1]);
             wh[0] = e->tex->width; wh[1] = e->tex->height;
+            if (stage == 1 && i < 64 && e->tex->backend) tex_video[i] = ((TexBackend *)e->tex->backend)->video || !((TexBackend *)e->tex->backend)->gpu_owned;
             for (int k = 0; k < nfeedback; k++)
                 if (e->tex == feedback_tex[k] && (st_->type == TEXTYPE_2D || st_->type == TEXTYPE_2D_ARRAY)) {
                     view = feedback_view[k];
@@ -3879,17 +3882,24 @@ static void draw_(CmdRec *r, bool indexed) {
         tex_sc[1][i][0] = sc[0]; tex_sc[1][i][1] = sc[1]; tex_wh[1][i][0] = wh[0]; tex_wh[1][i][1] = wh[1];
     }
     if (prof) prof_tex += SDL_GetTicksNS() - prof_tx_;
+    if (st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend && !renderer_texture_presented(st.rt.color[0])) {
+        // a movie frame converted into a (widened) target stays 2D; any other draw into it makes it a scene buffer
+        bool conv = pr->fi->ntex > 0 && r->x[2] <= 6;
+        for (int i = 0; i < pr->fi->ntex && i < 64; i++) conv &= tex_video[i];
+        ((TexBackend *)st.rt.color[0]->backend)->video = conv;
+    }
     if (fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
         // Draws into the swapchain image (see renderer.m): composites fill the window, UI goes in a centred 16:9 box.
-        bool reads_scene = false;
+        bool reads_scene = false, video = false;  // (movie frames: 2D, boxed with their screen edges)
+        for (int i = 0; i < pr->fi->ntex && i < 64; i++) video |= tex_video[i];
         for (int i = 0; i < pr->fi->ntex && i < 64; i++)
-            if ((tex_sc[1][i][0] != 1 || tex_sc[1][i][1] != 1) && tex_wh[1][i][0] == st.rt.color[0]->width &&
+            if (!tex_video[i] && (tex_sc[1][i][0] != 1 || tex_sc[1][i][1] != 1) && tex_wh[1][i][0] == st.rt.color[0]->width &&
                 tex_wh[1][i][1] == st.rt.color[0]->height)
                 reads_scene = true;
         bool fullscreen_quad = r->x[2] <= 6 && st.viewport[0][0] == 0 && st.viewport[0][1] == 0 &&
                                st.viewport[0][2] >= st.rt.color[0]->width && st.viewport[0][3] >= st.rt.color[0]->height;
         bool fullscreen_fill = pr->fi->ntex == 0 && fullscreen_quad;
-        if (fullscreen_quad && !reads_scene && pr->fi->ntex == 1 && (tex_sc[1][0][0] != 1 || tex_sc[1][0][1] != 1)) reads_scene = true;
+        if (fullscreen_quad && !reads_scene && !video && pr->fi->ntex == 1 && (tex_sc[1][0][0] != 1 || tex_sc[1][0][1] != 1)) reads_scene = true;
         static uint64_t wide_frame = ~0ull;
         if (reads_scene) wide_frame = renderer_present_count();
         bool fade_fill = false;
@@ -3916,7 +3926,7 @@ static void draw_(CmdRec *r, bool indexed) {
             float rs0[4] = {1, 1, 0, 0};
             if (ui_world_icons(r, indexed)) rs0[2] = 1, rs0[3] = (float)r->x[1];  // (centres: g_vs_rows)
             else if (ui_camera_16x9()) rs0[1] = 2;  // (tilted menu plates, forecast, battle HUD: w != 1)
-            else if (ui_edge_sprite(r, indexed)) rs0[0] = 2;  // (its screen-edge vertices are not a fill's)
+            else if (video || ui_edge_sprite(r, indexed)) rs0[0] = 2;  // (its screen-edge vertices are not a fill's)
             vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, rs0, NULL, 0, 0, 0, NULL);
             g_vs_nrows = 0;
             if (rs0[2] == 0) sc_box = q / 65535.0f;  // (world icons keep the wide scissor)
@@ -4343,6 +4353,7 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     if (!fi || !fi->bpb) return;
     TexBackend *b = vk_tex(t, false);  // prior CPU contents uploaded first
     renderer_mark_gpu_owned(t);
+    b->video = true;  // (uploaded content, e.g. movie frames: not a scene buffer)
     if (b->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) return;
     if (b->astc_bw) {  // (blocks would need the CPU decode: not seen in the game yet)
         static int nlog;
