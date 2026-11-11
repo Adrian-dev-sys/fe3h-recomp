@@ -70,6 +70,7 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
     int mode = g_settings.res_mode;
     if (forced > 0) h = forced;
     else if (mode >= 1 && mode <= 8) h = mode;
+    else if (mode == RES_X15) h = 1.5;  // (1620p: between 1x shimmer and 2x cost)
     else {
         h = reshape ? dh / 1080.0 : fit;  // Match display
         if (mode == RES_DYNAMIC) { dyn_update(now, gpu_ms); h *= g_dyn; }
