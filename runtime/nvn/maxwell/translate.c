@@ -83,6 +83,14 @@ typedef struct {
     bool glsl;               // emit Vulkan GLSL: dialect-specific constructs here, the rest via glsl_rewrite()
     bool uses_gmem_store;    // STG present: the gmem buffer is not readonly
     uint32_t cbuf_need[18];  // highest constant vec4 index + 1 per cbuf (array size of the GLSL block)
+    // SYNC / BRK / CONT targets resolved statically (per instruction index; ~0u: not resolved), and whether any
+    // pop of each kind stays dynamic (its pushes are then kept). The stacks were local-memory arrays indexed at run
+    // time - spilled to scratch on the GPU, in every light loop iteration of FE3H's deferred lighting.
+    uint32_t *flow_tgt;
+    bool dyn_ssy, dyn_pbk, dyn_pcnt;
+    // local memory words (a power of two): the SPH's own size, not a fixed 1 KB zeroed per invocation - FE3H's
+    // deferred lighting zeroed 256 words of scratch for every pixel before its first light (most of 13 ms at 2x)
+    unsigned lmem_words;
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
@@ -969,15 +977,16 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         sp(&c->body, "    pc = %uu; continue;\n", target);
     } else if (OPM(0xe290000000000000ull, 0xfff0000000000020ull)) {  // SSY
         c->uses_branches = true;
-        sp(&c->body, "    ssy[ssy_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
+        if (c->dyn_ssy) sp(&c->body, "    ssy[ssy_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xe2a0000000000000ull, 0xfff0000000000020ull)) {  // PBK
         c->uses_branches = true;
-        sp(&c->body, "    pbk[pbk_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
+        if (c->dyn_pbk) sp(&c->body, "    pbk[pbk_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xe2b0000000000000ull, 0xfff0000000000020ull)) {  // PCNT
         c->uses_branches = true;
-        sp(&c->body, "    pcnt[pcnt_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
+        if (c->dyn_pcnt) sp(&c->body, "    pcnt[pcnt_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xf0f8000000000000ull, 0xfff8000000000000ull)) {  // SYNC
-        sp(&c->body, "    pc = ssy[--ssy_n]; continue;\n");
+        if (!c->dyn_ssy) sp(&c->body, "    pc = %uu; continue;\n", c->flow_tgt[pc / 8]);
+        else sp(&c->body, "    pc = ssy[--ssy_n]; continue;\n");
     } else if (OPM(0xe260000000000000ull, 0xfff0000000000020ull)) {  // CAL: call a subroutine (relative), RET comes back
         c->uses_branches = true; c->uses_cal = true;
         sp(&c->body, "    if (cal_n < 16u) cal[cal_n++] = %uu; pc = %uu; continue;\n", norm_target((int64_t)pc + 8),
@@ -989,9 +998,11 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         c->uses_cal = true;
         sp(&c->body, "    if (cal_n == 0u) { exit_now = true; break; } pc = cal[--cal_n]; continue;\n");
     } else if (OPM(0xe340000000000000ull, 0xfff0000000000000ull)) {  // BRK
-        sp(&c->body, "    pc = pbk[--pbk_n]; continue;\n");
+        if (!c->dyn_pbk) sp(&c->body, "    pc = %uu; continue;\n", c->flow_tgt[pc / 8]);
+        else sp(&c->body, "    pc = pbk[--pbk_n]; continue;\n");
     } else if (OPM(0xe350000000000000ull, 0xfff0000000000000ull)) {  // CONT
-        sp(&c->body, "    pc = pcnt[pcnt_n - 1]; continue;\n");
+        if (!c->dyn_pcnt) sp(&c->body, "    pc = %uu; continue;\n", c->flow_tgt[pc / 8]);
+        else sp(&c->body, "    pc = pcnt[pcnt_n - 1]; continue;\n");
     } else if (OPM(0xf0f0000000000000ull, 0xfff8000000000000ull) || OPM(0x50b0000000000000ull, 0xfff8000000000000ull) ||
                OPM(0xef98000000000000ull, 0xfff8000000000000ull)) {
         // DEPBAR / NOP / MEMBAR
@@ -1692,7 +1703,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int size = (int)bits(w, 48, 3);
         int32_t off = (int32_t)sbits(w, 20, 24);
         const char *mem = "lmem";
-        unsigned words = LMEM_WORDS;
+        unsigned words = c->lmem_words ? c->lmem_words : LMEM_WORDS;
         if (shared_mem) {
             if (!c->glsl || c->stage != STAGE_COMPUTE) { fail(c, "LDS/STS outside a GLSL compute shader at %#x", pc); return; }
             c->uses_shared = true;
@@ -2084,11 +2095,18 @@ static const char glsl_prelude[] =
     // half -> float by bits, not unpackHalf2x16: NVIDIA's driver recognises unpacked halves and runs some of the
     // fp32 math after them in native fp16, differently per shader, so a depth pre-pass and its colour pass (EQUAL
     // test) placed wind-animated foliage apart: black slashes / flicker (tools: notes/PLAN.md 2026-10-08)
+    // (FAST_HALF: fragment shaders not writing depth - the hardware unpack; the light loop of FE3H's deferred
+    // lighting unpacked ~40 halves an iteration through the bit version: most of its 15 ms at 2x)
+    "#ifdef FAST_HALF\n"
+    "float h2f(uint h) { return unpackHalf2x16(h & 0xFFFFu).x; }\n"
+    "vec2 unpack_h2(uint v) { return unpackHalf2x16(v); }\n"
+    "#else\n"
     "float h2f(uint h) { uint s = (h & 0x8000u) << 16, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;"
     " if (e == 0u) { float d = float(m) * 5.9604644775390625e-8; return s != 0u ? -d : d; }"
     " if (e == 31u) return uintBitsToFloat(s | 0x7F800000u | (m << 13));"
     " return uintBitsToFloat(s | ((e + 112u) << 23) | (m << 13)); }\n"
     "vec2 unpack_h2(uint v) { return vec2(h2f(v & 0xFFFFu), h2f(v >> 16)); }\n"
+    "#endif\n"
     // F32 operands of half ops: finite values saturate to the half range (FE3H's shadow mask: inf - floor(inf) = NaN wedges)
     "vec2 hx(uint v, uint swz) { if (swz == 1u) { float f = uintBitsToFloat(v); return vec2(isinf(f) || isnan(f) ? f : clamp(f, -65504.0f, 65504.0f)); } vec2 h = unpack_h2(v); return swz == 2u ? h.xx : (swz == 3u ? h.yy : h); }\n"
     "uint hpack(vec2 r, uint merge, uint old) { if (merge == 1u) return floatBitsToUint(r.x); uint lo = packHalf2x16(vec2(r.x, 0.0f)), hi = packHalf2x16(vec2(r.y, 0.0f)); if (merge == 2u) return (old & 0xFFFF0000u) | lo; if (merge == 3u) return (old & 0xFFFFu) | (hi << 16); return lo | (hi << 16); }\n"
@@ -2117,7 +2135,14 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (c->fail) { free(body.buf); free(c->body.buf); free(c); return info; }
     int set = stage == STAGE_FRAGMENT ? 1 : 0;
     Str s = {0};
-    sp(&s, "%s", glsl_prelude);
+    {   // the #version line, then FAST_HALF where exact half unpacking doesn't matter (LARECOMP_EXACT_HALF=1: never)
+        static int exact = -1;
+        if (exact < 0) exact = getenv("LARECOMP_EXACT_HALF") != NULL;
+        const char *nl = strchr(glsl_prelude, '\n');
+        sp(&s, "%.*s", (int)(nl - glsl_prelude + 1), glsl_prelude);
+        if (!exact && stage == STAGE_FRAGMENT && !c->omap_depth) sp(&s, "#define FAST_HALF\n");
+        sp(&s, "%s", nl + 1);
+    }
     if (maxwell_glsl_denorm_preserve)  // (the declaration only brings in the DenormPreserve capability)
         sp(&s, "spirv_execution_mode(4459, 32);\n"
                "spirv_instruction(extensions = [\"SPV_KHR_float_controls\"], capabilities = [4464], id = 0) void denorm_cap_();\n");
@@ -2229,7 +2254,11 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     for (int i = 0; i < 7; i++)
         if (c->pred_used[i]) sp(&s, "  bool p%d = false;\n", i);
     if (c->uses_cc) sp(&s, "  uint cc = 0u; bool ccz = false, ccs = false;\n");
-    if (c->uses_local) sp(&s, "  uint lmem[%d]; for (int li_ = 0; li_ < %d; li_++) lmem[li_] = 0u;\n", LMEM_WORDS, LMEM_WORDS);
+    if (c->uses_local) {  // (undefined at start, as on the hardware; small ones still zeroed - cheap)
+        unsigned lw = c->lmem_words ? c->lmem_words : LMEM_WORDS;
+        if (lw <= 32) sp(&s, "  uint lmem[%u]; for (int li_ = 0; li_ < %u; li_++) lmem[li_] = 0u;\n", lw, lw);
+        else sp(&s, "  uint lmem[%u];\n", lw);
+    }
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0u; uint pbk[16]; uint pbk_n = 0u; uint pcnt[16]; uint pcnt_n = 0u;%s\n", c->uses_cal ? " uint cal[16]; uint cal_n = 0u;" : "");
@@ -2369,6 +2398,12 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         c->omap_target = *(const uint32_t *)(sph + 0x48);
         c->omap_depth = (*(const uint32_t *)(sph + 0x4C) >> 1) & 1;
     }
+    c->lmem_words = LMEM_WORDS;
+    if (stage != STAGE_COMPUTE && !getenv("LARECOMP_FULL_LMEM")) {  // (SPH word 1: ShaderLocalMemoryLowSize, bytes)
+        uint32_t lo = *(const uint32_t *)(sph + 4) & 0xFFFFFFu, w = 4;
+        while (w * 4 < lo && w < LMEM_WORDS) w <<= 1;
+        if (lo) c->lmem_words = w;
+    }
     // find the end: the last EXIT followed by self-branch padding, or max_size
     size_t n = (max_size - (code - blob)) / 8;
     if (n > 65536) n = 65536;
@@ -2417,6 +2452,33 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         }
         (void)is_branch_target_op;
     }
+    {   // static SYNC / BRK / CONT targets: the innermost SSY / PBK / PCNT whose range (push, target) holds the pop -
+        // the compiler's nesting. LARECOMP_DYN_FLOW=1: the run-time stacks for all (the old way).
+        static int dyn = -1;
+        if (dyn < 0) dyn = getenv("LARECOMP_DYN_FLOW") != NULL;
+        c->flow_tgt = malloc((end + 4) * sizeof *c->flow_tgt);
+        for (size_t i = 0; i < end + 4; i++) c->flow_tgt[i] = ~0u;
+        c->dyn_ssy = c->dyn_pbk = c->dyn_pcnt = dyn != 0;
+        static const uint64_t push[3] = {0xe290000000000000ull, 0xe2a0000000000000ull, 0xe2b0000000000000ull};
+        for (size_t i = 0; i < end && !dyn; i++) {
+            if (i % 4 == 0) continue;
+            uint64_t w = ((const uint64_t *)code)[i];
+            int kind = (w & 0xfff8000000000000ull) == 0xf0f8000000000000ull ? 0   // SYNC
+                     : (w & 0xfff0000000000000ull) == 0xe340000000000000ull ? 1   // BRK
+                     : (w & 0xfff0000000000000ull) == 0xe350000000000000ull ? 2 : -1;  // CONT
+            if (kind < 0) continue;
+            int64_t best_a = -1, best_t = -1;
+            for (size_t j = 0; j < end; j++) {
+                if (j % 4 == 0) continue;
+                uint64_t v = ((const uint64_t *)code)[j];
+                if ((v & 0xfff0000000000020ull) != push[kind]) continue;
+                int64_t t = norm_target((int64_t)j * 8 + 8 + sbits(v, 20, 24));
+                if (j < i && (int64_t)i * 8 < t && (int64_t)j > best_a) best_a = (int64_t)j, best_t = t;
+            }
+            if (best_t < 0) { if (kind == 0) c->dyn_ssy = true; else if (kind == 1) c->dyn_pbk = true; else c->dyn_pcnt = true; }
+            else c->flow_tgt[i] = (uint32_t)best_t;
+        }
+    }
     // translate
     bool dbg = maxwell_dbg_code && blob == maxwell_dbg_code && stage == STAGE_FRAGMENT;
     static int annotate = -1;
@@ -2438,6 +2500,8 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         info->num_insts++;
     }
     free(label);
+    free(c->flow_tgt);
+    c->flow_tgt = NULL;
     if (c->fail) { free(c->body.buf); free(c); return info; }
     if (c->glsl) return glsl_finish(c, any_branch, dbg);
 
@@ -2538,7 +2602,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     for (int i = 0; i < 7; i++)
         if (c->pred_used[i]) sp(&s, "  bool p%d = false;\n", i);
     if (c->uses_cc) sp(&s, "  uint cc = 0; bool ccz = false, ccs = false;\n");
-    if (c->uses_local) sp(&s, "  uint lmem[%d] = {};\n", LMEM_WORDS);
+    if (c->uses_local) sp(&s, "  uint lmem[%u] = {};\n", c->lmem_words ? c->lmem_words : LMEM_WORDS);
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0; uint pbk[16]; uint pbk_n = 0; uint pcnt[16]; uint pcnt_n = 0;%s\n", c->uses_cal ? " uint cal[16]; uint cal_n = 0;" : "");

@@ -1467,6 +1467,7 @@ typedef struct {
     uint64_t waited_ns; // draws' time waiting for it to build (wait_built)
     _Atomic int state;  // 0 building, 1 ready, 2 failed
     void *motion;       // (DLAA) its object-motion variant (a Prog), once asked for: mv_prog
+    signed char bf_only[2];  // vertex / fragment: guest heap read by buffer textures only (0 unknown, 1 yes, 2 no)
     bool is_motion;
 } Prog;
 
@@ -3124,9 +3125,55 @@ static int g_vs_nrows;
 static float g_vs_px[2];  // vertex rscale[65].zw: the boxed UI's pass size (2D vertices snap to its pixels)
 
 static bool mv_binding(const VkBindingInfo *b, int stage, ShaderInfo *si, VkDescriptorBufferInfo *out);
+// Buffer textures (bfetch) read the guest heap, which is host memory across PCIe: FE3H's deferred lighting reads its
+// light lists there for every pixel and light (16 of 20 ms a frame at 2x). A stage whose only heap reads are
+// buffer textures gets their ranges copied into the device-local ring instead (once per submission) and its heap
+// binding pointed there. LARECOMP_VK_BFETCH_HEAP=1: the old way.
+static struct { bool valid; VkSpan span; uint64_t total, key; uint32_t off[64]; bool has[64]; } g_bf;
+static void bf_prepare(Prog *p, int stage, ShaderInfo *si) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_VK_BFETCH_HEAP") != NULL;
+    int sg = stage == 1 ? 1 : 0;
+    g_bf.valid = false;
+    if (off || (stage != 0 && stage != 1) || !si->uses_gmem || !si->msl) return;
+    if (!p->bf_only[sg]) {  // (bfetch_at holds the shader's only 4 heap reads)
+        int n = 0;
+        for (const char *q = strstr(si->msl, "gmem_.w["); q; q = strstr(q + 8, "gmem_.w[")) n++;
+        p->bf_only[sg] = n == 4 && strstr(si->msl, "vec4 bfetch_at(") ? 1 : 2;
+    }
+    if (p->bf_only[sg] != 1) return;
+    uint64_t key = vk_pending_seq() * 0x9E3779B97F4A7C15ull ^ gcopy_gen, total = 0;
+    uint32_t offs[64];
+    bool has[64] = {0};
+    const uint8_t *src[64];
+    uint64_t len[64];
+    for (int t = 0; t < si->ntex && t < 32; t++) {
+        if (si->tex[t].type != TEXTYPE_1D) continue;
+        NvnTexture *bt = shader_texture_object(stage, &si->tex[t]);
+        if (!bt || bt->target != 10 || bt->addr < HEAP_BASE) continue;
+        const FormatInfo *fi = nvn_format_info(bt->format);
+        len[t] = (uint64_t)bt->width * (fi && fi->bpb ? fi->bpb : 4);
+        if (!len[t] || len[t] > (64ull << 20)) continue;
+        src[t] = (const uint8_t *)(uintptr_t)bt->addr;
+        offs[t] = (uint32_t)total, has[t] = true;
+        total += (len[t] + 255) & ~255ull;
+        key = (key ^ bt->addr) * 0x100000001B3ull ^ len[t];
+    }
+    if (!total) return;
+    if (!g_bf.span.buf || g_bf.key != key || g_bf.total != total) {  // (once per submission and set of ranges)
+        VkSpan s = vk_transient(total, 256);
+        if (!s.ptr) return;
+        for (int t = 0; t < si->ntex && t < 32; t++) if (has[t]) memcpy((uint8_t *)s.ptr + offs[t], src[t], len[t]);
+        g_bf.span = s, g_bf.total = total, g_bf.key = key;
+    }
+    memcpy(g_bf.off, offs, sizeof offs);
+    memcpy(g_bf.has, has, sizeof has);
+    g_bf.valid = true;
+}
 static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
                                  const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii) {
     VkDescriptorSet ds = vk_alloc_set(layout);
+    bf_prepare(p, stage, si);
     VkWriteDescriptorSet w[MAX_BIND];
     VkDescriptorBufferInfo bi[MAX_BIND];
     VkDescriptorImageInfo ii[MAX_BIND];
@@ -3164,7 +3211,8 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
             w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-            bi[n] = b->binding == GFAST_BUFFER_INDEX ? gfast_info() : gmem_info();
+            bi[n] = b->binding == GFAST_BUFFER_INDEX ? gfast_info()
+                  : g_bf.valid ? (VkDescriptorBufferInfo){g_bf.span.buf, g_bf.span.off, g_bf.total} : gmem_info();
             w[n].pBufferInfo = &bi[n];
         } else {
             continue;  // rscale / tint: written below, once the textures (and their scales) are known
@@ -3190,6 +3238,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 uint32_t off = 0xFFFFFFFFu, cnt = (bt->width < 0xFFFFFFu ? bt->width : 0xFFFFFFu) | (bt->format & 0xFFu) << 24;
                 gmem_info();  // (imports the heap on first use)
                 if (bt->addr >= HEAP_BASE && bt->addr + bytes <= HEAP_BASE + gmem_size && gmem_buf) off = (uint32_t)(bt->addr - HEAP_BASE);
+                if (g_bf.valid) off = g_bf.has[t] ? g_bf.off[t] : 0xFFFFFFFFu;  // (the device-local copy: bf_prepare)
                 {   // LARECOMP_WATCH_BUFTEX=1 (debug): watch the first compute-bound buffer texture's page - who touches it
                     static bool armed;
                     // LARECOMP_WATCH_ADDR=<hex addr>,<hex size> instead: that range (armed at the same moment)
@@ -4835,6 +4884,13 @@ static void draw_(CmdRec *r, bool indexed) {
         }
     }
     if (!nruns) { run_at[0] = 0; run_n[0] = inst; nruns = 1; run_gold[0] = false; }
+    if (g_gpuprof_frame && st.rt.ncolor == 1 && st.rt.color[0] && st.rt.color[0]->format == 0x3f && st.rt.depth) {
+        static int per = -1;  // (LARECOMP_GPUPROF_DRAWS=1: each draw into the lit scene timed on its own)
+        if (per < 0) per = getenv("LARECOMP_GPUPROF_DRAWS") != NULL;
+        if (per) gp_mark(cb, "  draw fs %016llx %s %u x%u, ds %02x%02x%02x, stencil ref %u mask %#x, vp %.0fx%.0f", (unsigned long long)g_cur_fs_hash,
+                         use_index ? "idx" : "vtx", use_index ? icount : count, inst, st.ds[0], st.ds[1], st.ds[2], st.stencil_ref[0],
+                         st.stencil_vmask[0], st.viewport[0][2], st.viewport[0][3]);
+    }
     for (int ri = 0; ri < nruns; ri++) {
         if (nruns > 1 || run_gold[0]) {  // this run's tint: a fragment set of its own
             float rtint[8] = {0};
@@ -5487,6 +5543,7 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
     extern void vk_frame_resume(void);
     vk_frame_suspend();
     if (smaa) {  // SMAA 1x: luma edges -> blending weights -> neighbourhood blending
+        gp_mark(cb, "post: smaa %ux%u", b->width, b->height);
         float w = (float)b->width, h = (float)b->height;
         float m[8] = {1.0f / w, 1.0f / h, w, h};
         TexBackend *edges = post_image(0, b->width, b->height), *weights = post_image(1, b->width, b->height);
@@ -5500,6 +5557,7 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
         v = post_view(out);
     }
     if (fsr) {
+        gp_mark(cb, "post: fsr1");
         float iw = (float)b->width, ih = (float)b->height;
         TexBackend *e = post_image(3, ow, oh), *r = post_image(4, ow, oh);
         float pe[8] = {iw / ow, ih / oh, 0.5f * iw / ow - 0.5f, 0.5f * ih / oh - 0.5f, iw, ih};
@@ -5511,6 +5569,7 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
         v = post_view(r);
     }
     if (down) {
+        gp_mark(cb, "post: resolve -> %ux%u", ow, oh);
         float iw = (float)b->width, ih = (float)b->height;
         TexBackend *d = post_image(5, ow, oh);
         float pd[8] = {iw / ow, ih / oh, 0, 0, iw, ih};
@@ -5526,6 +5585,7 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
         post_pass(cb, "rcas.frag", ri_, 1, r, pr, false);
         v = post_view(r);
     }
+    gp_mark(cb, "post: end");
     vk_full_barrier(cb);
     vk_frame_resume();
     {

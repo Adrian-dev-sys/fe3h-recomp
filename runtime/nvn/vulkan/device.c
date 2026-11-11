@@ -678,6 +678,11 @@ static void backend_present_locked(NvnTexture *t) {
         extern void vk_gpuprof_report(void);
         if (g_gpuprof_frame) { g_gpuprof_frame = false; vk_gpuprof_report(); }
         const char *e = getenv("LARECOMP_GPUPROF_AT");
+        if (e && !strncmp(e, "every:", 6)) {  // (every:<n>: one frame in n, from frame 600)
+            long n = atol(e + 6);
+            if (n > 0 && total_frames >= 600 && total_frames % (uint64_t)n == 0) g_gpuprof_frame = true;
+            e = NULL;
+        }
         for (const char *p = e; p && *p;) {
             long at = strtol(p, (char **)&p, 10);
             if (at == (long)total_frames) { g_gpuprof_frame = true; break; }
