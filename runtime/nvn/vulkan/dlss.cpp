@@ -365,7 +365,7 @@ extern "C" bool dlss_evaluate(VkCommandBuffer cb, const DlssImage *color, const 
     k.cameraFOV = c->fov;
     k.cameraAspectRatio = c->aspect;
     k.depthInverted = c->depth_inverted ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-    k.cameraMotionIncluded = sl::Boolean::eFalse;  // (zero vectors: DLSS adds the camera's motion from depth)
+    k.cameraMotionIncluded = c->camera_motion ? sl::Boolean::eTrue : sl::Boolean::eFalse;  // (else SL adds it from depth)
     k.motionVectors3D = sl::Boolean::eFalse;
     k.reset = c->reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     k.orthographicProjection = sl::Boolean::eFalse;

@@ -755,10 +755,21 @@ static bool big_cs_ok(void) {
     return ok;
 }
 typedef struct { void (*fn)(void *); void *arg; } HugeJob;
-static void *huge_thread(void *a) {
+static void *huge_thread(void *a) {  // (two at a time: eight at once ran the driver's compiler out of memory)
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+    static int running;
     HugeJob j = *(HugeJob *)a;
     free(a);
+    pthread_mutex_lock(&m);
+    while (running >= 2) pthread_cond_wait(&cv, &m);
+    running++;
+    pthread_mutex_unlock(&m);
     j.fn(j.arg);
+    pthread_mutex_lock(&m);
+    running--;
+    pthread_cond_signal(&cv);
+    pthread_mutex_unlock(&m);
     return NULL;
 }
 static void run_huge_job(void (*fn)(void *), void *arg) {
@@ -1078,6 +1089,8 @@ static uint32_t tex_wh[2][64][2];
 // ================================================================== render passes
 static VkFormat pass_color[8], pass_depth, pass_stencil;
 #define MV_FMT VK_FORMAT_R16G16_SFLOAT
+static const float *g_post_pc80;  // (the next post_pass's push constants, when 80 bytes: mvfull.frag)
+static float g_scene_flip[2];     // (the scene's clip-space flips x / y, from its motion draws)
 static TexBackend g_mv_img;      // (DLAA) object motion target, the G-buffer pass's color 4: see mv_prog
 static bool g_mv_pass;           // the current pass has it attached
 static uint64_t g_mv_clear_frame = ~0ull;
@@ -1689,7 +1702,7 @@ static uint32_t buffer_texture_mask(int stage, const ShaderInfo *si) {
 static Prog *warm_find(NvnProgram *np, const ShaderKey *vkey, const ShaderKey *fkey);
 static void warm_start(void);
 static Prog *mv_prog(Prog *p);
-static void mv_prepare(const Prog *p, const CmdRec *r);
+static void mv_prepare(const Prog *p, const CmdRec *r, const ShaderKey *vk);
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
     warm_start();
@@ -4024,6 +4037,7 @@ static char *mv_fs_src(const char *src) {
         "    if (mvP.y > 0.5) g.x = -g.x;\n    if (mvP.z > 0.5) g.y = -g.y;\n    if (mvP.w > 0.5) g.z = 2.0 * g.z - g.w;\n"
         "    vec4 c = mvM * g;\n    if (mvP.y > 0.5) c.x = -c.x;\n    if (mvP.z > 0.5) c.y = -c.y;\n"
         "    if (c.w > 0.0) { vec2 d = i_mvp.xy / i_mvp.w - c.xy / c.w; o_mv = vec4(0.5 * d.x, -0.5 * d.y, 0.0, 0.0); }\n"
+        "    if (dot(o_mv.xy, o_mv.xy) > 4e-4) o_mv = vec4(0.0);\n"  // (> 2% of the screen a frame: a copy matched to another's last frame)
         "  }\n}\n";
     char *body = str_replace_tok(m, "main", "fs_main");
     size_t hl = (size_t)(m - src);
@@ -4077,9 +4091,13 @@ static Prog *mv_prog(Prog *p) {
     return atomic_load(&pm->state) == 1 ? pm : NULL;
 }
 
-// Last frame's vertex cbufs per draw (keyed by program and mesh): two generations
+// Last frame's vertex cbufs per mesh (keyed by program and mesh), one per instance: copies of a mesh (a battalion's
+// soldiers) are told apart by their cbufs' heads (root bone, world matrix) - each takes last frame's nearest copy.
 #define MV_TAB 2048
-typedef struct { uint64_t key, frame; void *cur[18], *old[18]; uint32_t cur_len[18], old_len[18]; } MvEnt;
+#define MV_SIG 48
+#define MV_MAXINST 512
+typedef struct { float sig[MV_SIG]; void *cb[18]; uint32_t len[18]; int prev; } MvInst;
+typedef struct { uint64_t key, frame; MvInst *cur, *old; int ncur, nold, capcur; uint8_t *claimed; } MvEnt;
 static MvEnt *mv_tab;
 
 static int g_mv_stat[6];  // draws, no slot, no last frame, no camera, valid, cbuf size changed
@@ -4091,10 +4109,27 @@ static uint64_t mv_key(const Prog *p, const CmdRec *r) {
     return h ? h : 1;
 }
 
-// Before a motion draw's descriptor sets: last frame's cbufs (if this mesh was drawn then), this frame's kept for next
-static void mv_prepare(const Prog *p, const CmdRec *r) {
+static void mv_free_insts(MvInst *v, int n) {
+    for (int i = 0; i < n; i++)
+        for (int k = 0; k < 18; k++) free(v[i].cb[k]);
+    free(v);
+}
+
+// Before a motion draw's descriptor sets: last frame's cbufs (if this object was drawn then), this frame's kept for next
+static void mv_prepare(const Prog *p, const CmdRec *r, const ShaderKey *vk) {  // (vk: the draw's key; warm programs' vkey is unset)
     if (!mv_tab) mv_tab = calloc(MV_TAB, sizeof *mv_tab);
     uint64_t f = renderer_present_count(), key = mv_key(p, r);
+    static uint64_t swept;
+    if (swept != f) {  // (meshes not drawn for a while: their copies freed, 64 slots a frame)
+        static uint32_t sw;
+        swept = f;
+        for (int i = 0; i < 64; i++, sw = (sw + 1) & (MV_TAB - 1)) {
+            MvEnt *x = &mv_tab[sw];
+            if (!x->key || x->frame + 30 >= f) continue;
+            mv_free_insts(x->cur, x->ncur), mv_free_insts(x->old, x->nold), free(x->claimed);
+            memset(x, 0, sizeof *x);
+        }
+    }
     uint32_t s = (uint32_t)(key ^ (key >> 29)) & (MV_TAB - 1);
     MvEnt *e = NULL;
     for (int i = 0; i < 16 && !e; i++, s = (s + 1) & (MV_TAB - 1))
@@ -4104,33 +4139,73 @@ static void mv_prepare(const Prog *p, const CmdRec *r) {
     g_mv_stat[0]++;
     if (!e) { g_mv_stat[1]++; return; }
     if (e->key != key) {  // (new or stale slot)
-        for (int k = 0; k < 18; k++) { free(e->cur[k]); free(e->old[k]); }
+        mv_free_insts(e->cur, e->ncur), mv_free_insts(e->old, e->nold), free(e->claimed);
         memset(e, 0, sizeof *e);
         e->key = key;
     }
-    if (e->frame != f) {  // first draw of this mesh this frame: this frame's copies go to cur
+    if (e->frame != f) {  // first draw of this mesh this frame: last frame's instances become old
         bool recent = e->frame && e->frame + 3 >= f;
-        for (int k = 0; k < 18; k++) {
-            free(e->old[k]);
-            e->old[k] = recent ? e->cur[k] : NULL, e->old_len[k] = recent ? e->cur_len[k] : 0;
-            if (!recent) free(e->cur[k]);
-            e->cur[k] = NULL, e->cur_len[k] = 0;
-        }
+        mv_free_insts(e->old, e->nold);
+        e->old = recent ? e->cur : NULL, e->nold = recent ? e->ncur : 0;
+        if (!recent) mv_free_insts(e->cur, e->ncur);
+        e->cur = NULL, e->ncur = e->capcur = 0;
+        free(e->claimed);
+        e->claimed = e->nold ? calloc((size_t)e->nold, 1) : NULL;
         e->frame = f;
+    }
+    float sig[MV_SIG] = {0};
+    int ns = 0;
+    for (int k = 3; k < 18 && ns < MV_SIG; k++) {
+        if (!((p->vi->cbuf_mask >> k) & 1) || !st.ubuf[0][k - 3].addr) continue;
+        uint64_t len = st.ubuf[0][k - 3].size ? st.ubuf[0][k - 3].size : 256;
+        const float *src = (const float *)(uintptr_t)st.ubuf[0][k - 3].addr;
+        for (uint64_t i = 0; i < 16 && i * 4 < len && ns < MV_SIG; i++) sig[ns++] = isfinite(src[i]) ? src[i] : 0;
+    }
+    MvInst *in = NULL;
+    for (int i = 0; i < e->ncur && !in; i++)  // (the same object drawn again this frame)
+        if (!memcmp(e->cur[i].sig, sig, sizeof sig)) {
+            bool same = true;
+            for (int k = 3; k < 18 && same; k++)
+                if (e->cur[i].cb[k] && (!st.ubuf[0][k - 3].addr ||
+                    memcmp(e->cur[i].cb[k], (const void *)(uintptr_t)st.ubuf[0][k - 3].addr, e->cur[i].len[k]))) same = false;
+            if (same) in = &e->cur[i];
+        }
+    if (!in) {
+        if (e->ncur >= MV_MAXINST) { g_mv_stat[1]++; return; }
+        if (e->ncur == e->capcur) {
+            int nc = e->capcur ? e->capcur * 2 : 4;
+            MvInst *nv = realloc(e->cur, (size_t)nc * sizeof *nv);
+            if (!nv) { g_mv_stat[1]++; return; }
+            e->cur = nv, e->capcur = nc;
+        }
+        in = &e->cur[e->ncur++];
+        memset(in, 0, sizeof *in);
+        memcpy(in->sig, sig, sizeof sig);
         for (int k = 3; k < 18; k++) {
             if (!((p->vi->cbuf_mask >> k) & 1) || !st.ubuf[0][k - 3].addr) continue;
             uint64_t len = st.ubuf[0][k - 3].size ? st.ubuf[0][k - 3].size : 256;
             if (len > 0x10000) len = 0x10000;
-            e->cur[k] = malloc(len);
-            if (e->cur[k]) memcpy(e->cur[k], (const void *)(uintptr_t)st.ubuf[0][k - 3].addr, len), e->cur_len[k] = (uint32_t)len;
+            if (p->vi->cbuf_size[k] && len > p->vi->cbuf_size[k]) len = p->vi->cbuf_size[k];  // (only what it reads)
+            in->cb[k] = malloc(len);
+            if (in->cb[k]) memcpy(in->cb[k], (const void *)(uintptr_t)st.ubuf[0][k - 3].addr, len), in->len[k] = (uint32_t)len;
         }
+        in->prev = -1;  // (last frame's nearest unclaimed copy)
+        float best = INFINITY;
+        for (int i = 0; i < e->nold; i++) {
+            if (e->claimed[i]) continue;
+            float d = 0;
+            for (int j = 0; j < MV_SIG; j++) d += fabsf(e->old[i].sig[j] - sig[j]);
+            if (d < best) best = d, in->prev = i;
+        }
+        if (in->prev >= 0) e->claimed[in->prev] = 1;
     }
+    const MvInst *old = in->prev >= 0 ? &e->old[in->prev] : NULL;
     bool any = false, all = true;
     for (int k = 3; k < 18; k++) {
         if (!((p->vi->cbuf_mask >> k) & 1) || !st.ubuf[0][k - 3].addr) continue;
-        g_mvd.prev[k] = e->old[k], g_mvd.prev_len[k] = e->old_len[k];
+        g_mvd.prev[k] = old ? old->cb[k] : NULL, g_mvd.prev_len[k] = old ? old->len[k] : 0;
         any = true;
-        all &= e->old[k] != NULL;
+        all &= g_mvd.prev[k] != NULL;
     }
     float inv[16];
     if (!any || !all) { g_mv_stat[2]++; return; }
@@ -4138,7 +4213,8 @@ static void mv_prepare(const Prog *p, const CmdRec *r) {
     g_mv_stat[4]++;
     m4_mul(g_mvd.u, g_cam_prev, inv);
     g_mvd.u[16] = 1;
-    g_mvd.u[17] = p->vkey.flip_x, g_mvd.u[18] = p->vkey.flip_y, g_mvd.u[19] = p->vkey.depth_minus_one;
+    g_mvd.u[17] = vk->flip_x, g_mvd.u[18] = vk->flip_y, g_mvd.u[19] = vk->depth_minus_one;
+    g_scene_flip[0] = g_mvd.u[17], g_scene_flip[1] = g_mvd.u[18];
     g_mvd.valid = true;
 }
 
@@ -4206,15 +4282,16 @@ static void dlaa_run(NvnTexture *tex) {
                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, true);
     if (mv_enabled() && g_mv_img.image && g_mv_img.width == c->width && g_mv_img.height == c->height &&
         g_mv_clear_frame == renderer_present_count()) mv = &g_mv_img;  // (characters' own motion: mv_prog)
-    if (g_debug_frame && mv == &g_mv_img) {  // (F9: build/dlaa_motion.png - red / green = x / y x 200, blue = non-zero)
+    if (g_debug_frame && mv == &g_mv_img) {  // (F9: build/dlaa_motion.png - red / green = x / y x 20, blue = non-zero)
         static TexBackend viz;
         TexBackend *vb = dlaa_image(&viz, mv->width, mv->height, VK_FORMAT_R8G8B8A8_UNORM,
                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, false);
         VkImageView src[1] = {post_view(mv)};
-        float pv[8] = {200.0f};
+        float pv[8] = {20.0f};
         post_pass(cb, "mvviz.frag", src, 1, vb, pv, false);
         vk_full_barrier(cb);
         renderer_save_texture_tex(vb, "build/dlaa_motion.png");
+        cb = vk_cmd();  // (the save submitted the old command buffer)
     }
     TexBackend *o = dlaa_image(&out_img, c->width, c->height, c->format,
                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, false);
@@ -4286,10 +4363,43 @@ static void dlaa_run(NvnTexture *tex) {
         if (g_debug_frame) {  // (F9: the mask and its source)
             renderer_save_texture_tex(bi, "build/dlaa_charmask.png");
             renderer_save_texture_tex(gm, "build/dlaa_material.png");
+            cb = vk_cmd();
         }
         ib = (DlssImage){bi->image, post_view(bi), bi->format, bi->width, bi->height,
                          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
         pib = &ib;
+    }
+    // frame generation: the camera's motion added here (SL's own from depth, merged with ours, haloed the characters).
+    // LARECOMP_MV_SL_CAMERA=1: the old way.
+    static int sl_cam = -1;
+    if (sl_cam < 0) sl_cam = getenv("LARECOMP_MV_SL_CAMERA") != NULL;
+    if (!sl_cam) {
+        static TexBackend full_img;
+        TexBackend *fm = dlaa_image(&full_img, c->width, c->height, VK_FORMAT_R16G16_SFLOAT,
+                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT, false);
+        float pc80[20];
+        memcpy(pc80, k.clip_to_prev_clip, 64);
+        pc80[16] = g_scene_flip[0], pc80[17] = g_scene_flip[1], pc80[18] = pc80[19] = 1;
+        if (getenv("LARECOMP_OBJMV_SCALE")) sscanf(getenv("LARECOMP_OBJMV_SCALE"), "%f %f", &pc80[18], &pc80[19]);  // (test)
+        VkImageView src[2] = {idp.view, im.view};
+        g_post_pc80 = pc80;
+        post_pass(cb, "mvfull.frag", src, 2, fm, pc80, false);
+        vk_full_barrier(cb);
+        im = (DlssImage){fm->image, post_view(fm), fm->format, fm->width, fm->height,
+                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+        k.camera_motion = true;
+        if (g_debug_frame) {  // (F9: build/dlaa_motion_full.png, x / y x 20 around grey)
+            static TexBackend viz2;
+            TexBackend *vb = dlaa_image(&viz2, fm->width, fm->height, VK_FORMAT_R8G8B8A8_UNORM,
+                                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, false);
+            VkImageView s1[1] = {im.view};
+            float pv[8] = {20.0f};
+            post_pass(cb, "mvviz.frag", s1, 1, vb, pv, false);
+            vk_full_barrier(cb);
+            renderer_save_texture_tex(vb, "build/dlaa_motion_full.png");
+            cb = vk_cmd();
+        }
     }
     if (dlss_evaluate(cb, &ic, &idp, &im, pib, &io, &k, g_settings.frame_gen & 3, win.width, win.height)) {
         vk_full_barrier(cb);
@@ -4393,7 +4503,7 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     if (g_mv_pass && pr->vi->cbuf_dynamic && !pr->vi->uses_gmem && !pr->fi->uses_gmem && st.ds[0]) {  // (object motion)
         Prog *pm = mv_prog(pr);
-        if (pm) { mv_prepare(pr, r); pr = pm; }
+        if (pm) { mv_prepare(pr, r, &vkey); pr = pm; }
     }
     g_mirror_w = 0;
     {   // mirror mode (runtime/hle/mirror.c; as renderer.m): the scene's composite into the window image is mirrored
@@ -5399,7 +5509,7 @@ static VkPipeline post_pipeline(const char *fs) {
             b[i] = (VkDescriptorSetLayoutBinding){i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
         VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 3, .pBindings = b};
         VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &post_set_layout));
-        VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32};
+        VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80};
         VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
                                          .pSetLayouts = &post_set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &r};
         VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &post_layout));
@@ -5422,7 +5532,7 @@ static VkPipeline post_pipeline(const char *fs) {
                                               .pAttachments = &cba};
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn};
-    VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
+    VkFormat fmt = !strcmp(fs, "mvfull.frag") ? VK_FORMAT_R16G16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
     VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
                                         .pColorAttachmentFormats = &fmt};
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -5520,7 +5630,8 @@ static void post_pass(VkCommandBuffer cb, const char *fs, const VkImageView *src
     VkRect2D sc = {{0, 0}, {dst->width, dst->height}};
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdSetScissor(cb, 0, 1, &sc);
-    vkCmdPushConstants(cb, post_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pc);
+    vkCmdPushConstants(cb, post_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, g_post_pc80 ? 80 : 32, g_post_pc80 ? g_post_pc80 : pc);
+    g_post_pc80 = NULL;
     vkCmdDraw(cb, 3, 1, 0, 0);
     vkCmdEndRendering(cb);
 }

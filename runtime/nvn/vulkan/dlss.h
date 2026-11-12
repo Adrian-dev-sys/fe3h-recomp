@@ -23,6 +23,7 @@ typedef struct {
     float cam_pos[3], cam_up[3], cam_right[3], cam_fwd[3];
     float znear, zfar, fov, aspect;
     bool depth_inverted, reset;
+    bool camera_motion;  // the motion vectors already hold the camera's motion
 } DlssConstants;
 
 bool dlss_preinit(void);  // before vkCreateInstance

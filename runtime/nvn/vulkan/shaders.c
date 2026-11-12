@@ -392,6 +392,26 @@ static const char *builtin_src(const char *name, int *stage) {
                "void main() { vec2 m = texelFetch(t, ivec2(gl_FragCoord.xy), 0).xy * pc.a.x;\n"
                "  o = vec4(clamp(0.5 + m, 0.0, 1.0), any(notEqual(m, vec2(0.0))) ? 1.0 : 0.0, 1.0); }\n";
     }
+    // Full motion for DLSS / frame gen: the camera's (depth reprojected by m = clip -> last clip) plus the objects' own.
+    // f.xy: flip x / y of the clip space, f.zw: the objects' motion scale (test). Output in UV units, current -> last frame.
+    if (!strcmp(name, "mvfull.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D d;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D obj;\n"
+               "layout(push_constant) uniform P { mat4 m; vec4 f; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() { ivec2 ip = ivec2(gl_FragCoord.xy);\n"
+               "  vec2 uv = gl_FragCoord.xy / vec2(textureSize(d, 0));\n"
+               "  vec2 n = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);\n"
+               "  if (pc.f.x > 0.5) n.x = -n.x;\n  if (pc.f.y > 0.5) n.y = -n.y;\n"
+               "  vec4 p = pc.m * vec4(n, texelFetch(d, ip, 0).r, 1.0);\n"
+               "  vec2 mv = vec2(0.0);\n"
+               "  if (p.w > 1e-7) { vec2 q = p.xy / p.w;\n"
+               "    if (pc.f.x > 0.5) q.x = -q.x;\n    if (pc.f.y > 0.5) q.y = -q.y;\n"
+               "    mv = vec2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5) - uv; }\n"
+               "  o = vec4(mv + texelFetch(obj, ip, 0).xy * pc.f.zw, 0.0, 0.0); }\n";
+    }
     // DLAA's bias-current-colour mask from FE3H's G-buffer material target: green 1 on characters. a.x = the bias.
     if (!strcmp(name, "charmask.frag")) {
         *stage = STAGE_FRAGMENT;

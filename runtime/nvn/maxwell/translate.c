@@ -2458,9 +2458,11 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         if (dyn < 0) dyn = getenv("LARECOMP_DYN_FLOW") != NULL;
         c->flow_tgt = malloc((end + 4) * sizeof *c->flow_tgt);
         for (size_t i = 0; i < end + 4; i++) c->flow_tgt[i] = ~0u;
-        c->dyn_ssy = c->dyn_pbk = c->dyn_pcnt = dyn != 0;
+        // (compute keeps the run-time stacks: static flow made NVIDIA's compiler run out of memory on battle shaders)
+        bool dflow = dyn != 0 || stage == STAGE_COMPUTE;
+        c->dyn_ssy = c->dyn_pbk = c->dyn_pcnt = dflow;
         static const uint64_t push[3] = {0xe290000000000000ull, 0xe2a0000000000000ull, 0xe2b0000000000000ull};
-        for (size_t i = 0; i < end && !dyn; i++) {
+        for (size_t i = 0; i < end && !dflow; i++) {
             if (i % 4 == 0) continue;
             uint64_t w = ((const uint64_t *)code)[i];
             int kind = (w & 0xfff8000000000000ull) == 0xf0f8000000000000ull ? 0   // SYNC
