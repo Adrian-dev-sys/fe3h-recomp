@@ -22,6 +22,7 @@ int cheatvm_count(void);
 bool cheatvm_info(int i, CheatInfo *out);
 void cheatvm_set(int i, bool on);
 uint32_t cheat_word(uint64_t addr);  // the generated code's question: the active instruction there (0: the original)
+bool cheatvm_compiled(uint64_t addr, uint32_t word);  // that instruction variant is built into the game code
 bool cheatvm_settings_load(const char *key, const char *val);  // cheat.<name> = 1
 void cheatvm_settings_save(FILE *f);
 

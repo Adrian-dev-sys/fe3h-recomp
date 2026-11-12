@@ -17,10 +17,11 @@
 #include "../hle.h"
 #include "../ipc.h"
 #include "../romfs_build.h"
+#include "../mods.h"
 
 #define MAX_DLC 64
 
-typedef struct { uint64_t id; char dir[1024]; int fd; uint64_t size; } Dlc;
+typedef struct { uint64_t id; char dir[1024]; int fd; uint64_t size; Vfs *vfs; } Dlc;  // (vfs: with mods' files)
 static Dlc dlcs[MAX_DLC];
 static int ndlc = -1;  // -1: not scanned yet
 
@@ -105,12 +106,16 @@ static bool dlc_open(Dlc *x) {
     if (x->fd < 0) { LOG("[aoc] cannot open %s: %s\n", bin, strerror(errno)); return false; }
     fstat(x->fd, &sb);
     x->size = (uint64_t)sb.st_size;
+    char sub[64];
+    snprintf(sub, sizeof sub, "dlc/%016llX/romfs", (unsigned long long)x->id);
+    x->vfs = romfs_vfs_open(x->fd, sub);
+    if (x->vfs) x->size = romfs_vfs_size(x->vfs);
     return true;
 }
 
 RT_ON_RESET(aoc_reset) {
     for (int i = 0; i < ndlc; i++)
-        if (dlcs[i].fd >= 0) close(dlcs[i].fd), dlcs[i].fd = -1;
+        if (dlcs[i].fd >= 0) close(dlcs[i].fd), dlcs[i].fd = -1, romfs_vfs_free(dlcs[i].vfs), dlcs[i].vfs = NULL;
 }
 
 // ------------------------------------------------------------------ IStorage of one DLC's RomFS
@@ -123,7 +128,7 @@ static void dlc_storage(Service *s, IpcReq *req, IpcResp *resp) {
         if (!b) { resp->result = MAKE_RESULT(2, 6001); break; }
         if (size > b->size) size = b->size;
         uint8_t *dst = (uint8_t *)(uintptr_t)b->addr;
-        ssize_t n = off < x->size ? pread(x->fd, dst, size, (off_t)off) : 0;
+        ssize_t n = off >= x->size ? 0 : x->vfs ? romfs_vfs_read(x->vfs, dst, size, off) : pread(x->fd, dst, size, (off_t)off);
         if (n < 0) { LOG("[aoc] read %016llx at %llx: %s\n", (unsigned long long)x->id, (unsigned long long)off, strerror(errno)); n = 0; }
         if ((uint64_t)n < size) memset(dst + n, 0, size - n);
         break;

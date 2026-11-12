@@ -323,6 +323,12 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
 #else
         setenv("LARECOMP_CHEATS", cheats, 1);
 #endif
+        snprintf(cheats, sizeof cheats, "%s" SEP "mods", rt_data_root());  // (and the mods' exefs patches)
+#ifdef _WIN32
+        _putenv_s("LARECOMP_MODS", cheats);
+#else
+        setenv("LARECOMP_MODS", cheats, 1);
+#endif
     }
     for (int i = 0; i < NGEN && ok; i++) {
         Gen *g = &gens[i];

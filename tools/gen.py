@@ -587,6 +587,14 @@ def main():
         import cheats
         path = os.environ.get('LARECOMP_CHEATS', '../cheats.txt')  # (make gen runs in tools/: the project folder's)
         cv = cheats.code_variants(path, lambda off: m.in_text(args.base + off))
+        mods = os.environ.get('LARECOMP_MODS', '../mods')  # mods' exefs code patches too (runtime/mods.c)
+        mv = cheats.mod_variants(mods, m.nso.build_id, lambda off: m.in_text(args.base + off),
+                                 lambda off: m.word(args.base + off))
+        if mv:
+            print(f'[gen] {mods}: {len(mv)} instruction(s) with mod variants', file=sys.stderr)
+        for off, ws in mv.items():
+            vs = cv.setdefault(off, [])
+            vs += [w for w in ws if w not in vs]
         for off, ws in cv.items():
             VARIANTS[off] = ('cheat_word', ws)
         if cv:

@@ -19,6 +19,7 @@
 #include "../hle.h"
 #include "cheatvm.h"
 #include "../gamebuild.h"
+#include "../mods.h"
 
 #define MAX_CHEATS 128
 #define MAX_WORDS 1024
@@ -185,8 +186,16 @@ static void load(void) {
 uint32_t cheat_word(uint64_t addr) {
     // (no lock: a stale read for one frame is harmless; entries are written whole)
     for (int i = 0; i < g_ncode; i++)
-        if (g_code[i].addr == addr) return g_code[i].word;
-    return 0;
+        if (g_code[i].addr == addr && g_code[i].word) return g_code[i].word;
+    return mods_code_word(addr);  // (exefs patches of mods: runtime/mods.c)
+}
+
+bool cheatvm_compiled(uint64_t addr, uint32_t word) {
+    pthread_mutex_lock(&g_lock);
+    load();
+    bool ok = compiled(addr, word);
+    pthread_mutex_unlock(&g_lock);
+    return ok;
 }
 
 static void code_write(uint64_t addr, uint32_t word, int owner) {

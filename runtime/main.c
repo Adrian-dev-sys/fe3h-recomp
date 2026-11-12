@@ -137,6 +137,7 @@ static void boot(const char *root) {
     if (!gamelib_load(root, why, sizeof why)) FATAL("%s\n", why);
     loader_load(exefs);
     rando_boot();  // the chosen seed's data patches go into the freshly loaded module
+    { extern void mods_boot(void); mods_boot(); }  // mods' exefs patches (runtime/mods.c)
     { extern void settings_load(void); settings_load(); }
     kernel_init();
     dispatch_init();
