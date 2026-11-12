@@ -30,7 +30,7 @@ typedef struct {
     int res_mode;        // RES_MATCH, 1..4 / RES_X15 (N x the Switch's 1080p), RES_DYNAMIC, RES_Q75/50/25 (share of the display)
     int upscaler;        // UPSCALE_*: how a lower internal resolution reaches the window (MetalFX: macOS, FSR 1: Windows)
     int antialias;       // AA_*: anti-aliasing of the game image before it is scaled to the window
-    int dlaa_sharpen;    // 0 off, 1 low, 2 medium, 3 high: RCAS over DLAA's output (the 3D scene, before the UI), or
+    int dlaa_sharpen;    // 0 off, 1 low, 2 medium, 3 high, 4 / 5 + detail boost: RCAS over DLAA's output (the 3D scene, before the UI), or
                          // over the final image with SMAA / no AA
     int tex_detail;      // 0 normal; 1 / 2: the 3D scene's textures 1 / 2 mips sharper; 3: always the sharpest (as
                          // Fl4sh9174's Level of Detail mod)

@@ -126,7 +126,7 @@ void settings_load(void) {
                                   (n >= 1 && n <= 4) ? n : n > 4 ? 4 : RES_MATCH;  // (5x-8x were removed)
         }
         else if (!strcmp(key, "upscaler")) g_settings.upscaler = !strcmp(val, "bilinear") ? UPSCALE_BILINEAR : UPSCALE_SHARP;  // (metalfx / fsr1: this OS's)
-        else if (!strcmp(key, "dlaa_sharpen")) g_settings.dlaa_sharpen = atoi(val) < 0 ? 0 : atoi(val) > 3 ? 3 : atoi(val);
+        else if (!strcmp(key, "dlaa_sharpen")) g_settings.dlaa_sharpen = atoi(val) < 0 ? 0 : atoi(val) > 5 ? 5 : atoi(val);
         else if (!strcmp(key, "texture_detail")) g_settings.tex_detail = atoi(val) < 0 ? 0 : atoi(val) > 3 ? 3 : atoi(val);
         else if (!strcmp(key, "frame_gen")) g_settings.frame_gen = atoi(val) < 0 ? 0 : atoi(val) > 3 ? 3 : atoi(val);
         else if (!strcmp(key, "antialias")) g_settings.antialias = !strcmp(val, "off") ? AA_OFF : !strcmp(val, "dlaa") ? AA_DLAA : AA_SMAA;  // ("fxaa": SMAA now)

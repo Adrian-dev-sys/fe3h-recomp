@@ -506,10 +506,11 @@ static void tab_display(void) {
                "(NVIDIA RTX): steadies edges over several frames, so hair and outlines stop shimmering; without an "
                "RTX GPU it falls back to SMAA.");
     {
-        static const char *sh[] = {"Off", "Low", "Medium", "High"};
-        opt_choice("Sharpening", &g_settings.dlaa_sharpen, sh, 4, 2,
+        static const char *sh[] = {"Off", "Low", "Medium", "High", "Very high", "Extreme"};
+        opt_choice("Sharpening", &g_settings.dlaa_sharpen, sh, 6, 2,
                    "Sharpens the image (AMD's RCAS). With DLAA: the 3D scene only, menus and text are not touched. With "
-                   "SMAA or no anti-aliasing: the final image, after it is scaled to the window.");
+                   "SMAA or no anti-aliasing, or an internal resolution above the window's: the final image, after it "
+                   "is scaled to the window. Very high and Extreme also bring out fine texture grain (bricks, stone).");
         static const char *td[] = {"Normal", "High", "Very high", "Max"};
         opt_choice("Texture detail", &g_settings.tex_detail, td, 4, 0,
                    "How sharp the 3D scene's textures are at a distance (walls, floors, faces). The game blurs distant "

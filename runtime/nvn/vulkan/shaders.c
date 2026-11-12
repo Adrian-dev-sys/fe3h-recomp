@@ -446,7 +446,16 @@ static const char *builtin_src(const char *name, int *stage) {
                "  vec3 hitMax = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, vec3(-1.0 / 65536.0));\n"
                "  vec3 lobeRGB = max(-hitMin, hitMax);\n"
                "  float lobe = max(-(0.25 - 1.0 / 16.0), min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * pc.a.x * nz;\n"
-               "  o = vec4((lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0), 1.0);\n"
+               "  vec3 r = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);\n"
+               "  if (pc.a.z > 0.0) {\n"  // (a.z: extra boost of low-contrast detail; strong edges and text are left alone)
+               "    vec3 a = tap(ip + ivec2(-1, -1)), c = tap(ip + ivec2(1, -1)), g = tap(ip + ivec2(-1, 1)), i = tap(ip + ivec2(1, 1));\n"
+               "    float aL = lum(a), cL = lum(c), gL = lum(g), iL = lum(i);\n"
+               "    float r9 = max(max(max(aL, cL), max(gL, iL)), rng + min(min(min(bL, dL), min(eL, fL)), hL))\n"
+               "             - min(min(min(aL, cL), min(gL, iL)), min(min(min(bL, dL), min(eL, fL)), hL));\n"
+               "    vec3 blur = (4.0 * e + 2.0 * (b + d + f + h) + a + c + g + i) / 16.0;\n"
+               "    r += (e - blur) * pc.a.z * 2.0 * (1.0 - smoothstep(0.15, 0.6, 0.5 * r9));\n"
+               "  }\n"
+               "  o = vec4(clamp(r, 0.0, 1.0), 1.0);\n"
                "}\n";
     }
     // Supersampling resolve: each output pixel averages the source texels it covers (area weights, linear light).
