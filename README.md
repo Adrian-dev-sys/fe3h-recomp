@@ -3,15 +3,38 @@
 A static recompilation of *Fire Emblem: Three Houses* (Nintendo Switch, 2019) into a native Windows application,
 built on [LAS Recomp](https://github.com/peiikai/LASRecomp) by Peiikai.
 
-> [!IMPORTANT]
-> **This is a personal project, and I made it mostly for myself.** I wanted to play *Three Houses* on my PC at a steady 60fps
-> and a higher resolution, and so far emulators haven't given me the experience I'm after. So I built this instead, with a
-> significant amount of help from an AI (Anthropic's Claude wrote most of the FE3H-specific code; I directed and tested).
->
-> I'm doing this casually, in my spare time, and I'm not planning to pour a ton of time, energy or resources into it.
-> Honestly, I doubt I'll finish a full playthrough before GTA VI comes out, and once that happens this will probably
-> fall by the wayside for a while. It's shared as-is, and I can't promise any ongoing support. Run it at your own
-> discretion.
+## About this fork
+
+This is a personal fork of [FE3H Recomp](https://github.com/Bakanda07/fe3h-recomp), made for my own use. It has no
+releases of its own: build it from source as described below. Its changes were written with an AI assistant (Claude)
+and tested by hand on one Windows PC with an NVIDIA GPU and a 3440x1440 ultrawide screen. Its additions include:
+
+- **Ultrawide** (21:9 and wider): the 3D view fills the screen while the HUD, menus and movies stay in 16:9; map unit
+  icons, monastery speech bubbles and name tags stay over their characters (also when zoomed in).
+- **Resolution and sharpness:** internal resolution with a supersampling resolve (1.5x and up) and a sharp UI, forced
+  16x anisotropic filtering, a texture detail option, and RCAS sharpening levels up to Extreme.
+- **NVIDIA DLAA and DLSS Frame Generation** (2x-4x, with Reflex) through Streamline. The game logic stays at its
+  fixed 60 Hz; frame generation adds the extra frames.
+- **Rendering fixes:** full-resolution lighting (faces and walls no longer blurred above 1x), character motion
+  vectors, shadow-mask artefacts, black boxes from NaN pixels, DLC map floor lights cutting off.
+- **Performance:** 2x internal resolution went from about 44 to a steady 60 fps (shader local memory sizing, static
+  branch targets, light lists in GPU memory), and a host-side frame limiter.
+- **Mods** in the usual Switch layout from a `mods/` folder: game files, DLC files and exefs code patches (`.pchtxt` /
+  `.ips`). A Mods tab in Settings switches them on and off, sets their load order by drag and drop and warns when two
+  enabled mods change the same files. See [docs/mods.md](docs/mods.md).
+- **Debug launchers** used while making these changes (F9 frame capture, GPU profiling and others) are kept in
+  [tools/debug](tools/debug).
+
+The NVIDIA libraries are not included. To use DLAA and frame generation, put the
+[Streamline SDK](https://github.com/NVIDIA-RTX/Streamline)'s `sl.interposer.dll`, `sl.common.dll`, `sl.dlss.dll`,
+`nvngx_dlss.dll` and, for frame generation, `sl.dlss_g.dll`, `nvngx_dlssg.dll`, `sl.reflex.dll`, `sl.pcl.dll` and
+`NvLowLatencyVk.dll` next to `fe3hrecomp.exe`. Without them the game runs as before, with SMAA.
+
+Credits for this fork's additions: Bakanda07 (FE3H Recomp) and Peiikai with the LAS Recomp contributors, whose work
+all of this builds on; NVIDIA for the Streamline SDK headers (MIT, `third_party/streamline`); the Switch modding
+community (Atmosphere, yuzu, Ryujinx) for the LayeredFS mod layout and the IPSwitch `.pchtxt` / IPS patch formats,
+which the mod loader reads (written anew, no code copied); and Fl4sh9174's "Level of Detail" mod for FE3H, which
+inspired the texture detail option.
 
 > [!NOTE]
 > **No game files are included**, and no instructions for obtaining them are provided. You need your own legally
@@ -185,6 +208,8 @@ Nothing owned by Nintendo is ever committed: no game files, no extracted or gene
   are ports of its implementation.
 - **[EB Garamond](https://github.com/georgd/EB-Garamond)** by Georg Duffner: the start screen's title (SIL Open Font License
   1.1, `third_party/fonts/EBGaramond/OFL.txt`).
+- **[NVIDIA Streamline](https://github.com/NVIDIA-RTX/Streamline)** (MIT): the SDK headers for DLAA and frame generation.
+  The DLSS runtime libraries are NVIDIA's and are not included.
 - **[AMD FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR)** (MIT) and
   **[SMAA](https://github.com/iryoku/smaa)** (MIT), as used by LAS.
 - **Libraries:** [SDL 3](https://libsdl.org) (zlib), [FFmpeg](https://ffmpeg.org) (LGPL),
