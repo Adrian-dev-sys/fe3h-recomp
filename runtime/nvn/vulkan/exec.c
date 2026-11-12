@@ -1083,6 +1083,7 @@ void renderer_save_texture_tex(TexBackend *b, const char *path);
 static float pass_sx = 1, pass_sy = 1;
 static float vp_sx = 1, vp_sy = 1, vp_ox = 0, vp_oy = 0;
 static float sc_box;  // (this draw's UI box factor, for its scissor; 0 = none)
+static float g_label_dx;  // (this draw's world-label shift in pass pixels; ui_world_label)
 static float tex_sc[2][64][2];
 static uint32_t tex_wh[2][64][2];
 
@@ -2711,6 +2712,7 @@ static VmaAllocation gfast_mem;
 static uint32_t gmap_tab[(GMAP_MAX + 1) * 4];  // this dispatch's table (stage_set copies it into binding 20)
 static VkBufferCopy gfast_cp[GMAP_MAX];       // its copies heap -> gfast_buf (reversed after a storing dispatch)
 static int gfast_n;
+static uint64_t g_heap_gpu_gen;  // bumped after a dispatch stores to the heap (bf_gpu_copy: copies stale)
 
 static VkDescriptorBufferInfo gfast_info(void) {
     if (!gfast_buf) {
@@ -2783,6 +2785,7 @@ static void gfast_finish(VkCommandBuffer cb) {
     vkCmdCopyBuffer(cb, gfast_buf, gmem_buf, (uint32_t)gfast_n, back);
     vk_full_barrier(cb);
     gfast_n = 0;
+    g_heap_gpu_gen++;  // (buffer-texture copies of the heap are stale now: bf_gpu_copy)
 }
 
 // ---- vertex / index cache
@@ -3142,45 +3145,74 @@ static bool mv_binding(const VkBindingInfo *b, int stage, ShaderInfo *si, VkDesc
 // light lists there for every pixel and light (16 of 20 ms a frame at 2x). A stage whose only heap reads are
 // buffer textures gets their ranges copied into the device-local ring instead (once per submission) and its heap
 // binding pointed there. LARECOMP_VK_BFETCH_HEAP=1: the old way.
+// The copy is a GPU copy recorded before the draw's pass (bf_gpu_copy): the lists are GPU-written (a CPU memcpy at
+// record time read last frame's - lights cut off in tiles while the camera moved, DLC map). CPU copy: fallback.
 static struct { bool valid; VkSpan span; uint64_t total, key; uint32_t off[64]; bool has[64]; } g_bf;
-static void bf_prepare(Prog *p, int stage, ShaderInfo *si) {
+typedef struct { uint64_t key, total, addr[64], len[64]; uint32_t off[64]; bool has[64]; } BfRanges;
+static bool bf_ranges(Prog *p, int stage, ShaderInfo *si, BfRanges *b) {
     static int off = -1;
     if (off < 0) off = getenv("LARECOMP_VK_BFETCH_HEAP") != NULL;
     int sg = stage == 1 ? 1 : 0;
-    g_bf.valid = false;
-    if (off || (stage != 0 && stage != 1) || !si->uses_gmem || !si->msl) return;
+    if (off || (stage != 0 && stage != 1) || !si || !si->uses_gmem || !si->msl) return false;
     if (!p->bf_only[sg]) {  // (bfetch_at holds the shader's only 4 heap reads)
         int n = 0;
         for (const char *q = strstr(si->msl, "gmem_.w["); q; q = strstr(q + 8, "gmem_.w[")) n++;
         p->bf_only[sg] = n == 4 && strstr(si->msl, "vec4 bfetch_at(") ? 1 : 2;
     }
-    if (p->bf_only[sg] != 1) return;
-    uint64_t key = vk_pending_seq() * 0x9E3779B97F4A7C15ull ^ gcopy_gen, total = 0;
-    uint32_t offs[64];
-    bool has[64] = {0};
-    const uint8_t *src[64];
-    uint64_t len[64];
+    if (p->bf_only[sg] != 1) return false;
+    memset(b->has, 0, sizeof b->has);
+    b->key = vk_pending_seq() * 0x9E3779B97F4A7C15ull ^ g_heap_gpu_gen, b->total = 0;
     for (int t = 0; t < si->ntex && t < 32; t++) {
         if (si->tex[t].type != TEXTYPE_1D) continue;
         NvnTexture *bt = shader_texture_object(stage, &si->tex[t]);
         if (!bt || bt->target != 10 || bt->addr < HEAP_BASE) continue;
         const FormatInfo *fi = nvn_format_info(bt->format);
-        len[t] = (uint64_t)bt->width * (fi && fi->bpb ? fi->bpb : 4);
-        if (!len[t] || len[t] > (64ull << 20)) continue;
-        src[t] = (const uint8_t *)(uintptr_t)bt->addr;
-        offs[t] = (uint32_t)total, has[t] = true;
-        total += (len[t] + 255) & ~255ull;
-        key = (key ^ bt->addr) * 0x100000001B3ull ^ len[t];
+        uint64_t len = (uint64_t)bt->width * (fi && fi->bpb ? fi->bpb : 4);
+        if (!len || len > (64ull << 20)) continue;
+        b->addr[t] = bt->addr, b->len[t] = len;
+        b->off[t] = (uint32_t)b->total, b->has[t] = true;
+        b->total += (len + 255) & ~255ull;
+        b->key = (b->key ^ bt->addr) * 0x100000001B3ull ^ len;
     }
-    if (!total) return;
-    if (!g_bf.span.buf || g_bf.key != key || g_bf.total != total) {  // (once per submission and set of ranges)
+    return b->total != 0;
+}
+// Before the draw's pass: a new set of ranges is copied heap -> ring on the GPU, in order after earlier GPU writes
+static void bf_gpu_copy(Prog *p, int stage, ShaderInfo *si) {
+    BfRanges b;
+    if (!bf_ranges(p, stage, si, &b) || (g_bf.span.buf && g_bf.key == b.key && g_bf.total == b.total)) return;
+    VkBufferCopy cp[64];
+    int n = 0;
+    for (int t = 0; t < 64; t++) {
+        if (!b.has[t]) continue;
+        if (!gmem_buf || b.addr[t] + b.len[t] > HEAP_BASE + gmem_size) return;  // (stage_set copies on the CPU)
+        cp[n++] = (VkBufferCopy){b.addr[t] - HEAP_BASE, 0, b.len[t]};
+    }
+    VkSpan s = vk_transient(b.total, 256);
+    if (!s.buf) return;
+    n = 0;
+    for (int t = 0; t < 64; t++) if (b.has[t]) cp[n++].dstOffset = s.off + b.off[t];
+    vk_end_pass();
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    vkCmdCopyBuffer(cb, gmem_buf, s.buf, (uint32_t)n, cp);
+    vk_full_barrier(cb);
+    g_bf.span = s, g_bf.total = b.total, g_bf.key = b.key;
+}
+static void bf_prepare(Prog *p, int stage, ShaderInfo *si) {
+    g_bf.valid = false;
+    BfRanges b;
+    if (!bf_ranges(p, stage, si, &b)) return;
+    uint64_t total = b.total;
+    uint32_t *offs = b.off;
+    bool *has = b.has;
+    if (!g_bf.span.buf || g_bf.key != b.key || g_bf.total != total) {  // (not copied before the pass: on the CPU)
         VkSpan s = vk_transient(total, 256);
         if (!s.ptr) return;
-        for (int t = 0; t < si->ntex && t < 32; t++) if (has[t]) memcpy((uint8_t *)s.ptr + offs[t], src[t], len[t]);
-        g_bf.span = s, g_bf.total = total, g_bf.key = key;
+        for (int t = 0; t < 64; t++) if (has[t]) memcpy((uint8_t *)s.ptr + offs[t], (const void *)(uintptr_t)b.addr[t], b.len[t]);
+        g_bf.span = s, g_bf.total = total, g_bf.key = b.key;
     }
-    memcpy(g_bf.off, offs, sizeof offs);
-    memcpy(g_bf.has, has, sizeof has);
+    memcpy(g_bf.off, offs, sizeof g_bf.off);
+    memcpy(g_bf.has, has, sizeof g_bf.has);
     g_bf.valid = true;
 }
 static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
@@ -3771,6 +3803,40 @@ static bool ui_world_icons(CmdRec *r, bool indexed) {
     if (!(prev >> ord & 1) || (prev_big >> ord & 1) || (big >> ord & 1)) return false;
     g_vs_nrows = nq;
     if (g_debug_frame) LOG("[draw]   world icon: %d quads, layout %d\n", nq, ord);
+    return true;
+}
+
+// FE3H ultrawide: world-anchored 2D labels (monastery speech bubbles, name tags, quest marks) are depth-writing UI
+// draws placed with the widened camera. Boxed whole they drift to the centre; instead each keeps its anchor on the
+// wide screen (a viewport shift) and only its size is boxed. A draw inside the previous one's bbox (a bubble's text
+// in its frame) shares that anchor. Returns the anchor's clip x.
+static bool ui_world_label(CmdRec *r, bool indexed, float *ax) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_NO_LABEL_FIX") != NULL;
+    const float *u = (const float *)(uintptr_t)st.ubuf[0][0].addr;
+    float w = (float)st.rt.color[0]->width, h = (float)st.rt.color[0]->height;
+    if (off || !u || st.ubuf[0][0].size < 16 || fabsf(u[0] * w - 2) > 0.02f || fabsf(fabsf(u[1]) * h - 2) > 0.02f) return false;
+    // labels: depth test GEQUAL + write, one small z per draw (their world depth); menus' masks / minimap differ
+    if (!st.ds[0] || !st.ds[1] || st.ds[2] != 7 || indexed || !st.vbuf[0].addr || st.stream[0][0] < 12 || !r->x[2] || r->x[2] > 8192)
+        return false;
+    float b[4] = {1e9f, 1e9f, -1e9f, -1e9f}, z0 = 0;
+    for (uint64_t v = 0; v < r->x[2]; v++) {
+        uint64_t o = (r->x[1] + v) * st.stream[0][0];
+        if (o + 12 > st.vbuf[0].size) return false;
+        const float *p = (const float *)(uintptr_t)(st.vbuf[0].addr + o);
+        if (!v) z0 = p[2];
+        if (p[2] != z0 || !(z0 > 0 && z0 < 0.2f)) return false;
+        b[0] = fminf(b[0], p[0]), b[1] = fminf(b[1], p[1]), b[2] = fmaxf(b[2], p[0]), b[3] = fmaxf(b[3], p[1]);
+    }
+    if (b[2] - b[0] > w * 0.6f) return false;  // (not a label: spans the screen)
+    static uint64_t frame = ~0ull, cbuf;
+    static float a[4];
+    static bool have;
+    uint64_t f = renderer_present_count();
+    if (f != frame || st.ubuf[0][0].addr != cbuf) frame = f, cbuf = st.ubuf[0][0].addr, have = false;
+    if (!(have && b[0] >= a[0] - 2 && b[1] >= a[1] - 2 && b[2] <= a[2] + 2 && b[3] <= a[3] + 2)) memcpy(a, b, sizeof a), have = true;
+    *ax = (a[0] + a[2]) * 0.5f * u[0] + u[2];
+    if (g_debug_frame) LOG("[draw]   world label: bbox %.0f %.0f %.0f %.0f, anchor x %.1f\n", b[0], b[1], b[2], b[3], (a[0] + a[2]) * 0.5f);
     return true;
 }
 
@@ -4568,6 +4634,8 @@ static void draw_(CmdRec *r, bool indexed) {
     snap_reason = "draw-colorwrite";
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i] && ((st.channel_mask >> (i * 4)) & 0xF)) snapshots_invalidate(st.rt.color[i]);
+    bf_gpu_copy(pr, 0, pr->vi);  // (light lists: copied outside the pass)
+    bf_gpu_copy(pr, 1, pr->fi);
     begin_pass();
     VkCommandBuffer cb = vk_cmd();
 
@@ -4731,7 +4799,7 @@ static void draw_(CmdRec *r, bool indexed) {
     // ---- textures first (their scales feed the widescreen decision and the rscale table), then the viewport
     float *vp = st.viewport[0];
     float zn = st.depth_range[0][0], zf = st.depth_range[0][1];
-    vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0; sc_box = 0;
+    vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0; sc_box = 0; g_label_dx = 0;
     {   // the Items page's cursor brackets while the cursor is on the companion card (runtime/hle/pets.c)
         extern bool pets_hide_item_cursor(void);
         extern bool texpatch_is_item_cursor(int id);
@@ -4834,8 +4902,15 @@ static void draw_(CmdRec *r, bool indexed) {
             Pipe *bp = pipe_get(&k);
             if (!wait_built(&bp->state, &bp->waited_ns)) SKIP(SK_PIPE, "vs box pipeline building\n");
             if (ss_need(SS_PIPE, ss.pipe == bp->pipe)) { ss.pipe = bp->pipe; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, bp->pipe); }
-            float rs0[4] = {1, 1, 0, 0};
-            if (ui_world_icons(r, indexed)) rs0[2] = 1, rs0[3] = (float)r->x[1];  // (centres: g_vs_rows)
+            float rs0[4] = {1, 1, 0, 0}, lax;
+            // (labels first: with a menu open the bubble layout passed as the icon layout and its quads split apart)
+            bool icon = ui_world_icons(r, indexed), label = ui_world_label(r, indexed, &lax);
+            if (label) {  // (whole pixels: the 2D snap stays aligned)
+                int pw_, ph_;
+                pass_size(&pw_, &ph_);
+                g_label_dx = roundf((1 - q / 65535.0f) * lax * pw_ * 0.5f);
+            }
+            else if (icon) rs0[2] = 1, rs0[3] = (float)r->x[1];  // (centres: g_vs_rows)
             else if (ui_camera_16x9()) rs0[1] = 2;  // (tilted menu plates, forecast, battle HUD: w != 1)
             else if (video || ui_edge_sprite(r, indexed)) rs0[0] = 2;  // (its screen-edge vertices are not a fill's)
             int pw_, ph_;
@@ -4843,7 +4918,7 @@ static void draw_(CmdRec *r, bool indexed) {
             g_vs_px[0] = (float)pw_, g_vs_px[1] = (float)ph_;
             vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, rs0, NULL, 0, 0, 0, NULL);
             g_vs_nrows = 0, g_vs_px[0] = g_vs_px[1] = 0;
-            if (rs0[2] == 0) sc_box = q / 65535.0f;  // (world icons keep the wide scissor)
+            if (rs0[2] == 0 && !label) sc_box = q / 65535.0f;  // (world icons / labels keep the wide scissor)
             composite = true;  // (full-width viewport: nothing clipped at the box edges)
         }
         if (!composite) {
@@ -4858,7 +4933,8 @@ static void draw_(CmdRec *r, bool indexed) {
     {   // camera-attached effects sized for 16:9 are widened with the view (runtime/hle/widescreen.c)
         extern float widescreen_effect_stretch(uint64_t fs_hash);
         float k = widescreen_effect_stretch(g_cur_fs_hash);
-        float vx = vp[0] * vp_sx + vp_ox, vw = vp[2] * vp_sx;
+        float vx = vp[0] * vp_sx + vp_ox + g_label_dx, vw = vp[2] * vp_sx;
+        g_label_dx = 0;
         if (k > 1.0f) { vx -= vw * (k - 1) / 2; vw *= k; }
         float jx = 0, jy = 0;
         if (dlaa_jittered()) jx = g_jit[0], jy = g_jit[1];  // (DLAA: the scene a sub-pixel off each frame)
@@ -5145,6 +5221,21 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             LOG("\n");
         }
         uint32_t sd = st.stream[0][0];
+        if (!indexed && st.vbuf[0].addr && sd >= 8 && r->x[2] > 6) {  // (bigger 2D batches: bbox + the first 8 quads')
+            float b[4] = {1e9f, 1e9f, -1e9f, -1e9f};
+            LOG("[draw]   quads:");
+            for (uint64_t k = 0; k < r->x[2] && k < 8192; k++) {
+                uint64_t off = (r->x[1] + k) * sd;
+                if (off + 8 > st.vbuf[0].size) break;
+                const float *q = (const float *)(uintptr_t)(st.vbuf[0].addr + off);
+                b[0] = fminf(b[0], q[0]), b[1] = fminf(b[1], q[1]), b[2] = fmaxf(b[2], q[0]), b[3] = fmaxf(b[3], q[1]);
+                static float qb[4];
+                if (k % 6 == 0) qb[0] = qb[1] = 1e9f, qb[2] = qb[3] = -1e9f;
+                qb[0] = fminf(qb[0], q[0]), qb[1] = fminf(qb[1], q[1]), qb[2] = fmaxf(qb[2], q[0]), qb[3] = fmaxf(qb[3], q[1]);
+                if (k % 6 == 5 && k < 48) LOG(" [%.0f %.0f %.0f %.0f]", qb[0], qb[1], qb[2], qb[3]);
+            }
+            LOG(" | bbox %.1f %.1f %.1f %.1f\n", b[0], b[1], b[2], b[3]);
+        }
         if (!indexed && st.vbuf[0].addr && sd >= 24 && r->x[2] <= 6) {  // (small non-indexed draws: each vertex's first 6 floats)
             float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
             for (uint64_t k = 0; k < r->x[2]; k++) {
@@ -5160,10 +5251,10 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
                 icon_scan_add(bx0, by0, bx1, by1, st.vbuf[0].addr, st.vbuf[0].size);
             }
         }
-        if (st.ubuf[0][0].addr) {  // vertex cbuf c3: the first 16 floats (transform)
+        if (st.ubuf[0][0].addr) {  // vertex cbuf c3 (UI sprites: their rows 33-34 too)
             const float *u = (const float *)(uintptr_t)st.ubuf[0][0].addr;
             LOG("[draw]   vcb0:");
-            for (int k = 0; k < 64 && k * 4 < (int)st.ubuf[0][0].size; k++) LOG(" %.6g", u[k]);
+            for (int k = 0; k < 144 && k * 4 < (int)st.ubuf[0][0].size; k++) LOG(" %.6g", u[k]);
             LOG("\n");
         }
         for (int c = 3; c < 21; c++) {  // (cbuf_mask bits are cbuf indices; ubuf[] starts at c3)
