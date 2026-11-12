@@ -3784,6 +3784,7 @@ static NvnTexture *g_gbuf_mat;    // its material target (green: characters)
 static uint64_t g_dl_frame = ~0ull, g_scene_frame = ~0ull;
 static float g_cam[16], g_cam_prev[16], g_cam_cand[16], g_jit[2];
 static bool g_cam_ok, g_cam_prev_ok, g_dlaa_pending, g_dlaa_ran, g_dlaa_tried, g_dlaa_seen;  // (tried: once a frame)
+static bool g_resolve_down, g_dlaa_sharpen_late;  // the last present averaged down to the window; DLAA left its RCAS to that step
 static int g_cam_hits;
 // (test, LARECOMP_JITTER_TEST + F10) the jitter's sign as passed to DLSS: 0 (+x +y), 1 (-x +y), 2 (+x -y), 3 (-x -y),
 // 4 no jitter
@@ -3867,6 +3868,7 @@ static void dlaa_track(void) {
         g_cam_prev_ok = g_cam_ok && g_dlaa_ran;
         if (g_cam_ok) memcpy(g_cam_prev, g_cam, 64);
         g_cam_ok = false, g_cam_hits = 0, g_dlaa_pending = false, g_dlaa_ran = false, g_dlaa_tried = false, g_dlaa_seen = false;
+        g_dlaa_sharpen_late = false;
         int i = (int)(f % 16) + 1;
         g_jit[0] = halton(i, 2) - 0.5f, g_jit[1] = halton(i, 3) - 0.5f;
         if (g_jit_mode == 4) g_jit[0] = g_jit[1] = 0;  // (test: no jitter)
@@ -4405,7 +4407,9 @@ static void dlaa_run(NvnTexture *tex) {
         vk_full_barrier(cb);
         static const float stops[4] = {-1, 1.0f, 0.5f, 0.2f};  // (RCAS: exp2(-stops); 0.2 is AMD's default, fairly strong)
         float sh = stops[g_settings.dlaa_sharpen & 3];
-        if (sh >= 0 && c->format == VK_FORMAT_R8G8B8A8_UNORM) {  // (the scene only: the UI is drawn after this)
+        // internal res above the window: sharpen after the resolve instead (the box average undoes RCAS done here)
+        g_dlaa_sharpen_late = sh >= 0 && g_resolve_down && !getenv("LARECOMP_DLAA_SHARPEN_EARLY");
+        if (sh >= 0 && !g_dlaa_sharpen_late && c->format == VK_FORMAT_R8G8B8A8_UNORM) {  // (the scene only: the UI is drawn after this)
             float pr[8] = {exp2f(-sh), 0, 0, 0, (float)o->width, (float)o->height};
             VkImageView in[3] = {io.view};
             post_pass(cb, "rcas.frag", in, 1, c, pr, false);
@@ -5193,12 +5197,12 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             while (*p && *p != ',') p++;
             while (*p == ',') p++;
         }
-        static uint64_t done[32];
+        static uint64_t done[160];
         static int ndone;
         static uint64_t done_frame = ~0ull;
         if (done_frame != renderer_present_count()) done_frame = renderer_present_count(), ndone = 0;
         for (int k = 0; k < ndone; k++) if (done[k] == g_cur_fs_hash) want = false;
-        if (want && ndone < 32) {
+        if (want && ndone < 160) {
             extern uint32_t g_save_layer;
             done[ndone++] = g_cur_fs_hash;
             void renderer_save_depth_tex(TexBackend *b, const char *prefix);
@@ -5648,7 +5652,8 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
     // larger than the window: average every source pixel (bilinear would skip most of them and keep the shimmer)
     bool down = !fsr && ow && oh && (ow + 1 < b->width || oh + 1 < b->height) && !getenv("LARECOMP_NO_RESOLVE");
     static const float stops[4] = {-1, 1.0f, 0.5f, 0.2f};  // (as DLAA's: exp2(-stops))
-    bool sharpen = !fsr && g_settings.antialias != AA_DLAA && stops[g_settings.dlaa_sharpen & 3] >= 0;
+    bool sharpen = !fsr && (g_settings.antialias != AA_DLAA || (down && g_dlaa_sharpen_late)) && stops[g_settings.dlaa_sharpen & 3] >= 0;
+    g_resolve_down = down;
     if (!smaa && !fsr && !down && !sharpen) return v;
     extern void vk_frame_suspend(void);
     extern void vk_frame_resume(void);
@@ -5691,7 +5696,9 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
     if (sharpen) {  // (SMAA / no AA: RCAS over the final image, at the window's size - as Ryujinx's FSR filter)
         uint32_t sw = down ? ow : b->width, sh = down ? oh : b->height;
         TexBackend *r = post_image(6, sw, sh);
-        float pr[8] = {exp2f(-stops[g_settings.dlaa_sharpen & 3]), 0, 0, 0, (float)sw, (float)sh};
+        float pr[8] = {exp2f(-stops[g_settings.dlaa_sharpen & 3]), 1, 0, 0, (float)sw, (float)sh};  // (no noise damping)
+        static int late = -1;
+        if (late != (int)g_dlaa_sharpen_late) LOG("[post] rcas at %ux%u (after dlaa: %d)\n", sw, sh, late = g_dlaa_sharpen_late);
         VkImageView ri_[3] = {v};
         post_pass(cb, "rcas.frag", ri_, 1, r, pr, false);
         v = post_view(r);

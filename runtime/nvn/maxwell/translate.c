@@ -18,6 +18,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 
 #include "shader.h"
@@ -91,6 +92,11 @@ typedef struct {
     // local memory words (a power of two): the SPH's own size, not a fixed 1 KB zeroed per invocation - FE3H's
     // deferred lighting zeroed 256 words of scratch for every pixel before its first light (most of 13 ms at 2x)
     unsigned lmem_words;
+    // registers holding the fragment's own guest pixel coordinate (comp + 1): as f32, or copied into a half lane.
+    // An F2I of such a half reads the f32 instead: halves have 11 bits, pixel centres past 512 round to a neighbour
+    uint8_t fc_reg[256], fc_half[256][2];
+    int fc_new_reg, fc_new_kind, fc_new_val;  // set by the instruction being translated (kind 0 f32, 1 low, 2 high half)
+    bool fc_guarded;
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
@@ -258,6 +264,7 @@ static void attr_load(Ctx *c, int dst, uint32_t addr, const char *idx) {
             } else if (comp < 2) {  // guest pixel units: the render target may be allocated larger
                 c->uses_rscale = true;
                 sprintf(e, "as_type<uint>((in.pos[%d] - rscale[0][%d]) / rscale[0][%d])", comp, comp + 2, comp);
+                if (c->glsl && !c->fc_guarded) { c->fc_new_reg = dst; c->fc_new_kind = 0; c->fc_new_val = comp + 1; }
             } else {
                 sprintf(e, "as_type<uint>(in.pos[%d])", comp);
             }
@@ -403,6 +410,12 @@ static bool emit_half(Ctx *c, uint64_t w) {
         }
         sprintf(t, kind == 0 ? "(%s + %s)" : "(%s * %s)", HS(R(a), swa, nega, absa), HS(bv, swb, negb, absb));
         hstore(c, d, t, merge, sat);
+        if (kind == 0 && form == 0 && (merge == 2 || merge == 3) && !sat && !c->fc_guarded) {  // pixel coordinate + 0 -> half
+            int b = (int)bits(w, 20, 8), v = 0;
+            if (b == RZ && swa == 1 && !nega && !absa) v = c->fc_reg[a];
+            else if (a == RZ && swb == 1 && !negb && !absb) v = c->fc_reg[b];
+            if (v) { c->fc_new_reg = d; c->fc_new_kind = merge - 1; c->fc_new_val = v; }
+        }
         return true;
     }
     // ---- HFMA2 (reg 5d00, cr 70xx|0x80, rc 60xx|0x80, imm 70xx, 32I 28)
@@ -943,7 +956,30 @@ static uint64_t replace_word(uint64_t w) {
     return w;
 }
 
+static void emit_insn_(Ctx *c, uint64_t w, uint32_t pc);
 static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_HALF_FRAGCOORD") != NULL;
+    c->fc_new_kind = -1;
+    size_t from = c->body.len;
+    emit_insn_(c, w, pc);
+    // pixel-coordinate tracking: every register this instruction assigned ("rN = " in its text) loses its mark
+    int nr = c->fc_new_reg, nk = off ? -1 : c->fc_new_kind;
+    uint8_t keep0 = 0, keep1 = 0;
+    if (nk >= 0) { keep0 = c->fc_half[nr][0]; keep1 = c->fc_half[nr][1]; }
+    for (const char *q = c->body.buf ? c->body.buf + from : NULL; q && (q = strchr(q, 'r')); q++) {
+        if (q > c->body.buf && (isalnum((unsigned char)q[-1]) || q[-1] == '_')) continue;
+        char *e;
+        long r = strtol(q + 1, &e, 10);
+        if (e == q + 1 || r < 0 || r > 255 || strncmp(e, " = ", 3)) continue;
+        c->fc_reg[r] = 0; c->fc_half[r][0] = c->fc_half[r][1] = 0;
+    }
+    if (nk == 0) c->fc_reg[nr] = (uint8_t)c->fc_new_val;
+    else if (nk == 1) { c->fc_half[nr][0] = (uint8_t)c->fc_new_val; c->fc_half[nr][1] = keep1; }  // (a merge keeps the other lane)
+    else if (nk == 2) { c->fc_half[nr][1] = (uint8_t)c->fc_new_val; c->fc_half[nr][0] = keep0; }
+}
+
+static void emit_insn_(Ctx *c, uint64_t w, uint32_t pc) {
     w = replace_word(w);
     char t[2048], u[2048];
     int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8);
@@ -959,6 +995,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         prn = false;
     }
     bool guarded = !(pr == PT && !prn);
+    c->fc_guarded = guarded;
     if (pr == PT && prn) return;  // @!pt: never executes
     if (guarded) sp(&c->body, "  if (%s) {\n", P(pr, prn));
 
@@ -1025,6 +1062,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             c->ipa_mode = -1;
         }
         if (bits(w, 51, 1) && d != RZ) sp(&c->body, "    r%d = as_type<uint>(saturate(as_type<float>(r%d)));\n", d, d);
+        if (bits(w, 51, 1)) c->fc_new_kind = -1;
     } else if (OPM(0xefd8000000000000ull, 0xfff8000000000000ull)) {  // LD attribute
         int n = 1 + (int)bits(w, 47, 2);
         uint32_t addr = (uint32_t)bits(w, 20, 10);
@@ -1206,7 +1244,13 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0x5cb0000000000000ull, 0xfff8000000000000ull) || OPM(0x4cb0000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x38b0000000000000ull, 0xfef8000000000000ull)) {  // F2I (src fmt bits 10-11: 1 F16; dst size bits 8-9)
         char srcv[512];
-        if (bits(w, 10, 2) == 1 && c->glsl) sprintf(srcv, "h2f((%s >> %du) & 0xFFFFu)", B(false), 16 * (int)bits(w, 41, 1));
+        int fcv = 0;
+        if (bits(w, 10, 2) == 1 && c->glsl && c->stage == STAGE_FRAGMENT && OPM(0x5cb0000000000000ull, 0xfff8000000000000ull))
+            fcv = c->fc_half[bits(w, 20, 8)][bits(w, 41, 1)];
+        if (fcv) {  // the pixel's own coordinate at full precision (LARECOMP_HALF_FRAGCOORD=1: through the half)
+            c->uses_rscale = true;
+            sprintf(srcv, "((in.pos[%d] - rscale[0][%d]) / rscale[0][%d])", fcv - 1, fcv + 1, fcv - 1);
+        } else if (bits(w, 10, 2) == 1 && c->glsl) sprintf(srcv, "h2f((%s >> %du) & 0xFFFFu)", B(false), 16 * (int)bits(w, 41, 1));
         else if (bits(w, 10, 2) == 1) sprintf(srcv, "float(as_type<half2>(%s)[%d])", B(false), (int)bits(w, 41, 1));
         else strcpy(srcv, F(B(true)));
         const char *x = NA(srcv, bits(w, 45, 1), bits(w, 49, 1));
@@ -2490,7 +2534,10 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     for (size_t i = 0; i < end && !c->fail; i++) {
         if (i % 4 == 0) continue;
         uint32_t pc = (uint32_t)(i * 8);
-        if (any_branch && label[i]) sp(&c->body, "  case %uu:\n", pc);
+        if (any_branch && label[i]) {
+            sp(&c->body, "  case %uu:\n", pc);
+            memset(c->fc_reg, 0, sizeof c->fc_reg); memset(c->fc_half, 0, sizeof c->fc_half);
+        }
         if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)((const uint64_t *)code)[i]);
         emit_insn(c, ((const uint64_t *)code)[i], pc);
         if (dbg && pc == maxwell_dbg_pc) {
