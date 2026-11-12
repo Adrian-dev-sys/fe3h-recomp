@@ -3785,7 +3785,8 @@ static bool ui_world_icons(CmdRec *r, bool indexed) {
     if (st.ubuf[0][0].addr != cbuf) cbuf = st.ubuf[0][0].addr, ord++;
     if (ord < 0 || ord >= 32) return false;
     if (st.ds[0] && st.ds[1]) cur |= 1u << ord;  // (a depth-writing UI draw: the diamonds' masks)
-    // icons are separate small quads (6 vertices each, under 300 px); indexed batches (text) or big panels: a menu
+    // icons are separate quads (6 vertices each; zoomed in, a near unit's portrait passes 300 px); indexed batches
+    // (text) or panels over 640 px: a menu
     int nq = (int)(r->x[2] / 6);
     if (indexed || r->x[2] % 6 || nq > 64 || !st.vbuf[0].addr || st.stream[0][0] < 12) { big |= 1u << ord; return false; }
     for (int q = 0; q < nq; q++) {
@@ -3797,7 +3798,7 @@ static bool ui_world_icons(CmdRec *r, bool indexed) {
             sx += p[0];
             x0 = fminf(x0, p[0]), x1 = fmaxf(x1, p[0]), y0 = fminf(y0, p[1]), y1 = fmaxf(y1, p[1]);
         }
-        if (x1 - x0 > 300 || y1 - y0 > 300) big |= 1u << ord;
+        if (x1 - x0 > 640 || y1 - y0 > 640) big |= 1u << ord;
         g_vs_rows[q][0] = sx / 6 * u[0] + u[2];  // (the quad's centre, clip x)
     }
     if (!(prev >> ord & 1) || (prev_big >> ord & 1) || (big >> ord & 1)) return false;
