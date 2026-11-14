@@ -1,13 +1,16 @@
 # FE3H Recomp
 
-A static recompilation of *Fire Emblem: Three Houses* (Nintendo Switch, 2019) into a native Windows application,
-built on [LAS Recomp](https://github.com/peiikai/LASRecomp) by Peiikai.
+Native Windows recompilation of *Fire Emblem: Three Houses* (Nintendo Switch, version 1.2.0), a fork of
+[FE3H Recomp](https://github.com/Bakanda07/fe3h-recomp) built on [LAS Recomp](https://github.com/peiikai/LASRecomp).
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ## About this fork
 
 This is a personal fork of [FE3H Recomp](https://github.com/Bakanda07/fe3h-recomp), made for my own use. It has no
-releases of its own: build it from source as described below. Its changes were written with an AI assistant (Claude)
-and tested by hand on one Windows PC with an NVIDIA GPU and a 3440x1440 ultrawide screen. Its additions include:
+releases and no ready-made download: build it from source as described below. Its changes were written with an AI
+assistant (Claude) and tested by hand on one Windows PC with an NVIDIA GPU and a 3440x1440 ultrawide screen. Its
+additions include:
 
 - **Ultrawide** (21:9 and wider): the 3D view fills the screen while the HUD, menus and movies stay in 16:9; map unit
   icons, monastery speech bubbles and name tags stay over their characters (also when zoomed in).
@@ -30,103 +33,56 @@ The NVIDIA libraries are not included. To use DLAA and frame generation, put the
 `nvngx_dlss.dll` and, for frame generation, `sl.dlss_g.dll`, `nvngx_dlssg.dll`, `sl.reflex.dll`, `sl.pcl.dll` and
 `NvLowLatencyVk.dll` next to `fe3hrecomp.exe`. Without them the game runs as before, with SMAA.
 
-Credits for this fork's additions: Bakanda07 (FE3H Recomp) and Peiikai with the LAS Recomp contributors, whose work
-all of this builds on; NVIDIA for the Streamline SDK headers (MIT, `third_party/streamline`); the Switch modding
-community (Atmosphere, yuzu, Ryujinx) for the LayeredFS mod layout and the IPSwitch `.pchtxt` / IPS patch formats,
-which the mod loader reads (written anew, no code copied); and Fl4sh9174's "Level of Detail" mod for FE3H, which
-inspired the texture detail option.
+## Game files stay on your computer
 
-> [!NOTE]
-> **No game files are included**, and no instructions for obtaining them are provided. You need your own legally
-> obtained copy of the game, version **1.2.0**, extracted to `exefs` and `romfs` folders (and optionally your DLC).
+This repository contains the port's source and tools, not the game. Supply your own legally obtained copy of the
+game, version **1.2.0**, extracted to `exefs` and `romfs` folders (and optionally your DLC), and build locally. No
+instructions for obtaining game files are provided.
 
-## What this is
+Never commit or upload game files, extracted or generated game code (`extracted/`, `generated/`), a built game
+library, logs or F9 captures (they contain game code and data), mods, saves or the NVIDIA libraries. `.gitignore`
+covers the usual folders.
 
-Static recompilation translates the game's original Switch (AArch64) code into C ahead of time, then compiles it into
-a native program. It is not emulation: no CPU emulator runs the game. The Switch system software the game talks to
-(graphics, audio, files, controllers and so on) is reimplemented in the runtime, and graphics go through Vulkan.
+## Current status
 
-LAS Recomp did the heavy lifting: its recompiler, runtime and Vulkan renderer were built for *The Legend of Zelda:
-Link's Awakening*. This fork adds what *Three Houses* needs on top.
+On the tested PC (Windows 11, NVIDIA GPU, 3440x1440):
 
-## Status
+- The monastery, battles (combat arts, gambits and their cut-ins), cutscenes, the calendar and the DLC
+  (Cindered Shadows included) play at a steady 60 fps, at up to 2x internal resolution with DLAA.
+- Audio, keyboard and controllers work. Press **F1** (or Minus + Plus on a controller) for the settings menu.
+- Ultrawide, DLAA, frame generation and game-file mods work.
 
-Playable. Tested on Windows with an AMD Radeon RX 9070 and an RX 6800 XT: the opening chapters, battles (combat
-arts, gambits and their cut-ins), the monastery, cutscenes, the calendar, and the start of Cindered Shadows. It holds
-60 fps through the monastery and battles. Longer playthroughs are ongoing. Other platforms LAS supports (macOS,
-Linux) may build but haven't been tried with this game.
+Known limits:
 
-Added for *Three Houses*:
-- **Audio:** splitter routing (music, voices and effects reach the right mixes), 8 / 24 / 32-bit and float PCM,
-  I3DL2 room reverb, and the game's own effect send / return.
-- **Movies:** the nnMedia player the game uses for its cutscenes, decoded with FFmpeg.
-- **Lighting:** clustered lights work: buffer textures in the shader translator, lane IDs and masks, compute
-  barriers that are safe inside branches, 32-lane compute subgroups, and buffer clears.
-- **System services:** an always-offline network service (the calendar crashed without it).
-- **DLC:** the Expansion Pass, Cindered Shadows and the bonus waves, from your own DLC files.
-- **Shaders:** what FE3H's GPU code uses that Link's Awakening never did: address arithmetic (LEA), atomics and
-  reductions on memory, subroutine calls, and image stores (the battle effects write into textures from compute
-  shaders).
-- **Smooth play:** shader translations are kept on disk, and every shader and pipeline met before is rebuilt at
-  launch, so areas and battle effects you've seen draw at once instead of popping in or stuttering.
-- **Cheats:** Atmosphere-format cheat codes from a `cheats.txt` of your own, switched on and off in the menu's Game
-  tab, including the ones that patch the game's code (see [Cheats](#cheats) below).
-
-The start screen and the in-game menu (F1) are FE3H's own: Video, Audio, Controls and Game settings in slate
-and gold. LAS's Link's Awakening features (its randomizer, cheats, cosmetics, warps) are still in the code,
-switched off and out of the menus.
-
-The start screen shows your own picture if you put one in the game files folder as `extracted/background.png` (or
-`.jpg`); it isn't part of this repository, and `.gitignore` keeps it out.
-
-## Known issues
-
-- The first time you see an area or a battle effect on a PC, its shaders are built while it plays: some pop-in or
-  stutter, and once in a while an effect drawn incompletely (a cut-in as outlines). Only the first time.
-- A few very large battle-effect compute shaders (over 4,000 instructions) aren't built: GPU drivers took minutes on
-  them, if they finished at all. Some battle effects may be missing a layer. `LARECOMP_VK_BIG_CS=1` builds them anyway.
+- The first time an area or a battle effect is seen, its shaders are built while it plays: some pop-in or stutter,
+  only once. The largest battle-effect compute shaders take a few minutes to build on NVIDIA the first time; on other
+  GPUs they're skipped (`LARECOMP_VK_BIG_CS=1` builds them anyway), so some battle effects may be missing a layer.
+- Objects in the monastery pop in at a distance.
+- DLAA and frame generation need an NVIDIA RTX GPU and the libraries above; other GPUs use SMAA.
+- Cheats and mods that patch the game's code need the game code rebuilt after they're added (see below). DLC-file and
+  code mods were only checked with a test mod; game-file mods were tested with real ones.
 - One texture format (BC3, written by a compute shader) can't be written to on PC GPUs; the log mentions it. No
   visible effect found so far.
 - Experience multiplier cheats can overflow the EXP bar on the results screen for some classes (archers); the game
   itself is fine.
+- Long playthroughs, other GPUs, macOS and Linux are untested with this fork. The upstream author tested its base on
+  AMD GPUs.
 
-## Installing a release (Windows)
+## Building from source
 
-Requirements: Windows 10 or 11 (64-bit), a CPU with AVX2 (most from 2015 on), a GPU with Vulkan 1.3 drivers, and
-about 20 GB free for the game files and the build.
-
-1. Download `FE3H-Recomp-<version>-windows.zip` from [Releases](../../releases) and unzip it anywhere you can write
-   to (not Program Files). Everything it makes - saves, settings, caches, the game files - stays in that folder.
-2. Run `fe3hrecomp.exe`. On the start screen, open **Settings > Game Files**, choose the folder holding your own
-   extracted copy of the game (version 1.2.0, `exefs` and `romfs`), and click **Set up game files**.
-3. Wait. The setup copies the game files, then recompiles the game's code on your PC. That's a one-time job and takes
-   a while (about 6 minutes on a Ryzen 7 / 12 threads; longer with fewer cores).
-4. Click **Play**.
-
-**DLC:** if your game files folder has a `dlc` folder laid out as in [DLC](#dlc), the setup copies it too. To add
-DLC later, put it in `extracted/dlc` in the program's folder the same way.
-
-**Cheats:** put a `cheats.txt` next to `fe3hrecomp.exe` (see [Cheats](#cheats)). For cheats that patch the game's
-code, use **Settings > Game Files > Rebuild game code** on the start screen instead of `make gen-main`, then restart.
-
-The first time you enter an area, its shaders are prepared and things may pop in for a moment; from then on they're
-ready from the start of each session. Moving to another PC? Copy the `cache` folder along: the shaders are then
-ready there from the start too.
-
-## Building and running (Windows)
-
-Requirements: Windows 10+ x86-64, a CPU with AVX2 and a GPU with Vulkan 1.3.
+Requirements: Windows 10 or 11 (64-bit), a CPU with AVX2, a GPU with Vulkan 1.3 drivers, and about 20 GB free for the
+game files and the build.
 
 1. **One-time setup**, in PowerShell from the repo root:
    `powershell -ExecutionPolicy Bypass -File tools\setup_windows.ps1`
    (installs MSYS2 with clang, SDL3, FFmpeg, Vulkan and shaderc, plus Python for the tools). More detail in
-   [docs/BUILD-windows.md](docs/BUILD-windows.md), which LAS wrote for Link's Awakening; the steps are the same.
-2. **Game files:** put your extracted `exefs/` and `romfs/` in `extracted/` and set them up on the start screen as
-   in LAS (its game-file setup builds `extracted/romfs.bin`).
+   [docs/BUILD-windows.md](docs/BUILD-windows.md), written for Link's Awakening; the steps are the same.
+2. **Game files:** put your extracted `exefs/` and `romfs/` in `extracted/`, then set them up on the start screen
+   (Settings > Game Files), which builds `extracted/romfs.bin`.
 3. **Build**, from an MSYS2 UCRT64 shell:
    ```
    make gen          # once: recompile the game code from extracted/exefs into generated/
-   make -j$(nproc)   # every core: after make gen, hundreds of files compile
+   make -j$(nproc)   # after make gen, hundreds of files compile
    ```
 4. **Run:** `./build/fe3hrecomp.exe extracted --play > run.log 2>&1`
 
@@ -140,78 +96,54 @@ extracted/dlc/010055D009F79002/romfs/...
 The game sees every pack there as installed. The first launch converts each folder into a single image next to it
 (once; it takes extra disk space about the size of the DLC).
 
+### Mods
+
+Put each mod in its own folder in `mods/` (`mods/<name>/romfs/...`, `exefs/`, `dlc/<content id>/romfs/...`) and
+manage them in Settings > Mods. Changes apply the next time the game starts. Details: [docs/mods.md](docs/mods.md).
+
 ### Cheats
 
 Cheats use the Atmosphere format: put them in `cheats.txt` in the project folder (a `[Name]` line, then its codes; a
-`{Name}` block is a master code, always on; `#` lines under the name describe it), and they show up in the menu's **Game** tab to switch on and off. The
-file stays out of git.
+`{Name}` block is a master code, always on; `#` lines under the name describe it), and they show up in the menu's
+**Game** tab to switch on and off. The file stays out of git.
 
 Cheats that only change memory work straight away. Cheats that patch the game's code (most multipliers and "max"
 cheats) can't be applied to an already-recompiled game at run time, so their patched instructions get compiled in
-beside the originals: after adding or changing those, run `make gen-main` and then `make`. The menu marks any cheat
-still waiting on that. Switching a cheat off puts back any code it changed; values it already wrote stay. Cheats
-that patch the same instruction (Exp x2 / x4 / x8, say) exclude each other: switching one on turns the others off.
+beside the originals: after adding or changing those (or a code-patching mod), run `make gen-main` and then `make`.
+The menu marks any cheat still waiting on that. Switching a cheat off puts back any code it changed; values it already
+wrote stay. Cheats that patch the same instruction (Exp x2 / x4 / x8, say) exclude each other.
 
 ### Settings and logs
 
-- **F1** (or Minus + Plus on a controller) opens the settings overlay. For a sharp image use Internal resolution
-  "Match display" or higher, with SMAA.
-- Saves are in `save/`, settings in `fe3hrecomp.ini` (an older `larecomp.ini` is renamed to it once).
+- **F1** opens the settings menu: Video, Audio, Controls, Game and Mods. For the sharpest image use Internal resolution
+  1.5x or 2x with DLAA (SMAA without an NVIDIA GPU).
+- Saves are in `save/`, settings in `fe3hrecomp.ini`.
 - `run.log` is the first place to look when something goes wrong. `LARECOMP_*` environment variables turn on extra
   logging for specific systems (audio, textures, shaders); they're documented where they're read in `runtime/`.
+- The start screen shows your own picture if you put one in the game files folder as `extracted/background.png` (or
+  `.jpg`); `.gitignore` keeps it out.
 
-### Making a release package
+The upstream author's notes on what it took to get *Three Houses* running (lighting, audio, stutter, battle effects,
+cheats, setup time) are in [docs/upstream-notes.md](docs/upstream-notes.md).
 
-From the MSYS2 UCRT64 shell, once: `make deps-windows` (an LGPL build of FFmpeg: releases can't ship MSYS2's GPL one),
-`tools/fetch_zig.sh` (the compiler players' PCs build the game with) and `make gen-helper` (the game code generator
-as a standalone program; needs the python.org Python 3.12 the setup script installs). Then `make dist` builds
-`build/dist/FE3H-Recomp-<version>-windows.zip` (the version is `FE3H_VERSION` in `runtime/ui/launcher.mm`). It holds
-no game code: each player's PC recompiles the game from their own files. `make dist` rebuilds the generator helper
-by itself when `tools/` changed. If `py` isn't on the MSYS2 shell's PATH, give the Python for the helper as
-`GEN_PY=/c/Users/<you>/AppData/Local/Programs/Python/Python312/python.exe`.
+## Credits and license
 
-## Hurdles along the way
-
-Some of what it took to get from Link's Awakening's recompiler to a playable *Three Houses*, in case it helps anyone
-doing the same for another game:
-
-- **Lighting was missing.** FE3H culls its lights in compute shaders that count lights per screen tile with subgroup
-  operations. The translator returned 0 for lane IDs and masks, so no tile had any lights; and a barrier inside the
-  shader's branch state machine ran before every wave had added its own lights. Fixed in the shader translator.
-- **Audio routing.** Music, voices and effects go through the audio renderer's splitters and an I3DL2 reverb that
-  LA never used; until those were implemented, sounds didn't reach the right mixes.
-- **Stutter.** Each new shader was translated, compiled to SPIR-V and built by the driver in the middle of play.
-  Three layers fixed it: translations cached on disk, draws waiting a few milliseconds a frame for a shader still
-  building instead of skipping it, and a prewarm that rebuilds everything seen in earlier sessions at launch.
-- **Battle effects.** Combat art and gambit cut-ins are drawn by compute shaders writing into images, with
-  subroutine calls and memory reductions the translator didn't know yet. Some are enormous (9,000-11,000
-  instructions); building them stalled the driver for minutes and held up every other shader behind them, so the
-  effects never appeared. Large ones now build on threads of their own, and the largest are skipped.
-- **Cheats.** Many Switch cheats patch the game's code, which a recompiled game no longer runs. Their patched
-  instructions are compiled in beside the originals and picked at run time. One popular "always critical" cheat
-  turned out to zero unit stats (stranding units unable to move); it was replaced with a one-instruction code patch
-  on the crit roll.
-- **Setup time.** A few of the game's functions are huge (one is 4 MB of C). A compiler can't split one function
-  across cores, so the first setup spent 15 minutes compiling a single file. The generator now writes very long
-  functions as parts that compile in parallel: setup went from about 20 minutes to 6.
-
-## Rules for this repository
-
-Nothing owned by Nintendo is ever committed: no game files, no extracted or generated code (`extracted/`,
-`generated/`), no logs or dumps that contain game code, no assets. `.gitignore` covers the usual folders.
-
-## Credits
-
-- **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai and its contributors: the recompiler, runtime,
-  renderer and almost everything else here (MIT). Its README lists its full credits and third-party components.
-- **[Ryujinx](https://ryujinx.app)** (MIT): the audio renderer's reverb, I3DL2 reverb and auxiliary send / return
-  are ports of its implementation.
-- **[EB Garamond](https://github.com/georgd/EB-Garamond)** by Georg Duffner: the start screen's title (SIL Open Font License
-  1.1, `third_party/fonts/EBGaramond/OFL.txt`).
-- **[NVIDIA Streamline](https://github.com/NVIDIA-RTX/Streamline)** (MIT): the SDK headers for DLAA and frame generation.
-  The DLSS runtime libraries are NVIDIA's and are not included.
-- **[AMD FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR)** (MIT) and
-  **[SMAA](https://github.com/iryoku/smaa)** (MIT), as used by LAS.
+- **[FE3H Recomp](https://github.com/Bakanda07/fe3h-recomp)** by Bakanda07: the *Three Houses* port this fork builds on
+  (audio, movies, lighting, DLC, shaders, cheats, the start screen and menus).
+- **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai and its contributors: the recompiler, runtime and
+  Vulkan renderer (MIT). Its README lists its full credits and third-party components, including the Link's Awakening
+  randomizer still in `third_party/`.
+- **[Ryujinx](https://ryujinx.app)** (MIT): the audio renderer's reverb, I3DL2 reverb and auxiliary send / return are
+  ports of its implementation.
+- **[NVIDIA Streamline](https://github.com/NVIDIA-RTX/Streamline)** (MIT): the SDK headers for DLAA and frame
+  generation (`third_party/streamline`). The DLSS runtime libraries are NVIDIA's and are not included.
+- **[AMD FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR)** (MIT, including RCAS) and
+  **[SMAA](https://github.com/iryoku/smaa)** (MIT).
+- The Switch modding community (Atmosphere, yuzu, Ryujinx) for the LayeredFS mod layout and the IPSwitch `.pchtxt` /
+  IPS patch formats, which the mod loader reads (written anew, no code copied), and Fl4sh9174's "Level of Detail" mod
+  for FE3H, which inspired the texture detail option.
+- **[EB Garamond](https://github.com/georgd/EB-Garamond)** by Georg Duffner: the start screen's title (SIL Open Font
+  License 1.1, `third_party/fonts/EBGaramond/OFL.txt`).
 - **Libraries:** [SDL 3](https://libsdl.org) (zlib), [FFmpeg](https://ffmpeg.org) (LGPL),
   [Dear ImGui](https://github.com/ocornut/imgui) (MIT),
   [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) (MIT),
@@ -220,14 +152,7 @@ Nothing owned by Nintendo is ever committed: no game files, no extracted or gene
   [python-lz4](https://github.com/python-lz4/python-lz4).
 - The Switch homebrew community's documentation ([Switchbrew](https://switchbrew.org)).
 
-## Legal
-
-This is a fan project, not affiliated with, endorsed by or sponsored by Nintendo, Intelligent Systems or Koei Tecmo.
-*Fire Emblem* and *Fire Emblem: Three Houses* are trademarks of Nintendo. No game files, game code or assets are
-included in this repository. You must provide your own legally obtained copy of the game.
-
-## License
-
-The code is open source under the [MIT License](LICENSE), as LAS Recomp's is. Third-party components keep their own
-licenses (see LAS Recomp's README for the full list, including the Link's Awakening randomizer still in
-`third_party/`). The license covers this project's code only; it grants nothing for Nintendo's game.
+The code is under the [MIT License](LICENSE), as LAS Recomp's is; third-party components keep their own licenses. The
+license covers this project's code only and grants nothing for Nintendo's game. This is an independent fan project,
+not affiliated with, endorsed by or sponsored by Nintendo, Intelligent Systems or Koei Tecmo. *Fire Emblem* and
+*Fire Emblem: Three Houses* are trademarks of Nintendo.
