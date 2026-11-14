@@ -47,8 +47,9 @@ covers the usual folders.
 
 On the tested PC (Windows 11, NVIDIA GPU, 3440x1440):
 
-- The monastery, battles (combat arts, gambits and their cut-ins), cutscenes, the calendar and the DLC
-  (Cindered Shadows included) play at a steady 60 fps, at up to 2x internal resolution with DLAA.
+- The monastery, battles and DLC maps play at a steady 60 fps at 2x internal resolution with DLAA. The upstream
+  author also tested cutscenes, the calendar, combat arts and gambits with their cut-ins, and the start of Cindered
+  Shadows.
 - Audio, keyboard and controllers work. Press **F1** (or Minus + Plus on a controller) for the settings menu.
 - Ultrawide, DLAA, frame generation and game-file mods work.
 
@@ -77,14 +78,15 @@ game files and the build.
    `powershell -ExecutionPolicy Bypass -File tools\setup_windows.ps1`
    (installs MSYS2 with clang, SDL3, FFmpeg, Vulkan and shaderc, plus Python for the tools). More detail in
    [docs/BUILD-windows.md](docs/BUILD-windows.md), written for Link's Awakening; the steps are the same.
-2. **Game files:** put your extracted `exefs/` and `romfs/` in `extracted/`, then set them up on the start screen
-   (Settings > Game Files), which builds `extracted/romfs.bin`.
+2. **Game files:** put your extracted `exefs/` and `romfs/` in `extracted/`.
 3. **Build**, from an MSYS2 UCRT64 shell:
    ```
    make gen          # once: recompile the game code from extracted/exefs into generated/
    make -j$(nproc)   # after make gen, hundreds of files compile
    ```
-4. **Run:** `./build/fe3hrecomp.exe extracted --play > run.log 2>&1`
+4. **First run:** start `./build/fe3hrecomp.exe` and, on the start screen, set up the game files (Settings > Game
+   Files). That builds `extracted/romfs.bin` once. Then click **Play**.
+5. **Later runs:** `./build/fe3hrecomp.exe extracted --play > run.log 2>&1` skips the start screen.
 
 ### DLC
 
