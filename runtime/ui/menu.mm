@@ -452,6 +452,11 @@ static void tab_display(void) {
                        "widens to the window; menus and text stay 16:9 in the middle.", false))
             g_settings.aspect = ai ? ASPECT_UNLOCKED : ASPECT_ORIGINAL;
     }
+    if (g_settings.aspect != ASPECT_UNLOCKED) opt_disable_next();
+    opt_toggle("HUD at screen edges (experimental)", &g_settings.hud_edges, false,
+               "Fill screen only: side panels (unit info, minimap, button hints) move to the edges of the window "
+               "instead of staying in the 16:9 area.\n\nNot finished, off by default: some menus (save files, unit "
+               "status, the monastery menu) misplace or split elements.");
     bool fs = g_settings.fullscreen;
     if (opt_toggle("Fullscreen", &fs, false, "Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.")) {
         g_settings.fullscreen = fs;

@@ -1083,6 +1083,7 @@ void renderer_save_texture_tex(TexBackend *b, const char *path);
 static float pass_sx = 1, pass_sy = 1;
 static float vp_sx = 1, vp_sy = 1, vp_ox = 0, vp_oy = 0;
 static float sc_box;  // (this draw's UI box factor, for its scissor; 0 = none)
+static float sc_dx;   // (its HUD edge shift in pass pixels; ui_edge_anchor)
 static float g_label_dx;  // (this draw's world-label shift in pass pixels; ui_world_label)
 static float tex_sc[2][64][2];
 static uint32_t tex_wh[2][64][2];
@@ -1262,7 +1263,7 @@ static void begin_pass(void) {
     vkCmdBeginRendering(cb, &ri);
     ss_forget();  // (whatever ran between the passes may have set its own state)
     in_pass = true;
-    vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0; sc_box = 0;
+    vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0; sc_box = 0; sc_dx = 0;
     stat_passes++;
 }
 
@@ -1291,7 +1292,7 @@ static VkRect2D scissor_rect(void) {
     }
     if (sc_box > 0 && (x > 0 || x + sw < w)) {  // ultrawide UI box: a partial scissor follows its boxed UI (minimap)
         double c = w * 0.5, x0 = floor(c + (x - c) * sc_box), x1 = ceil(c + (x + sw - c) * sc_box);
-        x = (int)x0; sw = (int)(x1 - x0);
+        x = (int)x0 + (int)sc_dx; sw = (int)(x1 - x0);
     }
     if (x < 0) { sw += x; x = 0; }
     if (y < 0) { sh += y; y = 0; }
@@ -1420,7 +1421,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
                   uint32_t smask) {
     begin_pass();
     VkCommandBuffer cb = vk_cmd();
-    vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0; sc_box = 0;
+    vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0; sc_box = 0; sc_dx = 0;
     VkRect2D rect = scissor_rect();
     if (!rect.extent.width || !rect.extent.height) return;
     if (index >= 0 && (index >= (int)pass_ncolor || pass_color[index] == VK_FORMAT_UNDEFINED)) return;
@@ -3841,6 +3842,102 @@ static bool ui_world_label(CmdRec *r, bool indexed, float *ax) {
     return true;
 }
 
+// FE3H ultrawide, experimental (Display > HUD at screen edges): 2D UI draws that touch merge into elements (last frame's draws); an element
+// whose bbox sits in an outer part of the 16:9 box moves, unscaled, to that window edge. Returns -1 / 0 / +1.
+static bool ui_vtx_bbox(CmdRec *r, bool indexed, float *b) {
+    uint32_t stride = st.stream[0][0];
+    uint64_t n = r->x[2];
+    if (!st.vbuf[0].addr || stride < 8 || !n || n > 16384) return false;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t v;
+        if (!indexed) v = r->x[1] + i;
+        else {
+            const uint8_t *ip = (const uint8_t *)(uintptr_t)r->x[3];
+            uint32_t t = (uint32_t)r->x[1];
+            if (!ip) return false;
+            v = t == 0 ? ip[i] : t == 1 ? ((const uint16_t *)ip)[i] : ((const uint32_t *)ip)[i];
+            if (st.prim_restart && v == st.restart_index) continue;
+            v += (int32_t)r->x[4];
+        }
+        uint64_t o = v * stride;
+        if (o + 8 > st.vbuf[0].size) return false;
+        const float *p = (const float *)(uintptr_t)(st.vbuf[0].addr + o);
+        b[0] = fminf(b[0], p[0]), b[1] = fminf(b[1], p[1]), b[2] = fmaxf(b[2], p[0]), b[3] = fmaxf(b[3], p[1]);
+    }
+    return b[0] <= b[2];
+}
+
+enum { HUD_NR = 512 };
+// in the outer part of the box, or running off one of its edges (the monastery notebook): that side
+static int hud_side(const float *b, float w, float split) {
+    if (b[2] <= w * split || (b[0] < -1 && b[2] < w * 0.7f)) return -1;
+    if (b[0] >= w * (1 - split) || (b[2] > w + 1 && b[0] > w * 0.3f)) return 1;
+    return 0;
+}
+static int hud_find(int *par, int i) { while (par[i] != i) i = par[i] = par[par[i]]; return i; }
+
+static int ui_edge_anchor(CmdRec *r, bool indexed) {
+    static int on = -1;  // (LARECOMP_HUD_EDGES=1; else the menu setting)
+    static float split = 0.45f, gap = 8;
+    if (on < 0) {
+        on = getenv("LARECOMP_HUD_EDGES") != NULL;
+        const char *e = getenv("LARECOMP_HUD_EDGE_SPLIT");  // (outer fraction of the box that counts as a side)
+        if (e) split = (float)atof(e);
+        if ((e = getenv("LARECOMP_HUD_EDGE_GAP"))) gap = (float)atof(e);  // (guest px between draws of one element)
+    }
+    const float *u = (const float *)(uintptr_t)st.ubuf[0][0].addr;
+    float w = (float)st.rt.color[0]->width, h = (float)st.rt.color[0]->height;
+    if (!on && !g_settings.hud_edges) return 0;
+    // pixel-space vertices: their bbox; others (minimap grid, tilted UI) only when a partial scissor says where they are
+    bool px = u && st.ubuf[0][0].size >= 16 && fabsf(u[0] * w - 2) <= 0.02f && fabsf(fabsf(u[1]) * h - 2) <= 0.02f;
+    float sx = (float)st.scissor[0][0], sy = (float)st.scissor[0][1], sw = (float)st.scissor[0][2], sh = (float)st.scissor[0][3];
+    bool part = sw > 0 && sw < 16384 && (sx > 0 || sx + sw < w);
+    if (!px && !part) return 0;
+    static float cur[HUD_NR][4], grp[HUD_NR][4];
+    static int8_t gside[HUD_NR], cside[HUD_NR];
+    static int ncur, ngrp;
+    static uint64_t frame = ~0ull, frame_last = ~0ull;
+    uint64_t f = renderer_present_count();
+    if (f != frame) {  // last frame's draws -> elements (union of touching bboxes; screen-wide ones stay out)
+        frame = f;
+        static int par[HUD_NR];
+        for (int i = 0; i < ncur; i++) par[i] = i;
+        for (int i = 0; i < ncur; i++)
+            for (int j = i + 1; j < ncur; j++)
+                if (cur[i][0] <= cur[j][2] + gap && cur[j][0] <= cur[i][2] + gap && cur[i][1] <= cur[j][3] + gap && cur[j][1] <= cur[i][3] + gap)
+                    par[hud_find(par, i)] = hud_find(par, j);
+        static int gi[HUD_NR];
+        ngrp = 0;
+        for (int i = 0; i < ncur; i++) gi[i] = -1;
+        for (int i = 0; i < ncur; i++) {
+            int root = hud_find(par, i);
+            if (gi[root] < 0) gi[root] = ngrp, grp[ngrp][0] = grp[ngrp][1] = 1e9f, grp[ngrp][2] = grp[ngrp][3] = -1e9f, ngrp++;
+            float *g = grp[gi[root]];
+            g[0] = fminf(g[0], cur[i][0]), g[1] = fminf(g[1], cur[i][1]), g[2] = fmaxf(g[2], cur[i][2]), g[3] = fmaxf(g[3], cur[i][3]);
+        }
+        for (int i = 0; i < ngrp; i++) gside[i] = (int8_t)hud_side(grp[i], w, split);
+        ncur = 0;
+    }
+    float b[4] = {1e9f, 1e9f, -1e9f, -1e9f};
+    static int last;  // (the previous draw's side: for draws placed some other way)
+    if (f != frame_last) frame_last = f, last = 0;
+    if (!px) b[0] = sx, b[1] = sy, b[2] = sx + sw, b[3] = sy + sh;
+    else if (!ui_vtx_bbox(r, indexed, b)) return last;
+    else if (part) b[0] = fmaxf(b[0], sx), b[2] = fminf(b[2], sx + sw);  // (clipped part only)
+    if (b[2] - b[0] < 1 || b[3] - b[1] < 1) return last;  // (zero vertices: skill bars placed by the shader)
+    if (b[2] - b[0] > w * 0.7f) return last = 0;  // (fills, screen-wide bars)
+    int side = 2;
+    for (int i = 0; i < ngrp && side == 2; i++)
+        if (b[0] >= grp[i][0] - 2 && b[1] >= grp[i][1] - 2 && b[2] <= grp[i][2] + 2 && b[3] <= grp[i][3] + 2) side = gside[i];
+    for (int i = ncur - 1; i >= 0 && side == 2; i--)  // (new element: the side of a draw it touches this frame, else its own)
+        if (cur[i][0] <= b[2] + gap && b[0] <= cur[i][2] + gap && cur[i][1] <= b[3] + gap && b[1] <= cur[i][3] + gap) side = cside[i];
+    if (side == 2) side = hud_side(b, w, split);
+    if (ncur < HUD_NR) memcpy(cur[ncur], b, sizeof b), cside[ncur++] = (int8_t)side;
+    last = side;
+    if (g_debug_frame) LOG("[draw]   hud side %d (bbox %.0f %.0f %.0f %.0f)\n", side, b[0], b[1], b[2], b[3]);
+    return side;
+}
+
 // ================================================================== DLAA (dlss.cpp)
 // The 3D scene (draws testing the G-buffer pass's depth) is jittered by a sub-pixel viewport shift; once the game has
 // composited it into the window image, the next draw there (HUD, menus) first runs DLAA over it with that depth, zero
@@ -4800,7 +4897,7 @@ static void draw_(CmdRec *r, bool indexed) {
     // ---- textures first (their scales feed the widescreen decision and the rscale table), then the viewport
     float *vp = st.viewport[0];
     float zn = st.depth_range[0][0], zf = st.depth_range[0][1];
-    vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0; sc_box = 0; g_label_dx = 0;
+    vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0; sc_box = 0; sc_dx = 0; g_label_dx = 0;
     {   // the Items page's cursor brackets while the cursor is on the companion card (runtime/hle/pets.c)
         extern bool pets_hide_item_cursor(void);
         extern bool texpatch_is_item_cursor(int id);
@@ -4916,6 +5013,10 @@ static void draw_(CmdRec *r, bool indexed) {
             else if (video || ui_edge_sprite(r, indexed)) rs0[0] = 2;  // (its screen-edge vertices are not a fill's)
             int pw_, ph_;
             pass_size(&pw_, &ph_);
+            if (!label && !icon) {  // (side HUD to the window edges, shifted whole: experimental)
+                int s = ui_edge_anchor(r, indexed);
+                if (s) g_label_dx = sc_dx = roundf(s * (1 - q / 65535.0f) * pw_ * 0.5f);
+            }
             g_vs_px[0] = (float)pw_, g_vs_px[1] = (float)ph_;
             vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, rs0, NULL, 0, 0, 0, NULL);
             g_vs_nrows = 0, g_vs_px[0] = g_vs_px[1] = 0;
