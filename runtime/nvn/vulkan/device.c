@@ -818,7 +818,8 @@ int ui_run(void) {
     for (;;) {
         if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
         SDL_Event e;
-        while (SDL_WaitEventTimeout(&e, 16)) {
+        uint64_t batch_t0 = SDL_GetTicksNS();  // (gyro events stream every few ms: bound the batch)
+        while (SDL_GetTicksNS() - batch_t0 < 16000000ull && SDL_WaitEventTimeout(&e, 16)) {
             if (e.type == SDL_EVENT_QUIT) {
                 LOG("window closed\n");
                 exit(0);

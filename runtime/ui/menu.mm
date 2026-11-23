@@ -621,6 +621,13 @@ static void tab_game(void) {
                    "The console language the game is told, which picks its text language (the voice language is in "
                    "the game's own settings). Applies when the game restarts: Quit to Start Screen, then Play."))
         settings_save();
+    opt_section("Controller");
+    opt_toggle("Motion controls", &g_settings.gyro, true,
+               "The controller's gyro (DualSense, DualShock 4, Switch Pro) is passed to the game as the Switch's motion sensor.");
+    opt_toggle("Rumble", &g_settings.rumble, true, "The game's HD rumble drives the controller's motors.");
+    float rpct = roundf(g_settings.rumble_strength * 100);
+    if (opt_slider("Rumble strength", &rpct, 0, 200, 10, 100, "%g%%", "How strongly the controller rumbles. 100% is the default."))
+        g_settings.rumble_strength = rpct / 100.0f;
     // cheats.txt (Atmosphere's format, in the project folder): runtime/hle/cheatvm.c
     int nc = cheatvm_count();
     opt_section("Cheats");

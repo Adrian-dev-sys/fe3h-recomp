@@ -12,6 +12,11 @@ static uint32_t new_event_handle(void) {
 }
 
 // ------------------------------------------------------------------ hid
+typedef struct { float amp_low, freq_low, amp_high, freq_high; } VibValue;
+void vibration_send(uint32_t handle, const VibValue *v, const char *via);  // runtime/hle/motion.c
+void vibration_actual(uint32_t handle, VibValue *out);
+static int dumped201;
+
 KSharedMem *g_hid_shmem;
 static uint32_t hid_shmem_handle;
 RT_ON_RESET(hid_reset) { g_hid_shmem = NULL; hid_shmem_handle = 0; }
@@ -32,7 +37,22 @@ SERVICE("hid", hid) {
     case 101: OUT(uint32_t, 0) = 0x1F; resp_size(resp, 4); break;  // GetSupportedNpadStyleSet
     case 121: OUT(int64_t, 0) = 0; resp_size(resp, 8); break;      // GetNpadJoyHoldType
     case 129: OUT(int64_t, 0) = 0; resp_size(resp, 8); break;      // GetNpadHandheldActivationMode
-    case 201: case 202: case 203: case 206: case 207: case 208: case 209: break;  // vibration
+    case 201:
+        if (!dumped201++ && req->data_size >= 0x20)  // (layout check: handle u32, then 4 floats)
+            LOG("[rumble] ipc 201 raw: %08x | %f %f %f %f | %08x %016llx\n", IN(uint32_t, 0), IN(float, 4), IN(float, 8),
+                IN(float, 12), IN(float, 16), IN(uint32_t, 20), (unsigned long long)IN(uint64_t, 24));
+        vibration_send(IN(uint32_t, 0), (const VibValue *)(req->data + 4), "ipc 201"); break;  // SendVibrationValue
+    case 202: vibration_actual(IN(uint32_t, 0), &OUT(VibValue, 0)); resp_size(resp, 16); break;   // GetActualVibrationValue
+    case 205: case 211: OUT(uint8_t, 0) = 1; resp_size(resp, 4); break;  // IsVibrationPermitted / IsVibrationDeviceMounted
+    case 206: {                                                           // SendVibrationValues(handles[], values[])
+        IpcBuf *hb = in_buf(req, 0), *vb = in_buf(req, 1);
+        if (!hb || !vb) break;
+        uint64_t n = hb->size / 4 < vb->size / 16 ? hb->size / 4 : vb->size / 16;
+        for (uint64_t i = 0; i < n; i++)
+            vibration_send(((const uint32_t *)(uintptr_t)hb->addr)[i], (const VibValue *)(uintptr_t)vb->addr + i, "ipc 206");
+        break;
+    }
+    case 203: case 207: case 208: case 209: break;  // vibration list / GC ERM / sessions
     case 200: memset(resp->data, 0, 0x10); OUT(uint32_t, 0) = 1; resp_size(resp, 0x10); break;
     default: break;  // Activate*/Set*: accept
     }

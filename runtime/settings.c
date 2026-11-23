@@ -34,6 +34,9 @@ Settings g_settings = {
     .shader_wait = SHADER_WAIT_BALANCED,
     .movie_audio = true,
     .show_fps = false,
+    .gyro = true,
+    .rumble = true,
+    .rumble_strength = 1.0f,
     .inv_keys = true,
     .tracker = true,
     .chaos_letters = CHAOS_LETTERS_MAP,
@@ -119,6 +122,9 @@ void settings_load(void) {
         else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;
         else if (!strcmp(key, "movie_audio")) g_settings.movie_audio = atoi(val) != 0;
         else if (!strcmp(key, "show_fps")) g_settings.show_fps = atoi(val) != 0;
+        else if (!strcmp(key, "gyro")) g_settings.gyro = atoi(val) != 0;
+        else if (!strcmp(key, "rumble")) g_settings.rumble = atoi(val) != 0;
+        else if (!strcmp(key, "rumble_strength")) g_settings.rumble_strength = (float)atof(val);
         else if (!strcmp(key, "hud_edges")) g_settings.hud_edges = atoi(val) != 0;
         else if (!strcmp(key, "resolution")) {
             int n = atoi(val);
@@ -170,6 +176,8 @@ void settings_load(void) {
     fe3h_settings();
     if (g_settings.volume < 0) g_settings.volume = 0;
     if (g_settings.volume > 2) g_settings.volume = 2;
+    if (!(g_settings.rumble_strength >= 0)) g_settings.rumble_strength = 0;
+    if (g_settings.rumble_strength > 2) g_settings.rumble_strength = 2;
     LOG("[settings] loaded %s\n", SETTINGS_FILE);
 }
 
@@ -183,6 +191,7 @@ void settings_save(void) {
     fprintf(f, "reverb = %d\n", g_settings.reverb);
     fprintf(f, "movie_audio = %d\n", g_settings.movie_audio);
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
+    fprintf(f, "gyro = %d\nrumble = %d\nrumble_strength = %.2f\n", g_settings.gyro, g_settings.rumble, g_settings.rumble_strength);
     fprintf(f, "hud_edges = %d\n", g_settings.hud_edges);
     fprintf(f, "upscaler = %s\n", g_settings.upscaler == UPSCALE_METALFX ? "metalfx" : g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "bilinear");
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_DLAA ? "dlaa" : g_settings.antialias == AA_SMAA ? "smaa" : "off");

@@ -127,6 +127,21 @@ static void note_family(void) {
     if (f != pad_family) LOG("[input] button prompts: %s controller\n", f == 1 ? "Xbox" : f == 2 ? "PlayStation" : "Nintendo / other");
     pad_family = f;
 }
+// Gyro + accelerometer on while the Motion controls setting is on (DualSense / DS4 / Switch Pro via SDL's HIDAPI).
+static bool sensors_on, have_acc;
+static float last_acc[3];
+static uint64_t last_gyro_t;
+extern void motion_feed_sdl(const float a[3], const float g[3], double dt);  // runtime/hle/motion.c
+static void pad_sensors(void) {
+    bool want = g_settings.gyro, has = SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL);
+    bool on = has && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, want) && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, want) && want;
+    sensors_on = want;  // (also when unsupported: no retry every event)
+    have_acc = false, last_gyro_t = 0;
+    bool rumble = SDL_GetBooleanProperty(SDL_GetGamepadProperties(pad), SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
+    LOG("[input] %s: motion sensors %s (gyro %.0f Hz), rumble %s\n", SDL_GetGamepadName(pad),
+        !has ? "none" : on ? "on" : want ? "failed" : "off", has ? (double)SDL_GetGamepadSensorDataRate(pad, SDL_SENSOR_GYRO) : 0.0,
+        rumble ? "yes" : "no");
+}
 int input_pad_family(void) {
     static int env = -2;
     if (env == -2) {
@@ -142,7 +157,7 @@ void input_handle_event(const SDL_Event *e) {
         scanned = true;
         int n = 0;
         SDL_JoystickID *ids = SDL_GetGamepads(&n);
-        if (n > 0 && !pad) { pad = SDL_OpenGamepad(ids[0]); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        if (n > 0 && !pad) { pad = SDL_OpenGamepad(ids[0]); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); pad_sensors(); }
         SDL_free(ids);
     }
     switch (e->type) {
@@ -182,16 +197,45 @@ void input_handle_event(const SDL_Event *e) {
         recompute_keyboard();
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
-        if (!pad) { pad = SDL_OpenGamepad(e->gdevice.which); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        if (!pad) { pad = SDL_OpenGamepad(e->gdevice.which); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); pad_sensors(); }
         break;
     case SDL_EVENT_GAMEPAD_REMOVED:
-        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) { SDL_CloseGamepad(pad); pad = NULL; note_family(); }
+        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) {
+            SDL_LockJoysticks();  // (input_rumble runs on guest threads)
+            SDL_CloseGamepad(pad);
+            pad = NULL;
+            SDL_UnlockJoysticks();
+            note_family();
+            sensors_on = have_acc = false;
+        }
         recompute_pad();
         break;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP:
         recompute_pad();
         break;
+    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
+        if (!pad || e->gsensor.which != SDL_GetGamepadID(pad)) break;
+        if (e->gsensor.sensor == SDL_SENSOR_ACCEL) memcpy(last_acc, e->gsensor.data, sizeof last_acc), have_acc = true;
+        else if (e->gsensor.sensor == SDL_SENSOR_GYRO && have_acc) {
+            uint64_t t = e->gsensor.sensor_timestamp ? e->gsensor.sensor_timestamp : e->gsensor.timestamp;
+            double dt = last_gyro_t && t > last_gyro_t ? (double)(t - last_gyro_t) / 1e9 : 0;
+            last_gyro_t = t;
+            motion_feed_sdl(last_acc, e->gsensor.data, dt);
+        }
+        break;
     }
+    if (pad && sensors_on != g_settings.gyro) pad_sensors();  // (the menu's Motion controls toggle, live)
+}
+
+// (guest threads) the gamepad's motors; false without a gamepad or rumble support
+bool input_rumble(uint16_t low, uint16_t high, uint32_t ms) {
+    SDL_LockJoysticks();
+    bool ok = pad && SDL_RumbleGamepad(pad, low, high, ms);
+    SDL_UnlockJoysticks();
+    static _Atomic int logged;
+    if ((low || high) && !atomic_exchange(&logged, 1))
+        LOG("[rumble] first motor drive %u / %u: %s\n", low, high, ok ? "ok" : pad ? SDL_GetError() : "no gamepad");
+    return ok;
 }
 
 // Scripted input for testing: LARECOMP_INPUT="frame:BUTTON:frames,..." (BUTTON = A,B,X,Y,L,R,ZL,ZR,PLUS,
@@ -528,18 +572,18 @@ HLE_FUNC("_ZN2nn3hid27BindNpadStyleSetUpdateEventERKjPNS_2os15SystemEventTypeENS
     LOG("[input] style set update event bound\n");
 }
 
-// Vibration devices: accepted but inert (the SDK's vibration node graph stays recompiled).
+// Vibration devices: their values reach runtime/hle/motion.c (hid IPC 201/206, the SendVibrationValue import).
 HLE_FUNC("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", hid_init_vibration) { (void)c; }
 HLE_FUNC("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", hid_vibration_handles) {
     uint32_t *out = (uint32_t *)(uintptr_t)c->x[0];
     int n = (int)c->x[1] < 2 ? (int)c->x[1] : 2;
     uint32_t id = *(uint32_t *)(uintptr_t)c->x[2];
-    for (int i = 0; i < n; i++) out[i] = (id & 0xFF) << 8 | (uint32_t)i | 0x03000000u;  // type, player, position
+    for (int i = 0; i < n; i++) out[i] = 3u | (id & 0xFF) << 8 | (uint32_t)i << 16;  // FullKey, player, device (0 L, 1 R)
     c->x[0] = (uint64_t)n;
 }
 HLE_FUNC("_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", hid_vibration_info) {
     uint32_t *info = (uint32_t *)(uintptr_t)c->x[0];
     uint32_t h = *(uint32_t *)(uintptr_t)c->x[1];
-    info[0] = 1;        // VibrationDeviceType_LinearResonantActuator
-    info[1] = h & 1;    // position: left / right
+    info[0] = 1;                  // VibrationDeviceType_LinearResonantActuator
+    info[1] = (h >> 16 & 1) + 1;  // VibrationDevicePosition: 1 left, 2 right
 }
