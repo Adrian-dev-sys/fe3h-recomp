@@ -1,5 +1,5 @@
 // Fake online (Settings > Game > Online, off by default): local stand-in data for FE3H's online features, no server.
-// For now only Lost Spirits (glowing tiles on battle maps where "other players" lost units). Sites: tools/patches.py.
+// Lost Spirits (glowing tiles on battle maps) and the statistics cache (fake votes). Sites: tools/patches.py.
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,4 +57,39 @@ int rt_fake_lost_spirits(Cpu *c) {
     *(uint16_t *)(o + REQ_MAP) = map;
     LOG("[online] fake Lost Spirits for map %u\n", map);
     return 1;
+}
+
+// Statistics cache A (online obj+0x2380, 13 records x 0x628): per record 4 data keys, then 64 entries
+// {u16 id (rating slot), u32, u16, u64 votes, u32 100}; valid only while record+0x620 == global+0x2427c.
+#define STATS_A 0x2380
+#define STATS_REC 0x628
+#define GLOBAL_GOT 0x7001aa7908ull
+static const uint32_t stats_key[13] = {900000, 900100, 900200, 900300, 900400, 901000, 901200,
+                                       901400, 901600, 901800, 903200, 902000, 900001};
+
+// main+0x528ea0 (record accessor, w1 = slot): fill the record with fake votes the first time it is read.
+void rt_fake_stats(Cpu *c) {
+    if (!g_settings.fake_online || (uint32_t)c->x[1] > 12) return;
+    uint32_t slot = (uint32_t)c->x[1];
+    static uint16_t logged;
+    if (!(logged & (1u << slot))) {
+        logged |= 1u << slot;
+        LOG("[online] stats slot %u read (lr %#llx)\n", slot, (unsigned long long)c->x[30]);
+    }
+    uint8_t *g = (uint8_t *)(uintptr_t)*(uint64_t *)(uintptr_t)*(uint64_t *)(uintptr_t)GLOBAL_GOT;
+    uint32_t period = *(uint32_t *)(g + 0x2427c);
+    uint8_t *rec = (uint8_t *)(uintptr_t)c->x[0] + STATS_A + slot * STATS_REC;
+    if (period == 0xffffffffu || *(uint32_t *)(rec + 0x620) == period) return;
+    unsigned r = (unsigned)time(NULL) * 2654435761u + slot * 40503u;
+    memset(rec, 0, 0x620);
+    *(uint64_t *)rec = stats_key[slot];
+    for (int i = 0; i < 64; i++) {
+        uint8_t *e = rec + 0x20 + i * 0x18;
+        r = r * 1103515245u + 12345u;
+        *(uint16_t *)e = i < 16 ? (uint16_t)i : 0xffff;  // one data key: rating slots 0..15, rest empty
+        *(uint64_t *)(e + 8) = i < 16 ? 20 + (r >> 16) % 2000 : 0;
+        *(uint32_t *)(e + 0x10) = 100;
+    }
+    *(uint32_t *)(rec + 0x620) = period;
+    LOG("[online] fake stats slot %u (key %u, period %u)\n", slot, stats_key[slot], period);
 }

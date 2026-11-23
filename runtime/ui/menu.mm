@@ -630,9 +630,9 @@ static void tab_game(void) {
         g_settings.rumble_strength = rpct / 100.0f;
     opt_section("Online");
     opt_toggle("Fake online features (experimental)", &g_settings.fake_online, false,
-               "Plays as if online, with made-up local data instead of a server. For now: Lost Spirits, the glowing "
-               "tiles on battle maps where other players lost units (examine them for items).\n\nApplies to the next "
-               "battle you start. Off by default.");
+               "Plays as if online, with made-up local data instead of a server: Lost Spirits (glowing tiles on "
+               "battle maps where other players lost units, examine them for items) and other players' choice "
+               "percentages (random).\n\nApplies to the next battle or screen you open. Off by default.");
     // cheats.txt (Atmosphere's format, in the project folder): runtime/hle/cheatvm.c
     int nc = cheatvm_count();
     opt_section("Cheats");

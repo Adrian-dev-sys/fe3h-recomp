@@ -778,3 +778,16 @@ def _fe3h_spirits_req(gen, a):
 
 
 PATCHES[FE3H_SPIRITS_REQ_SITE] = _fe3h_spirits_req
+
+# Statistics cache accessor (0x528ea0, obj x0, slot w1): fake votes filled on first read when fake online is on.
+FE3H_STATS_SITE = 0x7000528ea0
+
+
+def _fe3h_stats(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0x52847008, hex(w)  # mov w8, #0x2380 (function entry)
+    return ('{ extern void rt_fake_stats(Cpu *); rt_fake_stats(c); } '
+            f'c->x[8] = (uint32_t)0x2380u;  /* {a:#x}: mov w8, #0x2380 (stats cache accessor) */')
+
+
+PATCHES[FE3H_STATS_SITE] = _fe3h_stats
