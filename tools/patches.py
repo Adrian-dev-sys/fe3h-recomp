@@ -748,3 +748,33 @@ def _fe3h_frame_spin(gen, a):
 
 
 PATCHES[FE3H_FRAME_SPIN_SITE] = _fe3h_frame_spin
+
+# Fake online, Lost Spirits (runtime/hle/online.c, off by default): the battle map's reads of the online-connected bit
+# (global +0x231ec bit 6) - battle setup 0x5162d0 (site 0), spot examine 0x18e470, glow spawner 0xf5cf0.
+FE3H_ONLINE_BIT_SITES = {0x70005163fc: 0, 0x700018e560: 1, 0x70000f5e48: 2, 0x70000f5ef4: 2, 0x70000f5f58: 2}
+
+
+def _fe3h_online_bit(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert (w & 0xffe0fc00) == 0x38606800, hex(w)  # ldrb wT, [xN, xM]
+    rt, rn, rm = w & 31, (w >> 5) & 31, (w >> 16) & 31
+    return ('{ extern uint32_t rt_fake_online_bit(int); '
+            f'c->x[{rt}] = (uint32_t)(LD8(c->x[{rn}] + c->x[{rm}]) | rt_fake_online_bit({FE3H_ONLINE_BIT_SITES[a]})); }}'
+            f'  /* {a:#x}: ldrb w{rt}, [x{rn}, x{rm}] (online bit) */')
+
+
+for _a in FE3H_ONLINE_BIT_SITES:
+    PATCHES[_a] = _fe3h_online_bit
+
+# The Lost Spirits request (0x52b6f0, map id in w1): answered locally when fake online is on.
+FE3H_SPIRITS_REQ_SITE = 0x700052b6f0
+
+
+def _fe3h_spirits_req(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0xd100c3ff, hex(w)  # sub sp, sp, #0x30 (function entry)
+    return ('{ extern int rt_fake_lost_spirits(Cpu *); if (rt_fake_lost_spirits(c)) return; } '
+            f'c->sp = (uint64_t)(c->sp - 0x30ull);  /* {a:#x}: sub sp, sp, #0x30 (Lost Spirits request) */')
+
+
+PATCHES[FE3H_SPIRITS_REQ_SITE] = _fe3h_spirits_req

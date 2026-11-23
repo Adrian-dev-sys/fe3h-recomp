@@ -628,6 +628,11 @@ static void tab_game(void) {
     float rpct = roundf(g_settings.rumble_strength * 100);
     if (opt_slider("Rumble strength", &rpct, 0, 200, 10, 100, "%g%%", "How strongly the controller rumbles. 100% is the default."))
         g_settings.rumble_strength = rpct / 100.0f;
+    opt_section("Online");
+    opt_toggle("Fake online features (experimental)", &g_settings.fake_online, false,
+               "Plays as if online, with made-up local data instead of a server. For now: Lost Spirits, the glowing "
+               "tiles on battle maps where other players lost units (examine them for items).\n\nApplies to the next "
+               "battle you start. Off by default.");
     // cheats.txt (Atmosphere's format, in the project folder): runtime/hle/cheatvm.c
     int nc = cheatvm_count();
     opt_section("Cheats");
