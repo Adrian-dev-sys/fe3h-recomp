@@ -1714,6 +1714,8 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
     if (fkey->attr_kind[0]) { h ^= fkey->attr_kind[0]; h *= 0x100000001B3ull; h ^= fkey->attr_kind[1]; h *= 0x100000001B3ull; }
+    if (fkey->attr_kind[2])  // (cut-in portrait remap variant)
+        for (int i = 2; i < 5; i++) { h ^= fkey->attr_kind[i]; h *= 0x100000001B3ull; }
     if (key_buf_mask(fkey)) {  // (buffer textures: only keys that have them hash differently)
         uint32_t m = key_buf_mask(fkey);
         for (int i = 0; i < 4; i++) { h ^= (m >> (i * 8)) & 0xFF; h *= 0x100000001B3ull; }
@@ -4718,6 +4720,12 @@ static void draw_(CmdRec *r, bool indexed) {
         if (last_hash == 0xa2177dbb72197bd9ull && pot_level_active()) SKIP(SK_POT, "\n");
         if (g_debug_frame && getenv("LARECOMP_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
         g_cur_fs_hash = last_hash;
+        {   // (debug) LARECOMP_DEBUG_ON_FSHASH=<hex>: an F9 capture the first time that fragment shader draws
+            static uint64_t trig = 1;
+            if (trig == 1) { const char *e = getenv("LARECOMP_DEBUG_ON_FSHASH"); trig = e ? strtoull(e, NULL, 16) : 0; }
+            extern volatile int g_debug_frame_request;
+            if (trig && last_hash == trig) { g_debug_frame_request = 1; trig = 0; }
+        }
         extern void widescreen_backdrop_seen(uint64_t hash);
         if (last_hash) widescreen_backdrop_seen(last_hash);
         extern void widescreen_scene_ubo(const float *u, uint64_t size);  // (the camera's view-projection)
@@ -4975,6 +4983,13 @@ static void draw_(CmdRec *r, bool indexed) {
             first_pres = now_f;
             if (first && fullscreen_quad && !video && pr->fi->ntex > 0 && g_scene_frame == now_f) reads_scene = true;
         }
+        // gambit / crit cut-in portrait panel: a 16:9 UI quad mapping a widened portrait render through a 16:9 mask
+        // (any shader: the 16:9 UI camera tells it from real composites, which use the pixel camera)
+        bool cutin_panel = ui_camera_16x9() && !getenv("LARECOMP_NO_CUTIN_FIX") && pr->fi->ntex > 0 &&
+                           !tex_video[0] && (tex_sc[1][0][0] != 1 || tex_sc[1][0][1] != 1) && tex_wh[1][0][0] == st.rt.color[0]->width &&
+                           tex_wh[1][0][1] == st.rt.color[0]->height && st.viewport[0][0] == 0 &&
+                           st.viewport[0][2] >= st.rt.color[0]->width && pass_sx > pass_sy && !getenv("LARECOMP_NO_VS_BOX");
+        if (cutin_panel) reads_scene = false;
         static uint64_t wide_frame = ~0ull;
         if (reads_scene) wide_frame = renderer_present_count();
         if (reads_scene && fullscreen_quad && !g_dlaa_tried && g_scene_frame == renderer_present_count() && dlaa_on())
@@ -4994,6 +5009,7 @@ static void draw_(CmdRec *r, bool indexed) {
             // FE3H: boxed per vertex - 2D (w == 1) in the 16:9 box, 3D overlays (unit rings, tiles) keep the wide camera
             uint16_t q = (uint16_t)lroundf(pass_sy / pass_sx * 65535);
             vkey.rt_kind[0] = 1; vkey.rt_kind[1] = (uint8_t)q; vkey.rt_kind[2] = (uint8_t)(q >> 8);
+            if (cutin_panel) { fkey.attr_kind[2] = 1; fkey.attr_kind[3] = (uint8_t)q; fkey.attr_kind[4] = (uint8_t)(q >> 8); }
             pr = get_program(st.program, &vkey, &fkey);
             if (!pr || !wait_built(&pr->state, &pr->waited_ns)) SKIP(SK_PROG, "vs box variant building\n");
             k.prog = pr;  // (its pipeline: the one bound above has the plain vertex shader)
@@ -5287,7 +5303,7 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         (unsigned long long)(indexed ? r->x[6] : r->x[4]), (unsigned long long)r->x[0], (unsigned long long)r->x[2],
         (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)st.program->stages[1].code_addr,
         pr->vi->cbuf_mask, pr->fi->cbuf_mask, st.rt.ncolor);
-    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format);
+    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x %p", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format, (void *)st.rt.color[i]);
     if (st.rt.depth) LOG(" d%#x %p", st.rt.depth->format, (void *)st.rt.depth);
     LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n", st.viewport[0][0], st.viewport[0][1],
         st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],

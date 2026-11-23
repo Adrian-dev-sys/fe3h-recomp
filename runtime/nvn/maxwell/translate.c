@@ -651,6 +651,12 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
     } else if (n == 2) {
         if (off) snprintf(xs, sizeof xs, "(vec2(%s, %s) + vec2(%s) / vec2(tsize%d(%s).xy))", co[0], co[1], off, slot, L);
         else snprintf(xs, sizeof xs, "vec2(%s, %s)", co[0], co[1]);
+        if (slot == 0 && c->stage == STAGE_FRAGMENT && c->key && c->key->attr_kind[2] == 1) {  // (ultrawide: x of slot 0
+            char b[sizeof xs];                                                                  // to its centre 16:9 part)
+            snprintf(b, sizeof b, "(vec2(0.5f, 0.0f) + (%s - vec2(0.5f, 0.0f)) * vec2(%.6ff, 1.0f))", xs,
+                     (c->key->attr_kind[3] | c->key->attr_kind[4] << 8) / 65535.0);
+            strcpy(xs, b);
+        }
     } else {
         if (off && !cube) snprintf(xs, sizeof xs, "vec3(vec2(%s, %s) + vec2(%s) / vec2(tsize%d(%s).xy), %s)", co[0], co[1], off, slot, L, co[2]);
         else snprintf(xs, sizeof xs, "vec3(%s, %s, %s)", co[0], co[1], co[2]);  // cube lookups take no offset
