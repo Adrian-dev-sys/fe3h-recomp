@@ -195,6 +195,9 @@ static uint64_t vib_at[2], sent_at;
 static uint16_t sent_low, sent_high;
 
 extern bool input_rumble(uint16_t low, uint16_t high, uint32_t ms);  // runtime/hle/input.c
+extern int ds5_haptics_ready(void);                                  // runtime/hle/ds5_haptics.c
+extern void ds5_haptics_start(void);
+extern void ds5_haptics_set(int side, float al, float fl, float ah, float fh, uint64_t now);
 
 static float clamp01(float v) { return v > 0 ? (v < 1 ? v : 1) : 0; }  // NaN -> 0
 // Share of a band at f Hz for the light motor: none at <= 160 Hz, all at >= 320 Hz, log scale between.
@@ -220,6 +223,7 @@ static void rumble_update(uint64_t now) {
         if (l > light) light = l;
     }
     uint16_t lo = motor(clamp01(heavy)), hi = motor(clamp01(light));
+    if (ds5_haptics_ready()) lo = hi = 0;  // the DualSense's actuators play it instead
     int changed = lo != sent_low || hi != sent_high, on = lo || hi;
     if (changed ? on && now - sent_at < RUMBLE_MIN_GAP_NS : !on || now - sent_at < RUMBLE_REFRESH_NS) return;
     input_rumble(lo, hi, on ? RUMBLE_MS : 0);
@@ -245,6 +249,9 @@ void vibration_send(uint32_t handle, const VibrationValue *in, const char *via) 
     vib_at[side] = now;
     rumble_update(now);
     pthread_mutex_unlock(&vib_lock);
+    ds5_haptics_start();
+    float on = g_settings.rumble ? 1 : 0;
+    ds5_haptics_set(side, v.amp_low * on, v.freq_low, v.amp_high * on, v.freq_high, now);
 }
 
 void vibration_actual(uint32_t handle, VibrationValue *out) {

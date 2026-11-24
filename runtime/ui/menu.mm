@@ -628,6 +628,9 @@ static void tab_game(void) {
     float rpct = roundf(g_settings.rumble_strength * 100);
     if (opt_slider("Rumble strength", &rpct, 0, 200, 10, 100, "%g%%", "How strongly the controller rumbles. 100% is the default."))
         g_settings.rumble_strength = rpct / 100.0f;
+    opt_toggle("DualSense HD haptics (experimental)", &g_settings.haptics, false,
+               "A DualSense plays the game's HD rumble on its haptic actuators instead of emulated rumble, over USB "
+               "or Bluetooth. Uses the Rumble strength. Off by default.");
     opt_section("Online");
     opt_toggle("Fake online features (experimental)", &g_settings.fake_online, false,
                "Plays as if online, with made-up local data instead of a server: Lost Spirits (glowing tiles on "

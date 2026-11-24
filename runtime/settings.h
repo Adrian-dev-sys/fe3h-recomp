@@ -43,6 +43,7 @@ typedef struct {
     bool show_fps;
     bool gyro;             // controller gyro feeds the game's six-axis sensor (runtime/hle/motion.c)
     bool rumble;           // the game's HD rumble drives the controller's motors
+    bool haptics;          // DualSense: HD rumble played on the voice-coil actuators (runtime/hle/ds5_haptics.c)
     bool fake_online;      // local fake data for the online features (runtime/hle/online.c), off by default
     float rumble_strength; // 1 = 100%
     bool dpad_move;      // the d-pad (and arrow keys) move Link like the stick

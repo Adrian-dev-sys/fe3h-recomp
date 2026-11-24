@@ -126,6 +126,7 @@ void settings_load(void) {
         else if (!strcmp(key, "rumble")) g_settings.rumble = atoi(val) != 0;
         else if (!strcmp(key, "rumble_strength")) g_settings.rumble_strength = (float)atof(val);
         else if (!strcmp(key, "hud_edges")) g_settings.hud_edges = atoi(val) != 0;
+        else if (!strcmp(key, "haptics")) g_settings.haptics = atoi(val) != 0;
         else if (!strcmp(key, "fake_online")) g_settings.fake_online = atoi(val) != 0;
         else if (!strcmp(key, "resolution")) {
             int n = atoi(val);
@@ -195,6 +196,7 @@ void settings_save(void) {
     fprintf(f, "gyro = %d\nrumble = %d\nrumble_strength = %.2f\n", g_settings.gyro, g_settings.rumble, g_settings.rumble_strength);
     fprintf(f, "hud_edges = %d\n", g_settings.hud_edges);
     fprintf(f, "fake_online = %d\n", g_settings.fake_online);
+    fprintf(f, "haptics = %d\n", g_settings.haptics);
     fprintf(f, "upscaler = %s\n", g_settings.upscaler == UPSCALE_METALFX ? "metalfx" : g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "bilinear");
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_DLAA ? "dlaa" : g_settings.antialias == AA_SMAA ? "smaa" : "off");
     fprintf(f, "dlaa_sharpen = %d\n", g_settings.dlaa_sharpen);
